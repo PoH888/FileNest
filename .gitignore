@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.spec
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+
+# --- IDE / 编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 运行时生成 ---
+settings.json
+settings.json.tmp
+settings.json.bak
+logs/
+
+# --- 项目文档（不上传规划细节）---
+Plan.md
+
+# --- Git / 系统 ---
+.DS_Store
+Thumbs.db
