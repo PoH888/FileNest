@@ -26,9 +26,10 @@ settings.json.tmp
 settings.json.bak
 logs/
 
-# --- 项目文档（不上传规划细节）---
-Plan.md
 
 # --- Git / 系统 ---
 .DS_Store
 Thumbs.db
+
+# --- 项目文档（不上传规划细节）---
+Plan.md
