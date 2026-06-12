@@ -34,7 +34,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ignore_patterns": "",
     # ---- 外观与行为 ----
     "open_folder_after_move": False,
-    "play_sound_on_detect": False,
+    # ---- 语言 ----
+    "language": "zh",
 }
 """默认配置字典，首次运行或配置文件损坏时使用。"""
 
@@ -42,14 +43,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # 配置路径
 # ---------------------------------------------------------------------------
 
-_logger_initialized: bool = False
-
-
 def _get_logger() -> logging.Logger:
     """获取 FileNest 全局日志记录器（延迟初始化）。"""
-    global _logger_initialized  # noqa: PLW0603
     logger, _ = init_logging()
-    _logger_initialized = True
     return logger
 
 

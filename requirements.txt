@@ -12,5 +12,5 @@ watchdog>=2.1.0              # 文件系统事件监听
 pystray>=0.19.0              # 系统托盘图标
 Pillow>=9.0.0                # 托盘图标绘制（pystray 依赖）
 
-# ---- 可选：拖拽支持 ----
-# tkinterdnd2>=0.3.0         # tkinter 拖拽扩展，安装失败不影响核心功能
+# ---- 拖拽支持 ----
+tkinterdnd2>=0.5.0              # tkinter 原生拖拽扩展（COM IDropTarget）

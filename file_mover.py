@@ -10,22 +10,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from utils import init_logging
-
-# ---------------------------------------------------------------------------
-# 日志
-# ---------------------------------------------------------------------------
-
-_logger_initialized: bool = False
 
 
 def _get_logger() -> logging.Logger:
     """延迟获取全局日志记录器。"""
-    global _logger_initialized  # noqa: PLW0603
-    if not _logger_initialized:
-        lgr, _ = init_logging()
-        _logger_initialized = True
-        return lgr
     return logging.getLogger("FileNest")
 
 
@@ -273,6 +261,7 @@ if __name__ == "__main__":
     import os
     import tempfile
 
+    from utils import init_logging
     init_logging()
     log = _get_logger()
     log.info("file_mover.py 自测开始。")

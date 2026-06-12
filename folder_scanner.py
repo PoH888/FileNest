@@ -16,18 +16,9 @@ import config_manager
 # 日志
 # ---------------------------------------------------------------------------
 
-_logger_initialized: bool = False
-
 
 def _get_logger() -> logging.Logger:
     """延迟获取全局日志记录器。"""
-    global _logger_initialized  # noqa: PLW0603
-    if not _logger_initialized:
-        # 从 config_manager 借 init_logging（它内部有单例保护）
-        from utils import init_logging  # pylint: disable=import-outside-toplevel
-        lgr, _ = init_logging()
-        _logger_initialized = True
-        return lgr
     return logging.getLogger("FileNest")
 
 
