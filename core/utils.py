@@ -136,7 +136,8 @@ def _resource_dir() -> Path:
     """
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         return Path(sys._MEIPASS) / "assets"
-    return Path(__file__).parent / "assets"
+    # 开发模式：core/utils.py → core/ → 项目根目录
+    return Path(__file__).resolve().parent.parent / "assets"
 
 
 def ensure_icon_ico() -> Optional[Path]:
