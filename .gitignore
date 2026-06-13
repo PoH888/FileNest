@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 *.spec
+FileNest.zip
 
 # --- 虚拟环境 ---
 .venv/
@@ -27,10 +28,15 @@ settings.json.tmp
 settings.json.bak
 logs/
 
-
-# --- Git / 系统 ---
-.DS_Store
-Thumbs.db
-
-# --- 项目文档（不上传规划细节）---
+# --- 文档/规划（不上传 GitHub） ---
 Plan.md
+Plan_vs_Actual.md
+
+# --- Windows 系统文件 ---
+desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# --- 本地安装/构建脚本 ---
+setup_shortcut.bat
+scripts/

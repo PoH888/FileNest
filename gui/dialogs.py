@@ -9,8 +9,8 @@ from tkinter import ttk
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import matcher
-from i18n import tr
+from core import matcher
+from core.i18n import tr
 
 
 # ===================================================================

@@ -9,7 +9,7 @@ from tkinter import ttk
 from pathlib import Path
 from typing import Callable, Optional
 
-from i18n import tr
+from core.i18n import tr
 
 
 class NotificationWindow:

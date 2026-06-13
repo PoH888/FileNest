@@ -8,12 +8,10 @@ import logging
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
-from pathlib import Path
 from typing import Any, Callable, Dict
 
-import config_manager
-from i18n import tr
-from utils import init_logging
+from core.i18n import tr
+from core.utils import init_logging
 
 
 def _get_logger() -> logging.Logger:

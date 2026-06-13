@@ -11,18 +11,18 @@ import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-import config_manager
-import file_monitor
-import file_mover
-import folder_scanner
-import matcher
+from core import config_manager
+from core import file_monitor
+from core import file_mover
+from core import folder_scanner
+from core import matcher
 from gui.dialogs import CollisionDialog, CandidateWindow, TreeCandidateWindow
 from gui.notification import NotificationWindow
 from gui.settings_window import SettingsWindow
-from i18n import tr, set_language, get_language, get_available_languages
-from utils import create_tray_icon, destroy_tray_icon
+from core.i18n import tr, set_language, get_language, get_available_languages
+from core.utils import create_tray_icon, destroy_tray_icon, ensure_icon_ico, get_big_ico_path, get_ico_path
 
 # ---------------------------------------------------------------------------
 # TkinterDnD — 原生拖拽支持
@@ -112,6 +112,9 @@ class FileNestApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # ---- 窗口图标 ----
+        self._set_window_icon()
+
         # ---- 配置 ----
         self.config = config_manager.load_config()
         set_language(self.config.get("language", "zh"))
@@ -119,10 +122,10 @@ class FileNestApp:
         # ---- 状态 ----
         self.history: List[Dict[str, str]] = []
         self.monitor_active: bool = False
+        self._title_click_count: int = 0
         self._observer: Optional[Any] = None
         self._tray_shown: bool = False
         self.event_queue: "queue.Queue" = __import__("queue").Queue()
-        self._pending_notifications: List[Path] = []
 
         # ---- 构建 UI ----
         self._build_ui()
@@ -151,7 +154,9 @@ class FileNestApp:
         bar = ttk.Frame(self.root)
         bar.pack(fill=tk.X, padx=10, pady=(8, 0))
 
-        ttk.Label(bar, text=WINDOW_TITLE, font=("", 11, "bold")).pack(side=tk.LEFT)
+        self._title_label = ttk.Label(bar, text=WINDOW_TITLE, font=("", 11, "bold"))
+        self._title_label.pack(side=tk.LEFT)
+        self._title_label.bind("<Button-1>", self._on_title_click)
 
         self.status_label = ttk.Label(bar, font=("", 9))
         self.status_label.pack(side=tk.RIGHT)
@@ -165,6 +170,15 @@ class FileNestApp:
             self.status_label.config(text=tr("status_paused"), foreground="red")
         else:
             self.status_label.config(text=tr("status_ready"), foreground="green")
+
+    # ---- 标题彩蛋 ----
+
+    def _on_title_click(self, event: tk.Event) -> None:
+        """🎄 隐藏彩蛋：连续点击标题 7 次。"""
+        self._title_click_count += 1
+        if self._title_click_count >= 7:
+            self._title_click_count = 0
+            messagebox.showinfo("🎉", "感谢女朋友大人的支持！")
 
     # ---- 投放区域 ----
 
@@ -654,6 +668,41 @@ class FileNestApp:
     # ================================================================
     # 辅助功能
     # ================================================================
+
+    def _set_window_icon(self) -> None:
+        """设置窗口/任务栏图标为 FileNest_big.ico（Picture_big.png 图案），
+        系统托盘仍保持 Picture_small.png。"""
+        # 优先使用 FileNest_big.ico（大图标，任务栏 + Alt+Tab 清晰）
+        try:
+            big_ico = get_big_ico_path()
+            if big_ico and big_ico.exists():
+                self.root.iconbitmap(str(big_ico))
+                _get_logger().info("窗口图标已设置 (big .ico): %s", big_ico)
+                return
+        except Exception as e:
+            _get_logger().warning("big iconbitmap 失败: %s", e)
+
+        # 回退：使用 FileNest.ico（小图标）
+        try:
+            ico_path = ensure_icon_ico()
+            if ico_path and ico_path.exists():
+                self.root.iconbitmap(str(ico_path))
+                _get_logger().info("窗口图标已设置 (small .ico): %s", ico_path)
+                return
+        except Exception as e:
+            _get_logger().warning("small iconbitmap 失败: %s", e)
+
+        # 最终回退：使用 PNG 通过 iconphoto
+        try:
+            from PIL import Image, ImageTk
+            png_path = get_ico_path().parent / "Picture_small.png"
+            if png_path.exists():
+                img = ImageTk.PhotoImage(Image.open(png_path))
+                self.root.iconphoto(True, img)
+                self._icon_ref = img
+                _get_logger().info("窗口图标已设置 (PNG): %s", png_path)
+        except Exception as e:
+            _get_logger().warning("无法设置窗口图标: %s", e)
 
     def _open_in_explorer(self, file_path: Path) -> None:
         try:

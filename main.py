@@ -14,9 +14,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-import config_manager
+from core import config_manager
+from core.utils import init_logging
 from gui import FileNestApp
-from utils import init_logging
 
 
 def main() -> None:
