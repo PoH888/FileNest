@@ -749,6 +749,13 @@ class FileNestApp:
         win.geometry("480x400")
         win.resizable(False, False)
         win.transient(self.root)
+        # 与主窗口保持一致的图标
+        try:
+            big_ico = get_big_ico_path()
+            if big_ico and big_ico.exists():
+                win.iconbitmap(str(big_ico))
+        except Exception:
+            pass
 
         text = tk.Text(win, wrap=tk.WORD, font=("Microsoft YaHei", 10),
                        padx=16, pady=12, borderwidth=0)
