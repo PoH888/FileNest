@@ -137,21 +137,33 @@ FileNest/
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets/FileNest_big.ico" main.py
 ```
 
-打包后生成 `dist/FileNest.exe`，连同以下文件放入同一目录：
-- `assets/` — 图标、图片、演示 GIF
-- `setup_shortcut.bat` — 一键安装桌面快捷方式和文件夹图标
+所有依赖（assets/ 图标、tkinterdnd2 拖拽 DLL、Python 运行时）均被打入单个 exe 内部，没有零散文件。分发结构：
 
-然后可将整个目录压缩为 `.zip` 分发给用户。用户解压后运行 `setup_shortcut.bat` 即可完成安装。
+```
+FileNest.zip
+  └── 解压 → FileNest/
+                └── FileNest.exe    ← 首次运行后同级自动生成 settings.json
+```
 
 ```bash
-# 打包分发的完整命令
-tar -acf FileNest.zip dist/FileNest.exe assets/ setup_shortcut.bat
+# 1) 清除旧的构建产物
+rm -rf dist build
+
+# 2) 打包为单文件 exe（--onefile）
+pyinstaller --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets/FileNest_big.ico" main.py
+
+# 3) 创建分发文件夹，把 exe 放进去
+mkdir -p dist/FileNest
+mv dist/FileNest.exe dist/FileNest/
+
+# 4) 压缩为 .zip（注意：exe 放在 zip 根级，不要文件夹前缀，
+#         Windows "Extract All…" 会自动创建 FileNest/ 目录）
+python -c "import zipfile; zipfile.ZipFile('FileNest.zip','w',zipfile.ZIP_DEFLATED).write('dist/FileNest/FileNest.exe','FileNest.exe')"
 ```
 
-> **注意**：`settings.json` 在首次运行时自动生成，用户已有配置可连同 exe 一起复制，路径不变。
+> **注意**：`--onefile` 模式下 `settings.json` 首次运行时会自动生成在 exe 所在目录（即 `FileNest/` 下），随文件夹整体移动即可带走配置。
 
 ## 配置
 

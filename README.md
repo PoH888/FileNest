@@ -137,21 +137,33 @@ FileNest/
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets/FileNest_big.ico" main.py
 ```
 
-After packaging, place the generated `dist/FileNest.exe` together with the following files:
-- `assets/` — Icons, images, and demo GIFs
-- `setup_shortcut.bat` — One-click desktop shortcut & folder icon installation
+All dependencies (assets/ icons, tkinterdnd2 drag-drop DLLs, Python runtime) are bundled into a single exe — no loose files. Distribution structure:
 
-Then compress the entire directory into `.zip` for distribution. Users just need to unzip and run `setup_shortcut.bat` to complete installation.
+```
+FileNest.zip
+  └── extract → FileNest/
+                   └── FileNest.exe    ← settings.json auto-generated here on first run
+```
 
 ```bash
-# Full packaging command
-tar -acf FileNest.zip dist/FileNest.exe assets/ setup_shortcut.bat
+# 1) Clean old build artifacts
+rm -rf dist build
+
+# 2) Build as single-file exe (--onefile)
+pyinstaller --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets/FileNest_big.ico" main.py
+
+# 3) Create distribution folder and place the exe inside
+mkdir -p dist/FileNest
+mv dist/FileNest.exe dist/FileNest/
+
+# 4) Compress to .zip (exe at zip root — Windows "Extract All…" will
+#         create the FileNest/ folder automatically)
+python -c "import zipfile; zipfile.ZipFile('FileNest.zip','w',zipfile.ZIP_DEFLATED).write('dist/FileNest/FileNest.exe','FileNest.exe')"
 ```
 
-> **Note**: `settings.json` is auto-generated on first run. Users can copy their existing config alongside the exe — paths remain unchanged.
+> **Note**: With `--onefile`, `settings.json` is auto-generated on first run in the same directory as the exe (i.e., inside `FileNest/`). Moving the whole folder carries the config with it.
 
 ## Configuration
 

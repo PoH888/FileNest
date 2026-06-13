@@ -497,12 +497,10 @@ class FileNestApp:
             line1 = ttk.Frame(record_frame)
             line1.pack(fill=tk.X)
             ttk.Label(line1, text=f"✅ {current_path.name} →",
-                      font=("Microsoft YaHei", 8)).pack(side=tk.LEFT)
+                      font=("Microsoft YaHei", 8)).pack(anchor=tk.W)
 
-            wraplength = max(200, self.root.winfo_width() - 60)
             path_label = ttk.Label(record_frame, text=rec['current'],
                                    font=("Microsoft YaHei", 8),
-                                   wraplength=wraplength,
                                    anchor=tk.W)
             path_label.pack(fill=tk.X)
 

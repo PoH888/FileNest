@@ -8,8 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import Levenshtein
-from fuzzywuzzy import fuzz
+from rapidfuzz.distance import Levenshtein
+from thefuzz import fuzz
 
 # ---------------------------------------------------------------------------
 # 常量
