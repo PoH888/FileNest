@@ -60,15 +60,11 @@ FileNest 还可以持续监控 Downloads 或任意文件夹。
 
 ## 演示
 
-<video controls loop muted playsinline width="100%">
-  <source src="https://raw.githubusercontent.com/PoH888/FileNest/main/assets/%E4%B8%AD%E6%96%87-%E6%93%8D%E4%BD%9C.mp4" type="video/mp4">
-</video>
+![拖拽操作](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/%E4%B8%AD%E6%96%87-%E6%93%8D%E4%BD%9C.mp4)
 
 *拖拽文件自动归类到匹配目录*
 
-<video controls loop muted playsinline width="100%">
-  <source src="https://raw.githubusercontent.com/PoH888/FileNest/main/assets/%E4%B8%AD%E6%96%87-%E7%9B%91%E6%8E%A7.mp4" type="video/mp4">
-</video>
+![监控演示](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/%E4%B8%AD%E6%96%87-%E7%9B%91%E6%8E%A7.mp4)
 
 *后台监控新文件出现，实时推荐目标目录*
 

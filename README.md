@@ -60,15 +60,11 @@ and you choose to **Categorize** or **Ignore**.
 
 ## Demo
 
-<video controls loop muted playsinline width="100%">
-  <source src="https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Operate.mp4" type="video/mp4">
-</video>
+![Drag & Drop](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Operate.mp4)
 
 *Drag files to automatically sort them into matching directories*
 
-<video controls loop muted playsinline width="100%">
-  <source src="https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Monitor.mp4" type="video/mp4">
-</video>
+![Monitoring](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Monitor.mp4)
 
 *Monitor folders for new files and get real-time categorization suggestions*
 
