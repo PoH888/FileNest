@@ -60,11 +60,15 @@ and you choose to **Categorize** or **Ignore**.
 
 ## Demo
 
-![Drag & Drop](assets/English-Operate.gif)
+<video controls loop muted playsinline width="100%">
+  <source src="assets/English-Operate.mp4" type="video/mp4">
+</video>
 
 *Drag files to automatically sort them into matching directories*
 
-![Monitoring](assets/English-Monitor.gif)
+<video controls loop muted playsinline width="100%">
+  <source src="assets/English-Monitor.mp4" type="video/mp4">
+</video>
 
 *Monitor folders for new files and get real-time categorization suggestions*
 
