@@ -60,11 +60,11 @@ and you choose to **Categorize** or **Ignore**.
 
 ## Demo
 
-![Drag & Drop](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Operate.mp4)
+![Drag & Drop](https://cdn.jsdelivr.net/gh/PoH888/FileNest@main/assets/English-Operate.mp4)
 
 *Drag files to automatically sort them into matching directories*
 
-![Monitoring](https://raw.githubusercontent.com/PoH888/FileNest/main/assets/English-Monitor.mp4)
+![Monitoring](https://cdn.jsdelivr.net/gh/PoH888/FileNest@main/assets/English-Monitor.mp4)
 
 *Monitor folders for new files and get real-time categorization suggestions*
 
