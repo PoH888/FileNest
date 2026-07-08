@@ -39,3 +39,7 @@ ehthumbs.db
 # --- 本地安装/构建脚本 ---
 setup_shortcut.bat
 scripts/
+
+# --- CLAUDE ---
+CLAUDE.md
+V2_PLAN.md
