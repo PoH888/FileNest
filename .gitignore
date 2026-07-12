@@ -26,6 +26,7 @@ settings.json
 settings.json.tmp
 settings.json.bak
 logs/
+backend/filenest.db
 
 # --- 文档/规划（不上传 GitHub） ---
 Plan.md
