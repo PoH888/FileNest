@@ -1,6 +1,6 @@
 from fastapi import Depends, FastAPI, HTTPException # Depends：告诉 FastAPI：执行这个路由前，先调用指定的依赖函数，并把结果交给路由。
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select # select()：构造数据库查询。
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -9,6 +9,8 @@ from .database import Base, engine, get_session
 # Base：保存所有已经登记的 ORM 表设计
 # engine：告诉 SQLAlchemy要在哪个数据库中创建表
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
+
+from .repositories import (add_workspace, find_workspaces, get_workspace_by_id,)
 
 # 把 ORM 设计图和真实数据库连接起来
 Base.metadata.create_all(bind=engine)
@@ -65,7 +67,7 @@ def create_workspace(
         root_path=workspace.root_path, # 把请求对象中的 root_path 复制到 ORM 对象
     )
 
-    session.add(created_workspace) # 把 ORM 对象加入 Session
+    add_workspace(session, created_workspace)
 
     try:
         session.commit() # 提交事务，成功后数据写入 filenest.db
@@ -90,13 +92,7 @@ def list_workspaces(
         session: Session = Depends(get_session),
         #                  不从客户端请求中读取 session，而是调用 get_session()获得
 ) -> list[Workspace]: # 数据库内部对象
-    statement = select(Workspace)
-
-    if name is not None:
-        statement = statement.where(Workspace.name == name)
-
-    return list(session.scalars(statement).all())
-#                       scalars()取出的是 Workspace ORM 对象
+    return find_workspaces(session, name)
 
 # 支持按名称筛选
 @app.get("/api/v1/workspaces/{workspace_id}", response_model=WorkspaceResponse)
@@ -104,7 +100,7 @@ def get_workspace(
         workspace_id: int,
         session: Session = Depends(get_session),
 ) -> Workspace:
-    workspace = session.get(Workspace, workspace_id)
+    workspace = get_workspace_by_id(session, workspace_id)
 
     if workspace is None:
         raise HTTPException(
