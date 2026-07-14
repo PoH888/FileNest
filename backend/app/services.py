@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import Workspace
-from .repositories import add_workspace
+from .repositories import add_workspace, find_workspaces, get_workspace_by_id
 
 
 class WorkspacePathConflictError(Exception):
@@ -22,6 +22,7 @@ def create_workspace(
     name: str,
     root_path: str,
 ) -> Workspace:
+    
     workspace = Workspace(
         name=name,
         root_path=root_path,
@@ -36,3 +37,17 @@ def create_workspace(
         raise WorkspacePathConflictError from error
 
     return workspace
+
+
+def list_workspaces(
+    session: Session,
+    name: str | None = None,
+) -> list[Workspace]:
+    return find_workspaces(session, name)
+
+
+def get_workspace(
+    session: Session,
+    workspace_id: int,
+) -> Workspace | None:
+    return get_workspace_by_id(session, workspace_id)

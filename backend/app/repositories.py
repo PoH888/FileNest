@@ -31,4 +31,4 @@ def add_workspace(
     session: Session,
     workspace: Workspace,
 ) -> None:
-    session.add(workspace) # 把对象登记为“等待写入”
+    session.add(workspace) # 把对象登记为“等待保存”
