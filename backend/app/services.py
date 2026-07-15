@@ -22,6 +22,8 @@ def create_workspace(
     name: str,
     root_path: str,
 ) -> Workspace:
+    """创建并保存工作区；根路径重复时抛出业务冲突错误。"""
+
     
     workspace = Workspace(
         name=name,
@@ -43,6 +45,8 @@ def list_workspaces(
     session: Session,
     name: str | None = None,
 ) -> list[Workspace]:
+    """查询工作区列表，可按名称筛选。"""
+
     return find_workspaces(session, name)
 
 
@@ -50,4 +54,6 @@ def get_workspace(
     session: Session,
     workspace_id: int,
 ) -> Workspace | None:
+    """按 ID 查询工作区，找不到时返回 None。"""
+
     return get_workspace_by_id(session, workspace_id)

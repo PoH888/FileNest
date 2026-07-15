@@ -13,6 +13,8 @@ def get_workspace_by_id(
         session: Session, # 从外部传入
         workspace_id: int # 要查询的主键
 ) -> Workspace | None:
+    """按 ID 查询一个工作区，找不到时返回 None。"""
+
     return session.get(Workspace, workspace_id) # 按主键查询
 
 
@@ -20,6 +22,8 @@ def find_workspaces(
     session: Session,
     name: str | None = None,
 ) -> list[Workspace]:
+    """查询工作区列表；传入名称时只返回同名工作区。"""
+
     statement = select(Workspace)
 
     if name is not None:
@@ -31,4 +35,6 @@ def add_workspace(
     session: Session,
     workspace: Workspace,
 ) -> None:
+    """将工作区加入当前 Session，等待后续提交。"""
+
     session.add(workspace) # 把对象登记为“等待保存”

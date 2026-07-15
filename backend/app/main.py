@@ -36,6 +36,8 @@ class WorkspaceResponse(BaseModel):
 # 健康检查
 @app.get("/api/v1/health")
 def health_check() -> dict[str, str]:
+    """返回服务当前可用的健康状态。"""
+
     return {"status": "ok"}
 
 # 添加工作区
@@ -73,6 +75,8 @@ def list_workspaces(
         session: Session = Depends(get_session),
         #                  不从客户端请求中读取 session，而是调用 get_session()获得
 ) -> list[Workspace]: # 数据库内部对象
+    """返回工作区列表，可按名称筛选。"""
+
     return list_workspaces_service(session, name)
 
 # 支持按名称筛选
@@ -81,6 +85,8 @@ def get_workspace(
         workspace_id: int,
         session: Session = Depends(get_session),
 ) -> Workspace:
+    """返回指定工作区；不存在时返回 404。"""
+
     workspace = get_workspace_service(session, workspace_id)
 
     if workspace is None:

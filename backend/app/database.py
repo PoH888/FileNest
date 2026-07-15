@@ -37,6 +37,8 @@ SessionFactory = sessionmaker(
 
 # 交出一个 Session
 def get_session() -> Iterator[Session]:
+    """为一次请求提供数据库 Session，并在使用结束后自动关闭。"""
+
     with SessionFactory() as session:
     # 调用 SessionFactory() 创建 Session，使用 with 管理它的生命周期
         yield session
