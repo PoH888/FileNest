@@ -4,10 +4,14 @@ folder_scanner.py 独立测试
 从源文件 ``if __name__ == "__main__":`` 块迁移而来。
 """
 
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -69,6 +73,46 @@ def test_folder_scanner() -> None:
         assert empty_result == [], "不存在路径应返回空列表"
     finally:
         shutil.rmtree(tmp_root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junction 是 Windows 专属能力")
+def test_folder_scanner_uses_path_policy(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    outside_root = tmp_path / "outside"
+    _makedirs(workspace_root, "Visible/Nested")
+    _makedirs(workspace_root, "System Volume Information/Protected")
+    _makedirs(outside_root, "Escaped")
+
+    junction = workspace_root / "ExternalLink"
+    subprocess.run(
+        [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction),
+            str(outside_root),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    folders = scan_directory(
+        workspace_root,
+        max_depth=5,
+        ignore_patterns=[],
+    )
+    relative_folders = {
+        folder.relative_to(workspace_root)
+        for folder in folders
+    }
+
+    assert relative_folders == {
+        Path("Visible"),
+        Path("Visible") / "Nested",
+    }
 
 
 if __name__ == "__main__":

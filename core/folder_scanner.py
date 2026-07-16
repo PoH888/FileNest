@@ -10,6 +10,9 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 
+from backend.app.filesystem_adapter import FileSystemAdapter
+from backend.app.path_policy import PathPolicyError
+
 from . import config_manager
 
 # ---------------------------------------------------------------------------
@@ -110,29 +113,47 @@ def scan_directory(target_dir: Path, max_depth: int = 5,
 
     logger = _get_logger()
     results: List[Path] = []
+    adapter = FileSystemAdapter(target_dir)
 
     try:
-        target_dir = target_dir.resolve(strict=False)
-    except OSError as e:
+        if not adapter.is_directory(Path(".")):
+            logger.warning("目标路径不是有效目录: %s", target_dir)
+            return results
+        workspace_root = adapter.workspace_root
+    except (OSError, PathPolicyError) as e:
         logger.warning("无法解析目标目录 %s: %s", target_dir, e)
         return results
 
-    if not target_dir.is_dir():
-        logger.warning("目标路径不是有效目录: %s", target_dir)
-        return results
-
-    _scan_recursive(target_dir, 0, max_depth, ignore_patterns, results, logger)
+    _scan_recursive(
+        adapter,
+        workspace_root,
+        Path("."),
+        0,
+        max_depth,
+        ignore_patterns,
+        results,
+        logger,
+    )
     results.sort()
     return results
 
 
-def _scan_recursive(current_dir: Path, current_depth: int, max_depth: int,
-                    ignore_patterns: List[str], results: List[Path],
-                    log: logging.Logger) -> None:
+def _scan_recursive(
+    adapter: FileSystemAdapter,
+    workspace_root: Path,
+    current_dir: Path,
+    current_depth: int,
+    max_depth: int,
+    ignore_patterns: List[str],
+    results: List[Path],
+    log: logging.Logger,
+) -> None:
     """递归扫描的内部实现。
 
     Args:
-        current_dir: 当前扫描的目录。
+        adapter: 当前工作区唯一允许使用的文件系统入口。
+        workspace_root: 经过 Path Policy 授权的工作区根路径。
+        current_dir: 相对于工作区根路径的当前目录。
         current_depth: 当前递归深度（根目录为 0）。
         max_depth: 最大允许深度（1 表示仅直接子目录）。
         ignore_patterns: 忽略模式列表。
@@ -144,7 +165,7 @@ def _scan_recursive(current_dir: Path, current_depth: int, max_depth: int,
         return
 
     try:
-        iterator = current_dir.iterdir()
+        child_names = adapter.list_directory(current_dir)
     except PermissionError:
         log.warning("权限不足，跳过目录: %s", current_dir)
         return
@@ -155,17 +176,15 @@ def _scan_recursive(current_dir: Path, current_depth: int, max_depth: int,
         log.warning("无法访问目录 %s: %s", current_dir, e)
         return
 
-    for entry in iterator:
+    for name in child_names:
+        entry_path = current_dir / name
         try:
-            entry_path = Path(entry)
-            name = entry_path.name
-
             # 跳过隐藏/系统目录
             if _is_hidden_or_system(name):
                 continue
 
             # 检查是否为有效目录
-            if not entry_path.is_dir():
+            if not adapter.is_directory(entry_path):
                 continue
 
             # 忽略名单检查
@@ -174,18 +193,28 @@ def _scan_recursive(current_dir: Path, current_depth: int, max_depth: int,
                 continue
 
             # 当前条目符合深度要求，加入结果
-            results.append(entry_path.resolve())
+            results.append(adapter.authorized_path(entry_path))
 
             # 递归深入（下一层）
-            _scan_recursive(entry_path, next_depth, max_depth,
-                            ignore_patterns, results, log)
+            _scan_recursive(
+                adapter,
+                workspace_root,
+                entry_path,
+                next_depth,
+                max_depth,
+                ignore_patterns,
+                results,
+                log,
+            )
 
         except PermissionError:
-            log.warning("权限不足，跳过: %s", entry)
+            log.warning("权限不足，跳过: %s", workspace_root / entry_path)
         except FileNotFoundError:
-            log.warning("条目不存在，跳过: %s", entry)
+            log.warning("条目不存在，跳过: %s", workspace_root / entry_path)
+        except PathPolicyError as e:
+            log.warning("路径未通过安全策略，跳过 %s: %s", entry_path, e)
         except OSError as e:
-            log.warning("访问条目出错 %s: %s", entry, e)
+            log.warning("访问条目出错 %s: %s", workspace_root / entry_path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -211,4 +240,3 @@ def scan_all_roots() -> List[Tuple[Path, List[Path]]]:
                                  ignore_patterns=ignore_patterns)
         result.append((root, folders))
     return result
-
