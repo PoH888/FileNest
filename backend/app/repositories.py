@@ -1,4 +1,4 @@
-"""工作区数据访问层。
+"""FileNest 数据访问层。
 
 集中封装原本写在 API 路由中的数据库查询与持久化操作，
 使路由只负责接收请求、调用业务能力和生成 HTTP 响应。
@@ -7,7 +7,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import select # select()：构造数据库查询。
 
-from .models import Workspace
+from .models import FileEntry, Workspace
 
 def get_workspace_by_id(
         session: Session, # 从外部传入
@@ -38,3 +38,49 @@ def add_workspace(
     """将工作区加入当前 Session，等待后续提交。"""
 
     session.add(workspace) # 把对象登记为“等待保存”
+
+
+def get_file_entry_by_path(
+    session: Session,
+    workspace_id: int,
+    relative_path: str,
+) -> FileEntry | None:
+    """按工作区和相对路径查询一个文件索引。"""
+
+    statement = select(FileEntry).where(
+        FileEntry.workspace_id == workspace_id,
+        FileEntry.relative_path == relative_path,
+    )
+    return session.scalar(statement)
+
+
+def find_file_entries(
+    session: Session,
+    workspace_id: int,
+) -> list[FileEntry]:
+    """按相对路径顺序查询指定工作区的全部文件索引。"""
+
+    statement = (
+        select(FileEntry)
+        .where(FileEntry.workspace_id == workspace_id)
+        .order_by(FileEntry.relative_path)
+    )
+    return list(session.scalars(statement).all())
+
+
+def add_file_entry(
+    session: Session,
+    file_entry: FileEntry,
+) -> None:
+    """将文件索引加入当前 Session，事务由调用方提交。"""
+
+    session.add(file_entry)
+
+
+def delete_file_entry(
+    session: Session,
+    file_entry: FileEntry,
+) -> None:
+    """将文件索引标记为待删除，事务由调用方提交。"""
+
+    session.delete(file_entry)

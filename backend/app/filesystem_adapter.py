@@ -1,6 +1,8 @@
 """所有正式文件读取都必须经过的安全文件系统边界。"""
 
+from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 
 from .path_policy import (
     AuthorizedPath,
@@ -8,6 +10,14 @@ from .path_policy import (
     PathPolicyRequest,
     authorize_path,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class FileMetadata:
+    """文件索引需要的最小、只读文件系统元数据。"""
+
+    size_bytes: int
+    mtime_ns: int
 
 
 class FileSystemAdapter:
@@ -41,6 +51,23 @@ class FileSystemAdapter:
 
         authorized_path = self._authorize(requested_path)
         return authorized_path.path.read_text(encoding=encoding)
+
+    def get_file_metadata(
+        self,
+        requested_path: Path,
+    ) -> FileMetadata | None:
+        """授权路径后读取普通文件的大小和修改时间。"""
+
+        authorized_path = self._authorize(requested_path)
+        file_stat = authorized_path.path.stat()
+
+        if not S_ISREG(file_stat.st_mode):
+            return None
+
+        return FileMetadata(
+            size_bytes=file_stat.st_size,
+            mtime_ns=file_stat.st_mtime_ns,
+        )
 
     def list_directory(self, requested_path: Path = Path(".")) -> list[str]:
         """列出目录中经过 Path Policy 授权的直接子项名称。"""

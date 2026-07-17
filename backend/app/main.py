@@ -8,10 +8,14 @@ from .database import get_session
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
 
 from .services import (
+    FileIndexSyncResult,
     WorkspacePathConflictError,
+    WorkspaceNotFoundError,
+    WorkspaceScanUnavailableError,
     create_workspace as create_workspace_service,
     get_workspace as get_workspace_service,
     list_workspaces as list_workspaces_service,
+    scan_workspace as scan_workspace_service,
 )
 
 app = FastAPI(title="FileNest API")
@@ -30,6 +34,17 @@ class WorkspaceResponse(BaseModel):
     id: int
     name: str
     root_path: str
+
+
+class FileIndexSyncResponse(BaseModel):
+    """一次工作区扫描产生的索引变化统计。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    created: int
+    updated: int
+    deleted: int
+    unchanged: int
 
 
 
@@ -99,3 +114,33 @@ def get_workspace(
         )
 
     return workspace
+
+
+@app.post(
+    "/api/v1/workspaces/{workspace_id}/scan",
+    response_model=FileIndexSyncResponse,
+)
+def scan_workspace(
+    workspace_id: int,
+    session: Session = Depends(get_session),
+) -> FileIndexSyncResult:
+    """安全扫描工作区，并将完整结果同步到文件索引。"""
+
+    try:
+        return scan_workspace_service(session, workspace_id)
+    except WorkspaceNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        ) from error
+    except WorkspaceScanUnavailableError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_scan_unavailable",
+                "message": "工作区目录当前不可扫描。",
+            },
+        ) from error
