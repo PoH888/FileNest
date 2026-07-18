@@ -1,21 +1,34 @@
-from fastapi import Depends, FastAPI, HTTPException # Depends：告诉 FastAPI：执行这个路由前，先调用指定的依赖函数，并把结果交给路由。
+from datetime import datetime, timezone
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, Query # Depends：告诉 FastAPI：执行这个路由前，先调用指定的依赖函数，并把结果交给路由。
 from pydantic import BaseModel, ConfigDict
 
 from sqlalchemy.orm import Session
 
-from .models import Workspace
+from .models import FileEntry, Workspace
 from .database import get_session
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
 
 from .services import (
+    FileEntryNotFoundError,
     FileIndexSyncResult,
+    FileSearchResult,
     WorkspacePathConflictError,
     WorkspaceNotFoundError,
     WorkspaceScanUnavailableError,
     create_workspace as create_workspace_service,
+    get_file_detail as get_file_detail_service,
     get_workspace as get_workspace_service,
     list_workspaces as list_workspaces_service,
     scan_workspace as scan_workspace_service,
+    search_files as search_files_service,
+)
+from .schemas import (
+    FileDetailResponse,
+    FileListItemResponse,
+    FileListResponse,
+    FileQueryParams,
 )
 
 app = FastAPI(title="FileNest API")
@@ -114,6 +127,105 @@ def get_workspace(
         )
 
     return workspace
+
+
+@app.get(
+    "/api/v1/workspaces/{workspace_id}/files",
+    response_model=FileListResponse,
+)
+def list_files(
+    workspace_id: int,
+    query: Annotated[FileQueryParams, Query()],
+    session: Session = Depends(get_session),
+) -> FileListResponse:
+    """返回工作区文件索引，可搜索、过滤、排序和分页。"""
+
+    try:
+        result = search_files_service(
+            session,
+            workspace_id,
+            keyword=query.keyword,
+            extension=query.extension,
+            modified_from=query.modified_from,
+            modified_to=query.modified_to,
+            sort_by=query.sort_by.value,
+            sort_order=query.sort_order.value,
+            page=query.page,
+            page_size=query.page_size,
+        )
+    except WorkspaceNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        ) from error
+
+    return _file_list_response(result)
+
+
+@app.get(
+    "/api/v1/workspaces/{workspace_id}/files/{file_id}",
+    response_model=FileDetailResponse,
+)
+def get_file_detail(
+    workspace_id: int,
+    file_id: int,
+    session: Session = Depends(get_session),
+) -> FileDetailResponse:
+    """返回指定工作区内一个文件索引的详情。"""
+
+    try:
+        file_entry = get_file_detail_service(session, workspace_id, file_id)
+    except WorkspaceNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        ) from error
+    except FileEntryNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "file_not_found",
+                "message": "文件索引不存在。",
+            },
+        ) from error
+
+    item = _file_list_item_response(file_entry)
+    return FileDetailResponse(
+        **item.model_dump(),
+        workspace_id=file_entry.workspace_id,
+    )
+
+
+def _file_list_response(result: FileSearchResult) -> FileListResponse:
+    """将内部文件索引转换为不含绝对路径的公开响应。"""
+
+    return FileListResponse(
+        items=[_file_list_item_response(item) for item in result.items],
+        total=result.total,
+        page=result.page,
+        page_size=result.page_size,
+    )
+
+
+def _file_list_item_response(file_entry: FileEntry) -> FileListItemResponse:
+    seconds, nanoseconds = divmod(file_entry.mtime_ns, 1_000_000_000)
+    modified_at = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(
+        microsecond=nanoseconds // 1_000,
+    )
+    return FileListItemResponse(
+        id=file_entry.id,
+        relative_path=file_entry.relative_path,
+        name=file_entry.name,
+        extension=file_entry.extension,
+        size_bytes=file_entry.size_bytes,
+        modified_at=modified_at,
+    )
 
 
 @app.post(

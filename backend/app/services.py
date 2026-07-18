@@ -7,6 +7,7 @@
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.exc import IntegrityError
@@ -18,9 +19,12 @@ from .path_policy import PathPolicyError
 from .repositories import (
     add_file_entry,
     add_workspace,
+    count_file_entries,
     delete_file_entry,
+    FileEntrySortField,
     find_file_entries,
     find_workspaces,
+    get_file_entry_by_id,
     get_workspace_by_id,
 )
 from .workspace_scanner import ScannedFile, scan_workspace_files
@@ -31,7 +35,11 @@ class WorkspacePathConflictError(Exception):
 
 
 class WorkspaceNotFoundError(Exception):
-    """文件索引同步所需的工作区不存在。"""
+    """文件索引操作所需的工作区不存在。"""
+
+
+class FileEntryNotFoundError(Exception):
+    """指定工作区内不存在所需的文件索引。"""
 
 
 class DuplicateScannedPathError(Exception):
@@ -50,6 +58,24 @@ class FileIndexSyncResult:
     updated: int
     deleted: int
     unchanged: int
+
+
+@dataclass(frozen=True, slots=True)
+class FileSearchResult:
+    """一次文件搜索的当前页结果和分页元数据。"""
+
+    items: list[FileEntry]
+    total: int
+    page: int
+    page_size: int
+
+
+_FILE_SORT_FIELDS: dict[str, FileEntrySortField] = {
+    "relative_path": "relative_path",
+    "name": "name",
+    "size_bytes": "size_bytes",
+    "modified_at": "mtime_ns",
+}
 
 
 def create_workspace(
@@ -92,6 +118,119 @@ def get_workspace(
     """按 ID 查询工作区，找不到时返回 None。"""
 
     return get_workspace_by_id(session, workspace_id)
+
+
+def get_file_detail(
+    session: Session,
+    workspace_id: int,
+    file_id: int,
+) -> FileEntry:
+    """读取指定工作区内一个文件索引的详情。"""
+
+    if get_workspace_by_id(session, workspace_id) is None:
+        raise WorkspaceNotFoundError(workspace_id)
+
+    file_entry = get_file_entry_by_id(session, workspace_id, file_id)
+    if file_entry is None:
+        raise FileEntryNotFoundError(file_id)
+
+    return file_entry
+
+
+def search_files(
+    session: Session,
+    workspace_id: int,
+    *,
+    keyword: str | None = None,
+    extension: str | None = None,
+    modified_from: datetime | None = None,
+    modified_to: datetime | None = None,
+    sort_by: str = "relative_path",
+    sort_order: str = "asc",
+    page: int = 1,
+    page_size: int = 50,
+) -> FileSearchResult:
+    """在一个已授权工作区的持久化索引中搜索文件。"""
+
+    if get_workspace_by_id(session, workspace_id) is None:
+        raise WorkspaceNotFoundError(workspace_id)
+    if page < 1:
+        raise ValueError("page must be at least 1")
+    if not 1 <= page_size <= 100:
+        raise ValueError("page_size must be between 1 and 100")
+    if sort_by not in _FILE_SORT_FIELDS:
+        raise ValueError(f"unsupported file sort field: {sort_by}")
+
+    normalized_keyword = _normalize_keyword(keyword)
+    normalized_extension = _normalize_extension(extension)
+    modified_from_ns = _datetime_to_epoch_ns(modified_from)
+    modified_to_ns = _datetime_to_epoch_ns(modified_to)
+    filter_options = {
+        "keyword": normalized_keyword,
+        "extension": normalized_extension,
+        "modified_from_ns": modified_from_ns,
+        "modified_to_ns": modified_to_ns,
+    }
+
+    total = count_file_entries(
+        session,
+        workspace_id,
+        **filter_options,
+    )
+    items = find_file_entries(
+        session,
+        workspace_id,
+        sort_by=_FILE_SORT_FIELDS[sort_by],
+        sort_order=sort_order,
+        offset=(page - 1) * page_size,
+        limit=page_size,
+        **filter_options,
+    )
+
+    return FileSearchResult(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+def _normalize_keyword(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("keyword must not be blank")
+    return normalized
+
+
+def _normalize_extension(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = value.strip().casefold()
+    if not normalized:
+        raise ValueError("extension must not be blank")
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    return normalized
+
+
+def _datetime_to_epoch_ns(value: datetime | None) -> int | None:
+    """不经过浮点时间戳，将带时区时间精确转换为纳秒。"""
+
+    if value is None:
+        return None
+    if value.utcoffset() is None:
+        raise ValueError("modified time must include timezone information")
+
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = value.astimezone(timezone.utc) - epoch
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
 
 
 def sync_file_index(
