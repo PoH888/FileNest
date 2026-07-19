@@ -137,6 +137,28 @@ def get_file_detail(
     return file_entry
 
 
+def get_authorized_file_metadata(
+    session: Session,
+    workspace_id: int,
+    file_id: int,
+) -> FileEntry:
+    """读取文件索引元数据前验证工作区归属和相对路径授权。"""
+
+    workspace = get_workspace_by_id(session, workspace_id)
+    if workspace is None:
+        raise WorkspaceNotFoundError(workspace_id)
+
+    file_entry = get_file_entry_by_id(session, workspace_id, file_id)
+    if file_entry is None:
+        raise FileEntryNotFoundError(file_id)
+
+    # 索引属于数据库数据，也可能因历史版本或人工修改而不可信。
+    # 返回给 Agent 前重新经过 Path Policy，防止污染路径越过工作区。
+    adapter = FileSystemAdapter(Path(workspace.root_path))
+    adapter.authorized_path(Path(file_entry.relative_path))
+    return file_entry
+
+
 def search_files(
     session: Session,
     workspace_id: int,
