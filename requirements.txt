@@ -10,3 +10,4 @@ pydantic-settings>=2.15.0
 uvicorn>=0.52.4
 SQLAlchemy>=2.0,<3.0
 alembic>=1.18,<2.0
+openai>=2.0,<3.0

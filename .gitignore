@@ -28,6 +28,11 @@ settings.json.bak
 logs/
 backend/filenest.db
 
+# --- 本地环境变量/密钥 ---
+.env
+.env.*
+!.env.example
+
 # --- 文档/规划（不上传 GitHub） ---
 Plan.md
 Plan_vs_Actual.md
