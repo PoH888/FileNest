@@ -94,6 +94,40 @@ def test_registry_dispatches_registered_list_workspaces_tool(
     assert "root_path" not in result.model_dump_json()
 
 
+def test_registry_validates_registered_call_without_running_handler() -> None:
+    handler_calls: list[bool] = []
+    registry = ToolRegistry([_fake_tool("safe_tool", handler_calls)])
+
+    result = registry.validate("safe_tool", {})
+
+    assert result == ToolResult.success()
+    assert handler_calls == []
+
+
+def test_registry_rejects_unregistered_write_tool_during_validation() -> None:
+    handler_calls: list[bool] = []
+    registry = ToolRegistry([_fake_tool("safe_tool", handler_calls)])
+
+    result = registry.validate("delete_file", {"path": "private.txt"})
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code == "unknown_tool"
+    assert handler_calls == []
+
+
+def test_registry_rejects_invalid_arguments_without_running_handler() -> None:
+    handler_calls: list[bool] = []
+    registry = ToolRegistry([_fake_tool("safe_tool", handler_calls)])
+
+    result = registry.validate("safe_tool", {"unexpected": True})
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code == "invalid_arguments"
+    assert handler_calls == []
+
+
 @pytest.mark.parametrize("unknown_name", ["delete_all_files", "", 123, None])
 def test_registry_rejects_unknown_tool_without_calling_handler(
     unknown_name: object,

@@ -123,17 +123,22 @@ class Tool(BaseModel):
 
         return cast(dict[str, JsonValue], self.arguments_model.model_json_schema())
 
+    def validate_arguments(self, arguments: object) -> ToolResult:
+        """只校验不可信参数，不调用工具处理函数。"""
+
+        validation = self._validated_arguments(arguments)
+        if isinstance(validation, ToolResult):
+            return validation
+        return ToolResult.success()
+
     def invoke(self, arguments: object) -> ToolResult:
         """验证不可信参数，并把执行边界内的失败统一为安全结果。"""
 
-        try:
-            validated_arguments = self.arguments_model.model_validate(arguments)
-        except ValidationError as error:
-            return ToolResult.failure(
-                code="invalid_arguments",
-                message="工具参数不符合契约",
-                details={"errors": _safe_validation_errors(error)},
-            )
+        validation = self._validated_arguments(arguments)
+        if isinstance(validation, ToolResult):
+            return validation
+
+        validated_arguments = validation
 
         try:
             result = self.handler(validated_arguments)
@@ -155,6 +160,18 @@ class Tool(BaseModel):
             )
 
         return result
+
+    def _validated_arguments(self, arguments: object) -> BaseModel | ToolResult:
+        """复用同一验证结果，避免校验入口与执行入口规则分叉。"""
+
+        try:
+            return self.arguments_model.model_validate(arguments)
+        except ValidationError as error:
+            return ToolResult.failure(
+                code="invalid_arguments",
+                message="工具参数不符合契约",
+                details={"errors": _safe_validation_errors(error)},
+            )
 
 
 def _safe_validation_errors(error: ValidationError) -> list[JsonValue]:

@@ -55,6 +55,18 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
+    def validate(self, name: object, arguments: object) -> ToolResult:
+        """校验工具白名单权限与参数，不执行工具处理函数。"""
+
+        tool = self._tools.get(name) if isinstance(name, str) else None
+        if tool is None:
+            return ToolResult.failure(
+                code="unknown_tool",
+                message="请求的工具未注册",
+            )
+
+        return tool.validate_arguments(arguments)
+
     def invoke(self, name: object, arguments: object) -> ToolResult:
         """调用白名单工具；未知或非法名称一律拒绝。"""
 
