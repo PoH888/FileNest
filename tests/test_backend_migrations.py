@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_CONFIG_PATH = PROJECT_ROOT / "backend" / "alembic.ini"
 
 
-def test_migrations_build_schema_from_empty_database_and_downgrade_latest(
+def test_migrations_build_schema_and_downgrade_each_latest_layer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -61,8 +61,84 @@ def test_migrations_build_schema_from_empty_database_and_downgrade_latest(
         assert foreign_keys[0]["constrained_columns"] == ["workspace_id"]
         assert foreign_keys[0]["referred_table"] == "workspaces"
         assert foreign_keys[0]["referred_columns"] == ["id"]
+
+        assert "agent_runs" in schema.get_table_names()
+        assert [
+            column["name"] for column in schema.get_columns("agent_runs")
+        ] == [
+            "id",
+            "status",
+            "started_at",
+            "finished_at",
+            "model_turns",
+            "error_code",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_runs")
+        } == {
+            "ck_agent_runs_status",
+            "ck_agent_runs_model_turns_non_negative",
+        }
+
+        assert "agent_tool_calls" in schema.get_table_names()
+        assert [
+            column["name"]
+            for column in schema.get_columns("agent_tool_calls")
+        ] == [
+            "id",
+            "agent_run_id",
+            "sequence_no",
+            "model_call_id",
+            "tool_name",
+            "status",
+            "started_at",
+            "finished_at",
+            "error_code",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_tool_calls")
+        } == {
+            "ck_agent_tool_calls_sequence_positive",
+            "ck_agent_tool_calls_status",
+        }
+        assert {
+            constraint["name"]: constraint["column_names"]
+            for constraint in schema.get_unique_constraints("agent_tool_calls")
+        } == {
+            "uq_agent_tool_calls_run_model_call_id": [
+                "agent_run_id",
+                "model_call_id",
+            ],
+            "uq_agent_tool_calls_run_sequence": [
+                "agent_run_id",
+                "sequence_no",
+            ],
+        }
+
+        agent_tool_foreign_keys = schema.get_foreign_keys("agent_tool_calls")
+        assert len(agent_tool_foreign_keys) == 1
+        assert agent_tool_foreign_keys[0]["constrained_columns"] == [
+            "agent_run_id"
+        ]
+        assert agent_tool_foreign_keys[0]["referred_table"] == "agent_runs"
+        assert agent_tool_foreign_keys[0]["referred_columns"] == ["id"]
     finally:
         engine.dispose()
+
+    command.downgrade(alembic_config, "8b872f337530")
+
+    previous_head_engine = create_engine(database_url)
+    try:
+        previous_head_schema = inspect(previous_head_engine)
+
+        assert "workspaces" in previous_head_schema.get_table_names()
+        assert "file_entries" in previous_head_schema.get_table_names()
+        assert "agent_runs" not in previous_head_schema.get_table_names()
+        assert "agent_tool_calls" not in previous_head_schema.get_table_names()
+    finally:
+        previous_head_engine.dispose()
 
     command.downgrade(alembic_config, "4eb613c09cae")
 
@@ -72,5 +148,7 @@ def test_migrations_build_schema_from_empty_database_and_downgrade_latest(
 
         assert "workspaces" in downgraded_schema.get_table_names()
         assert "file_entries" not in downgraded_schema.get_table_names()
+        assert "agent_runs" not in downgraded_schema.get_table_names()
+        assert "agent_tool_calls" not in downgraded_schema.get_table_names()
     finally:
         downgraded_engine.dispose()

@@ -2,8 +2,15 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
-from openai import OpenAIError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAIError,
+    RateLimitError,
+)
 
 import backend.app.openai_compatible_model_client as client_module
 from backend.app.model_client import (
@@ -307,4 +314,69 @@ def test_client_hides_sdk_error_details() -> None:
     with pytest.raises(ModelProviderRequestError) as error_info:
         client.complete(messages=[ModelMessage(role="user", content="你好")], tools=[])
 
+    assert exposed_secret not in str(error_info.value)
+
+
+@pytest.mark.parametrize(
+    ("sdk_error_name", "expected_code", "expected_retryable"),
+    [
+        ("timeout", "model_timeout", True),
+        ("connection", "model_connection_error", True),
+        ("rate_limit", "model_rate_limited", True),
+        ("server", "model_server_error", True),
+        ("authentication", "model_request_rejected", False),
+        ("provider", "model_provider_error", False),
+    ],
+)
+def test_client_classifies_sdk_errors_without_exposing_details(
+    sdk_error_name: str,
+    expected_code: str,
+    expected_retryable: bool,
+) -> None:
+    exposed_secret = f"secret-from-{sdk_error_name}"
+    request = httpx.Request(
+        "POST",
+        "https://provider.example/v1/chat/completions",
+    )
+    status_errors: dict[str, APIStatusError] = {
+        "rate_limit": RateLimitError(
+            exposed_secret,
+            response=httpx.Response(429, request=request),
+            body={"message": exposed_secret},
+        ),
+        "server": APIStatusError(
+            exposed_secret,
+            response=httpx.Response(503, request=request),
+            body={"message": exposed_secret},
+        ),
+        "authentication": APIStatusError(
+            exposed_secret,
+            response=httpx.Response(401, request=request),
+            body={"message": exposed_secret},
+        ),
+    }
+    sdk_errors: dict[str, OpenAIError] = {
+        "timeout": APITimeoutError(request),
+        "connection": APIConnectionError(
+            message=exposed_secret,
+            request=request,
+        ),
+        **status_errors,
+        "provider": OpenAIError(exposed_secret),
+    }
+    client = OpenAICompatibleModelClient(
+        _settings(),
+        sdk_client=StubSdkClient(
+            StubCompletions(error=sdk_errors[sdk_error_name])
+        ),
+    )
+
+    with pytest.raises(ModelProviderRequestError) as error_info:
+        client.complete(
+            messages=[ModelMessage(role="user", content="你好")],
+            tools=[],
+        )
+
+    assert error_info.value.code == expected_code
+    assert error_info.value.retryable is expected_retryable
     assert exposed_secret not in str(error_info.value)

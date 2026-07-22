@@ -7,11 +7,20 @@ from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
 
 from .model_client import (
     ModelCallMetrics,
+    ModelClientRequestError,
     ModelMessage,
+    ModelRequestErrorCode,
     ModelResponse,
     ModelTokenPricing,
     ModelTokenUsage,
@@ -25,8 +34,20 @@ class UnsupportedModelProviderError(ValueError):
     """配置的供应商不属于已审核的 OpenAI 兼容地址。"""
 
 
-class ModelProviderRequestError(RuntimeError):
+class ModelProviderRequestError(ModelClientRequestError):
     """供应商请求失败，且不向上层公开 SDK 内部信息。"""
+
+    def __init__(
+        self,
+        *,
+        code: ModelRequestErrorCode,
+        retryable: bool,
+    ) -> None:
+        super().__init__(
+            code=code,
+            message="模型供应商请求失败",
+            retryable=retryable,
+        )
 
 
 class InvalidModelProviderResponseError(RuntimeError):
@@ -87,9 +108,37 @@ class OpenAICompatibleModelClient:
         started_at = perf_counter()
         try:
             response = self._client.chat.completions.create(**request)
+        except APITimeoutError:
+            raise ModelProviderRequestError(
+                code="model_timeout",
+                retryable=True,
+            ) from None
+        except APIConnectionError:
+            raise ModelProviderRequestError(
+                code="model_connection_error",
+                retryable=True,
+            ) from None
+        except RateLimitError:
+            raise ModelProviderRequestError(
+                code="model_rate_limited",
+                retryable=True,
+            ) from None
+        except APIStatusError as error:
+            is_server_error = error.status_code >= 500
+            raise ModelProviderRequestError(
+                code=(
+                    "model_server_error"
+                    if is_server_error
+                    else "model_request_rejected"
+                ),
+                retryable=is_server_error,
+            ) from None
         except OpenAIError:
-            # SDK 异常可能携带请求上下文，上层只接收稳定且不含密钥的错误。
-            raise ModelProviderRequestError("模型供应商请求失败") from None
+            # 未知 SDK 异常默认不重试，避免错误配置触发重复外部请求。
+            raise ModelProviderRequestError(
+                code="model_provider_error",
+                retryable=False,
+            ) from None
 
         latency_ms = (perf_counter() - started_at) * 1000
         return _model_response(

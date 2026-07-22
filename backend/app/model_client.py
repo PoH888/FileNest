@@ -18,6 +18,29 @@ from .tool_registry import ToolDefinition
 
 ModelRole = Literal["system", "user", "assistant", "tool"]
 ModelFinishReason = Literal["stop", "tool_calls"]
+ModelRequestErrorCode = Literal[
+    "model_timeout",
+    "model_connection_error",
+    "model_rate_limited",
+    "model_server_error",
+    "model_request_rejected",
+    "model_provider_error",
+]
+
+
+class ModelClientRequestError(RuntimeError):
+    """所有模型适配器向 Agent Loop 暴露的稳定请求错误。"""
+
+    def __init__(
+        self,
+        *,
+        code: ModelRequestErrorCode,
+        message: str,
+        retryable: bool,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
 
 
 class ModelTokenPricing(BaseModel):

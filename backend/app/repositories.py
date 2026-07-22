@@ -10,7 +10,7 @@ from sqlalchemy import func, or_, select # select()：构造数据库查询。
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from .models import FileEntry, Workspace
+from .models import AgentRun, AgentToolCall, FileEntry, Workspace
 
 FileEntrySortField = Literal[
     "relative_path",
@@ -220,3 +220,39 @@ def delete_file_entry(
     """将文件索引标记为待删除，事务由调用方提交。"""
 
     session.delete(file_entry)
+
+
+def add_agent_run(
+    session: Session,
+    agent_run: AgentRun,
+) -> None:
+    """加入一条 Agent 运行记录，提交时机由记录服务决定。"""
+
+    session.add(agent_run)
+
+
+def get_agent_run_by_id(
+    session: Session,
+    agent_run_id: int,
+) -> AgentRun | None:
+    """按主键读取 Agent 运行记录。"""
+
+    return session.get(AgentRun, agent_run_id)
+
+
+def add_agent_tool_call(
+    session: Session,
+    tool_call: AgentToolCall,
+) -> None:
+    """加入一条工具调用记录，提交时机由记录服务决定。"""
+
+    session.add(tool_call)
+
+
+def get_agent_tool_call_by_id(
+    session: Session,
+    tool_call_id: int,
+) -> AgentToolCall | None:
+    """按主键读取工具调用记录。"""
+
+    return session.get(AgentToolCall, tool_call_id)

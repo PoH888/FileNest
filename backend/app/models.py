@@ -1,4 +1,14 @@
-from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    String,
+    UniqueConstraint,
+    func,
+)
 
 from sqlalchemy.orm import Mapped, mapped_column
 # Mapped 用来标记：这个类属性不是普通属性，而是需要映射到数据库字段的 ORM 属性。
@@ -47,3 +57,94 @@ class FileEntry(Base):
     extension: Mapped[str] = mapped_column(String, nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     mtime_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class AgentRun(Base):
+    """一次 Agent Loop 运行的持久化生命周期。"""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'completed', 'max_steps_reached', "
+            "'timed_out', 'cancelled', 'failed')",
+            name="ck_agent_runs_status",
+        ),
+        CheckConstraint(
+            "model_turns >= 0",
+            name="ck_agent_runs_model_turns_non_negative",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="running",
+        server_default="running",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    model_turns: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class AgentToolCall(Base):
+    """一次 Agent Run 中可观察但不含原始参数和结果的工具调用。"""
+
+    __tablename__ = "agent_tool_calls"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_run_id",
+            "sequence_no",
+            name="uq_agent_tool_calls_run_sequence",
+        ),
+        UniqueConstraint(
+            "agent_run_id",
+            "model_call_id",
+            name="uq_agent_tool_calls_run_model_call_id",
+        ),
+        CheckConstraint(
+            "sequence_no >= 1",
+            name="ck_agent_tool_calls_sequence_positive",
+        ),
+        CheckConstraint(
+            "status IN ('requested', 'succeeded', 'rejected', 'failed')",
+            name="ck_agent_tool_calls_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_runs.id"),
+        nullable=False,
+    )
+    sequence_no: Mapped[int] = mapped_column(nullable=False)
+    model_call_id: Mapped[str] = mapped_column(String, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="requested",
+        server_default="requested",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
