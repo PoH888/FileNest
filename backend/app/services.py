@@ -15,6 +15,12 @@ from sqlalchemy.orm import Session
 
 from .filesystem_adapter import FileSystemAdapter
 from .models import FileEntry, Workspace
+from .operation_preview import (
+    OperationPreviewItem,
+    OperationPreviewRequest,
+    OperationPreviewResponse,
+    rank_preview_candidates,
+)
 from .path_policy import PathPolicyError
 from .repositories import (
     add_file_entry,
@@ -48,6 +54,10 @@ class DuplicateScannedPathError(Exception):
 
 class WorkspaceScanUnavailableError(Exception):
     """工作区根目录当前无法安全扫描。"""
+
+
+class OperationPreviewPathUnavailableError(Exception):
+    """整理预览所需的源文件或目标目录当前不可用。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +167,61 @@ def get_authorized_file_metadata(
     adapter = FileSystemAdapter(Path(workspace.root_path))
     adapter.authorized_path(Path(file_entry.relative_path))
     return file_entry
+
+
+def generate_operation_preview(
+    session: Session,
+    request: OperationPreviewRequest,
+) -> OperationPreviewResponse:
+    """根据当前索引和真实磁盘状态生成只读候选预览。"""
+
+    workspace = get_workspace_by_id(session, request.workspace_id)
+    if workspace is None:
+        raise WorkspaceNotFoundError(request.workspace_id)
+
+    adapter = FileSystemAdapter(Path(workspace.root_path))
+    for directory in request.target_directories:
+        try:
+            is_directory = adapter.is_directory(Path(directory))
+        except OSError as error:
+            raise OperationPreviewPathUnavailableError(directory) from error
+        if not is_directory:
+            raise OperationPreviewPathUnavailableError(directory)
+
+    items: list[OperationPreviewItem] = []
+    for file_id in request.source_file_ids:
+        file_entry = get_file_entry_by_id(
+            session,
+            request.workspace_id,
+            file_id,
+        )
+        if file_entry is None:
+            raise FileEntryNotFoundError(file_id)
+
+        try:
+            metadata = adapter.get_file_metadata(Path(file_entry.relative_path))
+        except OSError as error:
+            raise OperationPreviewPathUnavailableError(
+                file_entry.relative_path
+            ) from error
+        if metadata is None:
+            raise OperationPreviewPathUnavailableError(file_entry.relative_path)
+
+        items.append(
+            OperationPreviewItem(
+                source_file_id=file_entry.id,
+                source_relative_path=file_entry.relative_path,
+                candidates=rank_preview_candidates(
+                    file_entry.name,
+                    request.target_directories,
+                ),
+            )
+        )
+
+    return OperationPreviewResponse(
+        workspace_id=request.workspace_id,
+        items=items,
+    )
 
 
 def search_files(
