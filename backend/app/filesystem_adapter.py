@@ -1,6 +1,7 @@
 """所有正式文件读取都必须经过的安全文件系统边界。"""
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from stat import S_ISREG
 
@@ -42,6 +43,15 @@ class FileSystemAdapter:
 
         return self._authorize(requested_path).path.is_dir()
 
+    def path_exists(self, requested_path: Path) -> bool:
+        """授权路径后判断目标是否已被文件、目录或符号链接占用。"""
+
+        authorized_path = self._authorize(requested_path)
+        candidate_path = requested_path
+        if not candidate_path.is_absolute():
+            candidate_path = authorized_path.workspace_root / candidate_path
+        return candidate_path.exists() or candidate_path.is_symlink()
+
     def read_text(
         self,
         requested_path: Path,
@@ -68,6 +78,20 @@ class FileSystemAdapter:
             size_bytes=file_stat.st_size,
             mtime_ns=file_stat.st_mtime_ns,
         )
+
+    def get_file_sha256(self, requested_path: Path) -> str | None:
+        """授权后分块计算普通文件摘要，避免一次性载入大文件。"""
+
+        authorized_path = self._authorize(requested_path).path
+        file_stat = authorized_path.stat()
+        if not S_ISREG(file_stat.st_mode):
+            return None
+
+        digest = sha256()
+        with authorized_path.open("rb") as source_file:
+            while chunk := source_file.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def list_directory(self, requested_path: Path = Path(".")) -> list[str]:
         """列出目录中经过 Path Policy 授权的直接子项名称。"""

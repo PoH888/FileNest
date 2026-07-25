@@ -7,7 +7,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +21,7 @@ from .operation_preview import (
     OperationPreviewResponse,
     rank_preview_candidates,
 )
+from .operation_plan import OperationPlan
 from .path_policy import PathPolicyError
 from .repositories import (
     add_file_entry,
@@ -60,6 +61,26 @@ class OperationPreviewPathUnavailableError(Exception):
     """整理预览所需的源文件或目标目录当前不可用。"""
 
 
+class OperationPlanSourceMismatchError(Exception):
+    """计划中的源路径与当前工作区文件索引不一致。"""
+
+
+class OperationPlanTargetUnavailableError(Exception):
+    """计划目标的父目录当前不可用。"""
+
+
+class OperationPlanTargetConflictError(Exception):
+    """计划目标已经被文件、目录或符号链接占用。"""
+
+
+class OperationPlanExpiredError(Exception):
+    """计划的生成时间不在允许执行的时间窗口内。"""
+
+
+class OperationPlanSourceChangedError(Exception):
+    """计划生成后源文件已经消失或内容状态发生变化。"""
+
+
 @dataclass(frozen=True, slots=True)
 class FileIndexSyncResult:
     """一次文件索引同步产生的变化统计。"""
@@ -86,6 +107,8 @@ _FILE_SORT_FIELDS: dict[str, FileEntrySortField] = {
     "size_bytes": "size_bytes",
     "modified_at": "mtime_ns",
 }
+
+OPERATION_PLAN_MAX_AGE = timedelta(minutes=15)
 
 
 def create_workspace(
@@ -222,6 +245,84 @@ def generate_operation_preview(
         workspace_id=request.workspace_id,
         items=items,
     )
+
+
+def validate_operation_plan(
+    session: Session,
+    plan: OperationPlan,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """校验计划时间、源文件状态、工作区归属和目标冲突。"""
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+
+    plan_age = current_time - plan.created_at
+    if plan_age < timedelta(0) or plan_age > OPERATION_PLAN_MAX_AGE:
+        raise OperationPlanExpiredError(plan.plan_id)
+
+    workspace = get_workspace_by_id(session, plan.workspace_id)
+    if workspace is None:
+        raise WorkspaceNotFoundError(plan.workspace_id)
+
+    adapter = FileSystemAdapter(Path(workspace.root_path))
+    for operation in plan.operations:
+        file_entry = get_file_entry_by_id(
+            session,
+            plan.workspace_id,
+            operation.source_file_id,
+        )
+        if file_entry is None:
+            raise FileEntryNotFoundError(operation.source_file_id)
+        if file_entry.relative_path != operation.source_relative_path:
+            raise OperationPlanSourceMismatchError(operation.source_file_id)
+
+        source_path = Path(operation.source_relative_path)
+        adapter.authorized_path(source_path)
+        try:
+            current_metadata = adapter.get_file_metadata(source_path)
+        except OSError as error:
+            raise OperationPlanSourceChangedError(
+                operation.source_file_id
+            ) from error
+
+        expected_metadata = operation.source_precondition
+        if (
+            current_metadata is None
+            or current_metadata.size_bytes != expected_metadata.size_bytes
+            or current_metadata.mtime_ns != expected_metadata.mtime_ns
+        ):
+            raise OperationPlanSourceChangedError(operation.source_file_id)
+
+        expected_hash = expected_metadata.content_hash
+        if expected_hash is not None:
+            try:
+                current_hash = adapter.get_file_sha256(source_path)
+            except OSError as error:
+                raise OperationPlanSourceChangedError(
+                    operation.source_file_id
+                ) from error
+            if current_hash != expected_hash.digest:
+                raise OperationPlanSourceChangedError(operation.source_file_id)
+
+        target_path = Path(operation.target_relative_path)
+        adapter.authorized_path(target_path)
+
+        try:
+            if not adapter.is_directory(target_path.parent):
+                raise OperationPlanTargetUnavailableError(
+                    operation.target_relative_path
+                )
+            if adapter.path_exists(target_path):
+                raise OperationPlanTargetConflictError(
+                    operation.target_relative_path
+                )
+        except OSError as error:
+            raise OperationPlanTargetUnavailableError(
+                operation.target_relative_path
+            ) from error
 
 
 def search_files(
