@@ -4,6 +4,10 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from backend.app.models import ApprovalAuditEvent, ApprovalRequest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -124,8 +128,178 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
         ]
         assert agent_tool_foreign_keys[0]["referred_table"] == "agent_runs"
         assert agent_tool_foreign_keys[0]["referred_columns"] == ["id"]
+
+        assert "approval_requests" in schema.get_table_names()
+        assert [
+            column["name"]
+            for column in schema.get_columns("approval_requests")
+        ] == [
+            "id",
+            "workflow_id",
+            "plan_id",
+            "status",
+            "created_at",
+        ]
+        assert schema.get_unique_constraints("approval_requests") == [
+            {
+                "name": "uq_approval_requests_workflow_id",
+                "column_names": ["workflow_id"],
+            }
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints(
+                "approval_requests"
+            )
+        } == {"ck_approval_requests_status"}
+
+        assert "approval_audit_events" in schema.get_table_names()
+        assert [
+            column["name"]
+            for column in schema.get_columns("approval_audit_events")
+        ] == [
+            "id",
+            "approval_request_id",
+            "action",
+            "previous_status",
+            "next_status",
+            "previous_plan_id",
+            "next_plan_id",
+            "recorded_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints(
+                "approval_audit_events"
+            )
+        } == {
+            "ck_approval_audit_events_action",
+            "ck_approval_audit_events_previous_status",
+            "ck_approval_audit_events_next_status",
+        }
+        approval_audit_foreign_keys = schema.get_foreign_keys(
+            "approval_audit_events"
+        )
+        assert len(approval_audit_foreign_keys) == 1
+        assert approval_audit_foreign_keys[0]["constrained_columns"] == [
+            "approval_request_id"
+        ]
+        assert approval_audit_foreign_keys[0]["referred_table"] == (
+            "approval_requests"
+        )
+        assert approval_audit_foreign_keys[0]["referred_columns"] == ["id"]
+        assert schema.get_indexes("approval_audit_events") == [
+            {
+                "name": "ix_approval_audit_events_approval_request_id",
+                "column_names": ["approval_request_id"],
+                "unique": 0,
+                "dialect_options": {},
+            }
+        ]
+
+        with Session(engine) as session:
+            approval = ApprovalRequest(
+                workflow_id="66c8d4ba-a042-4491-a5d2-ad28cb47b8d9",
+                plan_id="2d053752-d3c4-45cb-b696-bd043e78ed92",
+            )
+            session.add(approval)
+            session.commit()
+            approval_id = approval.id
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    ApprovalRequest(
+                        workflow_id=approval.workflow_id,
+                        plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                    )
+                )
+                session.commit()
+            session.rollback()
+
+            audit_event = ApprovalAuditEvent(
+                approval_request_id=approval_id,
+                action="approve",
+                previous_status="WAITING_APPROVAL",
+                next_status="APPROVED",
+                previous_plan_id=approval.plan_id,
+                next_plan_id=approval.plan_id,
+            )
+            session.add(audit_event)
+            session.commit()
+            audit_event_id = audit_event.id
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    ApprovalAuditEvent(
+                        approval_request_id=approval_id,
+                        action="execute_without_approval",
+                        previous_status="WAITING_APPROVAL",
+                        next_status="APPROVED",
+                        previous_plan_id=approval.plan_id,
+                        next_plan_id=approval.plan_id,
+                    )
+                )
+                session.commit()
+            session.rollback()
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    ApprovalRequest(
+                        workflow_id="8933c981-fe44-4d3f-a4e0-3d7ed66be0ca",
+                        plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                        status="EXECUTING",
+                    )
+                )
+                session.commit()
+            session.rollback()
     finally:
         engine.dispose()
+
+    reopened_engine = create_engine(database_url)
+    try:
+        with Session(reopened_engine) as session:
+            restored = session.get(ApprovalRequest, approval_id)
+
+            assert restored is not None
+            assert restored.status == "WAITING_APPROVAL"
+            assert restored.workflow_id == (
+                "66c8d4ba-a042-4491-a5d2-ad28cb47b8d9"
+            )
+            assert restored.plan_id == (
+                "2d053752-d3c4-45cb-b696-bd043e78ed92"
+            )
+
+            restored_event = session.get(
+                ApprovalAuditEvent,
+                audit_event_id,
+            )
+            assert restored_event is not None
+            assert restored_event.approval_request_id == approval_id
+            assert restored_event.action == "approve"
+            assert restored_event.previous_status == "WAITING_APPROVAL"
+            assert restored_event.next_status == "APPROVED"
+            assert restored_event.recorded_at is not None
+    finally:
+        reopened_engine.dispose()
+
+    command.downgrade(alembic_config, "c3f4a1b92d6e")
+
+    previous_approval_engine = create_engine(database_url)
+    try:
+        previous_approval_schema = inspect(previous_approval_engine)
+
+        assert "approval_requests" not in (
+            previous_approval_schema.get_table_names()
+        )
+        assert "approval_audit_events" not in (
+            previous_approval_schema.get_table_names()
+        )
+        assert "agent_runs" in previous_approval_schema.get_table_names()
+        assert "agent_tool_calls" in (
+            previous_approval_schema.get_table_names()
+        )
+    finally:
+        previous_approval_engine.dispose()
 
     command.downgrade(alembic_config, "8b872f337530")
 

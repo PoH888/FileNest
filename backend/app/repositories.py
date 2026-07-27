@@ -6,11 +6,18 @@
 
 from typing import Literal
 
-from sqlalchemy import func, or_, select # select()：构造数据库查询。
+from sqlalchemy import func, or_, select, update # select()：构造数据库查询。
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from .models import AgentRun, AgentToolCall, FileEntry, Workspace
+from .models import (
+    AgentRun,
+    AgentToolCall,
+    ApprovalAuditEvent,
+    ApprovalRequest,
+    FileEntry,
+    Workspace,
+)
 
 FileEntrySortField = Literal[
     "relative_path",
@@ -19,6 +26,8 @@ FileEntrySortField = Literal[
     "mtime_ns",
 ]
 SortOrder = Literal["asc", "desc"]
+ApprovalStatus = Literal["WAITING_APPROVAL", "APPROVED", "REJECTED"]
+ApprovalAction = Literal["approve", "edit", "reject"]
 
 _FILE_ENTRY_SORT_COLUMNS = {
     "relative_path": FileEntry.relative_path,
@@ -256,3 +265,82 @@ def get_agent_tool_call_by_id(
     """按主键读取工具调用记录。"""
 
     return session.get(AgentToolCall, tool_call_id)
+
+
+def get_approval_request_by_workflow_id(
+    session: Session,
+    workflow_id: str,
+) -> ApprovalRequest | None:
+    """按工作流标识读取当前审批业务状态。"""
+
+    statement = select(ApprovalRequest).where(
+        ApprovalRequest.workflow_id == workflow_id,
+    )
+    return session.scalar(statement)
+
+
+def find_waiting_approval_requests(
+    session: Session,
+) -> list[ApprovalRequest]:
+    """按稳定顺序读取所有等待人工决定的审批任务。"""
+
+    statement = (
+        select(ApprovalRequest)
+        .where(ApprovalRequest.status == "WAITING_APPROVAL")
+        .order_by(ApprovalRequest.id.asc())
+    )
+    return list(session.scalars(statement).all())
+
+
+def compare_and_set_approval_request(
+    session: Session,
+    workflow_id: str,
+    expected_plan_id: str,
+    *,
+    next_status: ApprovalStatus,
+    next_plan_id: str,
+) -> bool:
+    """仅在审批仍等待且计划未变化时原子更新。"""
+
+    statement = (
+        update(ApprovalRequest)
+        .where(
+            ApprovalRequest.workflow_id == workflow_id,
+            ApprovalRequest.status == "WAITING_APPROVAL",
+            ApprovalRequest.plan_id == expected_plan_id,
+        )
+        .values(
+            status=next_status,
+            plan_id=next_plan_id,
+        )
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
+
+
+def add_approval_audit_event(
+    session: Session,
+    audit_event: ApprovalAuditEvent,
+) -> None:
+    """追加审批历史，提交时机由同一审批事务决定。"""
+
+    session.add(audit_event)
+
+
+def find_approval_audit_events(
+    session: Session,
+    approval_request_id: int,
+) -> list[ApprovalAuditEvent]:
+    """按写入顺序读取一条审批任务的不可变历史。"""
+
+    statement = (
+        select(ApprovalAuditEvent)
+        .where(
+            ApprovalAuditEvent.approval_request_id == approval_request_id
+        )
+        .order_by(ApprovalAuditEvent.id.asc())
+    )
+    return list(session.scalars(statement).all())

@@ -8,13 +8,15 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
+from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .filesystem_adapter import FileSystemAdapter
-from .models import FileEntry, Workspace
+from .models import ApprovalAuditEvent, ApprovalRequest, FileEntry, Workspace
 from .operation_preview import (
     OperationPreviewItem,
     OperationPreviewRequest,
@@ -25,13 +27,18 @@ from .operation_plan import OperationPlan
 from .path_policy import PathPolicyError
 from .repositories import (
     add_file_entry,
+    add_approval_audit_event,
     add_workspace,
+    ApprovalAction,
+    ApprovalStatus,
+    compare_and_set_approval_request,
     count_file_entries,
     delete_file_entry,
     FileEntrySortField,
     find_file_entries,
     find_workspaces,
     get_file_entry_by_id,
+    get_approval_request_by_workflow_id,
     get_workspace_by_id,
 )
 from .workspace_scanner import ScannedFile, scan_workspace_files
@@ -81,6 +88,48 @@ class OperationPlanSourceChangedError(Exception):
     """计划生成后源文件已经消失或内容状态发生变化。"""
 
 
+class ApprovalTransitionErrorCode(StrEnum):
+    """审批转换失败时供程序稳定判断的错误码。"""
+
+    NOT_FOUND = "approval_request_not_found"
+    NOT_WAITING = "approval_not_waiting"
+    PLAN_MISMATCH = "approval_plan_mismatch"
+    PLAN_UNCHANGED = "approval_plan_unchanged"
+    STATE_CHANGED = "approval_state_changed"
+
+
+class ApprovalTransitionError(RuntimeError):
+    """拒绝缺失、过期或不符合审批状态机规则的决定。"""
+
+    def __init__(
+        self,
+        code: ApprovalTransitionErrorCode,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class OperationPlanApprovalErrorCode(StrEnum):
+    """操作计划未通过人工审批时供程序稳定判断的错误码。"""
+
+    NOT_FOUND = "operation_plan_approval_not_found"
+    NOT_APPROVED = "operation_plan_not_approved"
+    PLAN_MISMATCH = "approved_operation_plan_mismatch"
+
+
+class OperationPlanApprovalError(RuntimeError):
+    """阻止缺少有效人工审批的操作计划进入执行边界。"""
+
+    def __init__(
+        self,
+        code: OperationPlanApprovalErrorCode,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True, slots=True)
 class FileIndexSyncResult:
     """一次文件索引同步产生的变化统计。"""
@@ -109,6 +158,165 @@ _FILE_SORT_FIELDS: dict[str, FileEntrySortField] = {
 }
 
 OPERATION_PLAN_MAX_AGE = timedelta(minutes=15)
+
+
+def require_approved_operation_plan(
+    session: Session,
+    workflow_id: UUID,
+    plan: OperationPlan,
+) -> ApprovalRequest:
+    """只允许与持久化审批记录完全匹配的已批准计划通过。"""
+
+    approval = get_approval_request_by_workflow_id(
+        session,
+        str(workflow_id),
+    )
+    if approval is None:
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.NOT_FOUND,
+            "操作计划没有对应的审批记录",
+        )
+    if approval.status != "APPROVED":
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.NOT_APPROVED,
+            "操作计划尚未获得人工批准",
+        )
+    if approval.plan_id != str(plan.plan_id):
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.PLAN_MISMATCH,
+            "已批准计划与当前操作计划不一致",
+        )
+
+    return approval
+
+
+def approve_operation_plan(
+    session: Session,
+    workflow_id: UUID,
+    expected_plan_id: UUID,
+) -> ApprovalRequest:
+    """批准仍处于等待状态且内容未变化的计划。"""
+
+    return _transition_approval_request(
+        session,
+        workflow_id,
+        expected_plan_id,
+        action="approve",
+        next_status="APPROVED",
+        next_plan_id=expected_plan_id,
+    )
+
+
+def edit_operation_plan(
+    session: Session,
+    workflow_id: UUID,
+    expected_plan_id: UUID,
+    replacement_plan_id: UUID,
+) -> ApprovalRequest:
+    """用新计划替换当前计划，并继续等待人工审批。"""
+
+    if replacement_plan_id == expected_plan_id:
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.PLAN_UNCHANGED,
+            "编辑后的计划必须使用新的 plan_id",
+        )
+
+    return _transition_approval_request(
+        session,
+        workflow_id,
+        expected_plan_id,
+        action="edit",
+        next_status="WAITING_APPROVAL",
+        next_plan_id=replacement_plan_id,
+    )
+
+
+def reject_operation_plan(
+    session: Session,
+    workflow_id: UUID,
+    expected_plan_id: UUID,
+) -> ApprovalRequest:
+    """拒绝仍处于等待状态且内容未变化的计划。"""
+
+    return _transition_approval_request(
+        session,
+        workflow_id,
+        expected_plan_id,
+        action="reject",
+        next_status="REJECTED",
+        next_plan_id=expected_plan_id,
+    )
+
+
+def _transition_approval_request(
+    session: Session,
+    workflow_id: UUID,
+    expected_plan_id: UUID,
+    *,
+    action: ApprovalAction,
+    next_status: ApprovalStatus,
+    next_plan_id: UUID,
+) -> ApprovalRequest:
+    workflow_key = str(workflow_id)
+    expected_plan_key = str(expected_plan_id)
+    approval = get_approval_request_by_workflow_id(session, workflow_key)
+
+    if approval is None:
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.NOT_FOUND,
+            "审批任务不存在",
+        )
+    if approval.status != "WAITING_APPROVAL":
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.NOT_WAITING,
+            "审批任务已结束，不能再次转换",
+        )
+    if approval.plan_id != expected_plan_key:
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.PLAN_MISMATCH,
+            "待审批计划已经变化",
+        )
+
+    previous_status = approval.status
+    previous_plan_id = approval.plan_id
+
+    try:
+        updated = compare_and_set_approval_request(
+            session,
+            workflow_key,
+            expected_plan_key,
+            next_status=next_status,
+            next_plan_id=str(next_plan_id),
+        )
+        if not updated:
+            raise ApprovalTransitionError(
+                ApprovalTransitionErrorCode.STATE_CHANGED,
+                "审批状态在提交前已经变化",
+            )
+
+        add_approval_audit_event(
+            session,
+            ApprovalAuditEvent(
+                approval_request_id=approval.id,
+                action=action,
+                previous_status=previous_status,
+                next_status=next_status,
+                previous_plan_id=previous_plan_id,
+                next_plan_id=str(next_plan_id),
+            ),
+        )
+        # 审计约束失败必须发生在业务状态提交前，保证二者共同回滚。
+        session.flush()
+
+        # 原子 UPDATE 绕过了当前 ORM 实例，提交前重新加载数据库事实。
+        session.expire(approval)
+        session.refresh(approval)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+    return approval
 
 
 def create_workspace(

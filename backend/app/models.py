@@ -148,3 +148,73 @@ class AgentToolCall(Base):
         nullable=True,
     )
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class ApprovalRequest(Base):
+    """一个等待人工决定的文件操作计划。"""
+
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id",
+            name="uq_approval_requests_workflow_id",
+        ),
+        CheckConstraint(
+            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            name="ck_approval_requests_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="WAITING_APPROVAL",
+        server_default="WAITING_APPROVAL",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+
+class ApprovalAuditEvent(Base):
+    """一次只追加、不保存原始用户文本的审批转换记录。"""
+
+    __tablename__ = "approval_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('approve', 'edit', 'reject')",
+            name="ck_approval_audit_events_action",
+        ),
+        CheckConstraint(
+            "previous_status IN "
+            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            name="ck_approval_audit_events_previous_status",
+        ),
+        CheckConstraint(
+            "next_status IN "
+            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            name="ck_approval_audit_events_next_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    approval_request_id: Mapped[int] = mapped_column(
+        ForeignKey("approval_requests.id"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    previous_status: Mapped[str] = mapped_column(String, nullable=False)
+    next_status: Mapped[str] = mapped_column(String, nullable=False)
+    previous_plan_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    next_plan_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
