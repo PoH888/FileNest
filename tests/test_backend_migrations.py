@@ -7,7 +7,13 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.app.models import ApprovalAuditEvent, ApprovalRequest
+from backend.app.models import (
+    ApprovalAuditEvent,
+    ApprovalRequest,
+    OperationExecution,
+    OperationExecutionItem,
+    Workspace,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -197,7 +203,130 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             }
         ]
 
+        assert "operation_executions" in schema.get_table_names()
+        assert [
+            column["name"]
+            for column in schema.get_columns("operation_executions")
+        ] == [
+            "id",
+            "workflow_id",
+            "plan_id",
+            "workspace_id",
+            "status",
+            "started_at",
+            "completed_at",
+            "undone_at",
+        ]
+        assert {
+            constraint["name"]: constraint["column_names"]
+            for constraint in schema.get_unique_constraints(
+                "operation_executions"
+            )
+        } == {
+            "uq_operation_executions_plan_id": ["plan_id"],
+            "uq_operation_executions_workflow_id": ["workflow_id"],
+        }
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints(
+                "operation_executions"
+            )
+        } == {"ck_operation_executions_status"}
+        execution_foreign_keys = schema.get_foreign_keys(
+            "operation_executions"
+        )
+        assert len(execution_foreign_keys) == 1
+        assert execution_foreign_keys[0]["constrained_columns"] == [
+            "workspace_id"
+        ]
+        assert execution_foreign_keys[0]["referred_table"] == "workspaces"
+        assert execution_foreign_keys[0]["referred_columns"] == ["id"]
+        assert schema.get_indexes("operation_executions") == [
+            {
+                "name": "ix_operation_executions_workspace_id",
+                "column_names": ["workspace_id"],
+                "unique": 0,
+                "dialect_options": {},
+            }
+        ]
+
+        assert "operation_execution_items" in schema.get_table_names()
+        assert [
+            column["name"]
+            for column in schema.get_columns("operation_execution_items")
+        ] == [
+            "id",
+            "execution_id",
+            "sequence_no",
+            "operation_type",
+            "source_file_id",
+            "before_location",
+            "before_relative_path",
+            "before_size_bytes",
+            "before_mtime_ns",
+            "before_sha256",
+            "after_location",
+            "after_relative_path",
+            "after_size_bytes",
+            "after_mtime_ns",
+            "after_sha256",
+            "undo_source_relative_path",
+            "undo_target_relative_path",
+            "status",
+            "recorded_at",
+            "completed_at",
+            "undone_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints(
+                "operation_execution_items"
+            )
+        } == {
+            "ck_operation_execution_items_after_location",
+            "ck_operation_execution_items_after_metadata",
+            "ck_operation_execution_items_before_location",
+            "ck_operation_execution_items_before_metadata",
+            "ck_operation_execution_items_sequence_positive",
+            "ck_operation_execution_items_status",
+            "ck_operation_execution_items_type",
+        }
+        assert schema.get_unique_constraints(
+            "operation_execution_items"
+        ) == [
+            {
+                "name": "uq_operation_execution_items_execution_sequence",
+                "column_names": ["execution_id", "sequence_no"],
+            }
+        ]
+        execution_item_foreign_keys = schema.get_foreign_keys(
+            "operation_execution_items"
+        )
+        assert len(execution_item_foreign_keys) == 1
+        assert execution_item_foreign_keys[0]["constrained_columns"] == [
+            "execution_id"
+        ]
+        assert execution_item_foreign_keys[0]["referred_table"] == (
+            "operation_executions"
+        )
+        assert execution_item_foreign_keys[0]["referred_columns"] == ["id"]
+        assert schema.get_indexes("operation_execution_items") == [
+            {
+                "name": "ix_operation_execution_items_execution_id",
+                "column_names": ["execution_id"],
+                "unique": 0,
+                "dialect_options": {},
+            }
+        ]
+
         with Session(engine) as session:
+            workspace = Workspace(
+                name="迁移测试工作区",
+                root_path=str(tmp_path / "workspace"),
+            )
+            session.add(workspace)
+            session.commit()
+
             approval = ApprovalRequest(
                 workflow_id="66c8d4ba-a042-4491-a5d2-ad28cb47b8d9",
                 plan_id="2d053752-d3c4-45cb-b696-bd043e78ed92",
@@ -211,6 +340,76 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
                     ApprovalRequest(
                         workflow_id=approval.workflow_id,
                         plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                    )
+                )
+                session.commit()
+            session.rollback()
+
+            execution = OperationExecution(
+                workflow_id=approval.workflow_id,
+                plan_id=approval.plan_id,
+                workspace_id=workspace.id,
+            )
+            session.add(execution)
+            session.commit()
+            execution_id = execution.id
+
+            execution_item = OperationExecutionItem(
+                execution_id=execution.id,
+                sequence_no=1,
+                operation_type="move",
+                source_file_id=7,
+                before_location="workspace",
+                before_relative_path="inbox/report.pdf",
+                before_size_bytes=15,
+                before_mtime_ns=123456,
+                after_location="workspace",
+                after_relative_path="documents/report.pdf",
+                undo_source_relative_path="documents/report.pdf",
+                undo_target_relative_path="inbox/report.pdf",
+            )
+            session.add(execution_item)
+            session.commit()
+            execution_item_id = execution_item.id
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    OperationExecution(
+                        workflow_id=execution.workflow_id,
+                        plan_id="8933c981-fe44-4d3f-a4e0-3d7ed66be0ca",
+                        workspace_id=workspace.id,
+                    )
+                )
+                session.commit()
+            session.rollback()
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    OperationExecution(
+                        workflow_id="8933c981-fe44-4d3f-a4e0-3d7ed66be0ca",
+                        plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                        workspace_id=workspace.id,
+                        status="EXECUTED_WITHOUT_HISTORY",
+                    )
+                )
+                session.commit()
+            session.rollback()
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    OperationExecutionItem(
+                        execution_id=execution.id,
+                        sequence_no=2,
+                        operation_type="overwrite",
+                        source_file_id=8,
+                        before_location="workspace",
+                        before_relative_path="inbox/unsafe.txt",
+                        before_size_bytes=1,
+                        before_mtime_ns=1,
+                        after_location="workspace",
+                        after_relative_path="documents/unsafe.txt",
+                        undo_source_relative_path="documents/unsafe.txt",
+                        undo_target_relative_path="inbox/unsafe.txt",
                     )
                 )
                 session.commit()
@@ -279,8 +478,57 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             assert restored_event.previous_status == "WAITING_APPROVAL"
             assert restored_event.next_status == "APPROVED"
             assert restored_event.recorded_at is not None
+
+            restored_execution = session.get(
+                OperationExecution,
+                execution_id,
+            )
+            assert restored_execution is not None
+            assert restored_execution.status == "EXECUTING"
+            assert restored_execution.completed_at is None
+            assert restored_execution.undone_at is None
+
+            restored_execution_item = session.get(
+                OperationExecutionItem,
+                execution_item_id,
+            )
+            assert restored_execution_item is not None
+            assert restored_execution_item.status == "PENDING"
+            assert restored_execution_item.before_relative_path == (
+                "inbox/report.pdf"
+            )
+            assert restored_execution_item.after_relative_path == (
+                "documents/report.pdf"
+            )
+            assert restored_execution_item.undo_source_relative_path == (
+                "documents/report.pdf"
+            )
+            assert restored_execution_item.undo_target_relative_path == (
+                "inbox/report.pdf"
+            )
     finally:
         reopened_engine.dispose()
+
+    command.downgrade(alembic_config, "e23a01c7d4f2")
+
+    previous_execution_engine = create_engine(database_url)
+    try:
+        previous_execution_schema = inspect(previous_execution_engine)
+
+        assert "operation_executions" not in (
+            previous_execution_schema.get_table_names()
+        )
+        assert "operation_execution_items" not in (
+            previous_execution_schema.get_table_names()
+        )
+        assert "approval_requests" in (
+            previous_execution_schema.get_table_names()
+        )
+        assert "approval_audit_events" in (
+            previous_execution_schema.get_table_names()
+        )
+    finally:
+        previous_execution_engine.dispose()
 
     command.downgrade(alembic_config, "c3f4a1b92d6e")
 

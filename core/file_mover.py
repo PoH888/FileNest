@@ -125,8 +125,13 @@ def handle_collision(target_path: Path, strategy: str) -> Optional[Path]:
 # 核心移动
 # ---------------------------------------------------------------------------
 
-def move_file(src: Path, dst_dir: Path,
-              collision_strategy: str = "keep_both") -> Optional[Path]:
+def move_file(
+    src: Path,
+    dst_dir: Path,
+    collision_strategy: str = "keep_both",
+    *,
+    target_name: Optional[str] = None,
+) -> Optional[Path]:
     """将文件移动到目标目录。
 
     完整流程：
@@ -139,11 +144,24 @@ def move_file(src: Path, dst_dir: Path,
         src: 源文件路径。
         dst_dir: 目标文件夹路径。
         collision_strategy: 冲突策略，默认 ``"keep_both"``。
+        target_name: 可选的确定目标文件名；省略时保持源文件名。
 
     Returns:
         移动后的新文件路径；若失败或跳过则返回 ``None``。
     """
     logger = _get_logger()
+
+    resolved_target_name = src.name if target_name is None else target_name
+    target_name_path = Path(resolved_target_name)
+    if (
+        not resolved_target_name
+        or resolved_target_name in {".", ".."}
+        or target_name_path.is_absolute()
+        or target_name_path.drive
+        or target_name_path.name != resolved_target_name
+    ):
+        logger.error("目标文件名无效: %s", resolved_target_name)
+        return None
 
     # 校验源文件
     if not src.exists():
@@ -166,7 +184,7 @@ def move_file(src: Path, dst_dir: Path,
         logger.error("无法创建目标目录 %s: %s", dst_dir, e)
         return None
 
-    dst = dst_dir / src.name
+    dst = dst_dir / resolved_target_name
 
     # 同名冲突处理
     resolved = handle_collision(dst, collision_strategy)
@@ -251,4 +269,3 @@ def undo_file(current_path: Path, original_path: Path) -> Optional[Path]:
         return None
 
     return move_file(current_path, original_dir, collision_strategy="keep_both")
-

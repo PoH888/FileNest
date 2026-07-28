@@ -218,3 +218,154 @@ class ApprovalAuditEvent(Base):
         nullable=False,
         server_default=func.current_timestamp(),
     )
+
+
+class OperationExecution(Base):
+    """一个已经进入安全执行边界的确定操作计划。"""
+
+    __tablename__ = "operation_executions"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id",
+            name="uq_operation_executions_workflow_id",
+        ),
+        UniqueConstraint(
+            "plan_id",
+            name="uq_operation_executions_plan_id",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('EXECUTING', 'COMPLETED', 'UNDOING', 'UNDONE', 'FAILED')",
+            name="ck_operation_executions_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="EXECUTING",
+        server_default="EXECUTING",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    undone_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class OperationExecutionItem(Base):
+    """一个文件操作的 before、after 与 undo 持久化证据。"""
+
+    __tablename__ = "operation_execution_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_id",
+            "sequence_no",
+            name="uq_operation_execution_items_execution_sequence",
+        ),
+        CheckConstraint(
+            "sequence_no >= 1",
+            name="ck_operation_execution_items_sequence_positive",
+        ),
+        CheckConstraint(
+            "operation_type IN ('move', 'quarantine')",
+            name="ck_operation_execution_items_type",
+        ),
+        CheckConstraint(
+            "before_location IN ('workspace', 'quarantine')",
+            name="ck_operation_execution_items_before_location",
+        ),
+        CheckConstraint(
+            "after_location IN ('workspace', 'quarantine')",
+            name="ck_operation_execution_items_after_location",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'COMPLETED', 'UNDOING', 'UNDONE', "
+            "'FAILED')",
+            name="ck_operation_execution_items_status",
+        ),
+        CheckConstraint(
+            "before_size_bytes >= 0 AND before_mtime_ns >= 0",
+            name="ck_operation_execution_items_before_metadata",
+        ),
+        CheckConstraint(
+            "(after_size_bytes IS NULL OR after_size_bytes >= 0) AND "
+            "(after_mtime_ns IS NULL OR after_mtime_ns >= 0)",
+            name="ck_operation_execution_items_after_metadata",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("operation_executions.id"),
+        nullable=False,
+        index=True,
+    )
+    sequence_no: Mapped[int] = mapped_column(nullable=False)
+    operation_type: Mapped[str] = mapped_column(String, nullable=False)
+    source_file_id: Mapped[int] = mapped_column(nullable=False)
+    before_location: Mapped[str] = mapped_column(String, nullable=False)
+    before_relative_path: Mapped[str] = mapped_column(String, nullable=False)
+    before_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    before_mtime_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    before_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    after_location: Mapped[str] = mapped_column(String, nullable=False)
+    after_relative_path: Mapped[str] = mapped_column(String, nullable=False)
+    after_size_bytes: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+    after_mtime_ns: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+    after_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    undo_source_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    undo_target_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="PENDING",
+        server_default="PENDING",
+    )
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    undone_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )

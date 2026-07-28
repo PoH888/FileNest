@@ -4,6 +4,8 @@
 使路由只负责接收请求、调用业务能力和生成 HTTP 响应。
 """
 
+from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Literal
 
 from sqlalchemy import func, or_, select, update # select()：构造数据库查询。
@@ -16,6 +18,8 @@ from .models import (
     ApprovalAuditEvent,
     ApprovalRequest,
     FileEntry,
+    OperationExecution,
+    OperationExecutionItem,
     Workspace,
 )
 
@@ -28,6 +32,20 @@ FileEntrySortField = Literal[
 SortOrder = Literal["asc", "desc"]
 ApprovalStatus = Literal["WAITING_APPROVAL", "APPROVED", "REJECTED"]
 ApprovalAction = Literal["approve", "edit", "reject"]
+OperationExecutionStatus = Literal[
+    "EXECUTING",
+    "COMPLETED",
+    "UNDOING",
+    "UNDONE",
+    "FAILED",
+]
+OperationExecutionItemStatus = Literal[
+    "PENDING",
+    "COMPLETED",
+    "UNDOING",
+    "UNDONE",
+    "FAILED",
+]
 
 _FILE_ENTRY_SORT_COLUMNS = {
     "relative_path": FileEntry.relative_path,
@@ -344,3 +362,187 @@ def find_approval_audit_events(
         .order_by(ApprovalAuditEvent.id.asc())
     )
     return list(session.scalars(statement).all())
+
+
+def add_operation_execution(
+    session: Session,
+    execution: OperationExecution,
+) -> None:
+    """加入执行主记录，提交时机由执行服务决定。"""
+
+    session.add(execution)
+
+
+def add_operation_execution_item(
+    session: Session,
+    execution_item: OperationExecutionItem,
+) -> None:
+    """加入一个文件操作的 before、after 与 undo 证据。"""
+
+    session.add(execution_item)
+
+
+def get_operation_execution_by_id(
+    session: Session,
+    execution_id: int,
+) -> OperationExecution | None:
+    """按主键读取一条执行主记录。"""
+
+    return session.get(OperationExecution, execution_id)
+
+
+def get_operation_execution_by_workflow_id(
+    session: Session,
+    workflow_id: str,
+) -> OperationExecution | None:
+    """按工作流标识读取唯一执行记录。"""
+
+    statement = select(OperationExecution).where(
+        OperationExecution.workflow_id == workflow_id,
+    )
+    return session.scalar(statement)
+
+
+def get_operation_execution_by_plan_id(
+    session: Session,
+    plan_id: str,
+) -> OperationExecution | None:
+    """按确定计划标识读取唯一执行记录。"""
+
+    statement = select(OperationExecution).where(
+        OperationExecution.plan_id == plan_id,
+    )
+    return session.scalar(statement)
+
+
+def find_operation_execution_items(
+    session: Session,
+    execution_id: int,
+) -> list[OperationExecutionItem]:
+    """按计划顺序读取一条执行记录的所有文件操作证据。"""
+
+    statement = (
+        select(OperationExecutionItem)
+        .where(OperationExecutionItem.execution_id == execution_id)
+        .order_by(OperationExecutionItem.sequence_no.asc())
+    )
+    return list(session.scalars(statement).all())
+
+
+def compare_and_set_operation_execution_status(
+    session: Session,
+    execution_id: int,
+    expected_status: OperationExecutionStatus,
+    *,
+    next_status: OperationExecutionStatus,
+    completed_at: datetime | None = None,
+    undone_at: datetime | None = None,
+) -> bool:
+    """仅在执行主记录仍处于预期状态时原子转换。"""
+
+    values: dict[str, object] = {"status": next_status}
+    if completed_at is not None:
+        values["completed_at"] = completed_at
+    if undone_at is not None:
+        values["undone_at"] = undone_at
+
+    statement = (
+        update(OperationExecution)
+        .where(
+            OperationExecution.id == execution_id,
+            OperationExecution.status == expected_status,
+        )
+        .values(**values)
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
+
+
+def compare_and_set_operation_execution_item_status(
+    session: Session,
+    execution_item_id: int,
+    expected_status: OperationExecutionItemStatus,
+    *,
+    next_status: OperationExecutionItemStatus,
+    after_size_bytes: int | None = None,
+    after_mtime_ns: int | None = None,
+    after_sha256: str | None = None,
+    completed_at: datetime | None = None,
+    undone_at: datetime | None = None,
+) -> bool:
+    """原子转换明细状态，并按需补充 after 或撤销时间。"""
+
+    values: dict[str, object] = {"status": next_status}
+    if after_size_bytes is not None:
+        values["after_size_bytes"] = after_size_bytes
+    if after_mtime_ns is not None:
+        values["after_mtime_ns"] = after_mtime_ns
+    if after_sha256 is not None:
+        values["after_sha256"] = after_sha256
+    if completed_at is not None:
+        values["completed_at"] = completed_at
+    if undone_at is not None:
+        values["undone_at"] = undone_at
+
+    statement = (
+        update(OperationExecutionItem)
+        .where(
+            OperationExecutionItem.id == execution_item_id,
+            OperationExecutionItem.status == expected_status,
+        )
+        .values(**values)
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
+
+
+def compare_and_set_file_entry_location(
+    session: Session,
+    workspace_id: int,
+    file_entry_id: int,
+    expected_relative_path: str,
+    *,
+    next_relative_path: str,
+    size_bytes: int,
+    mtime_ns: int,
+) -> bool:
+    """仅在索引仍指向预期旧路径时更新文件位置和元数据。"""
+
+    path = PurePosixPath(next_relative_path)
+    if (
+        "\\" in next_relative_path
+        or path.is_absolute()
+        or path.name in {"", ".", ".."}
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or str(path) != next_relative_path
+    ):
+        raise ValueError("next_relative_path must be normalized and relative")
+    if size_bytes < 0 or mtime_ns < 0:
+        raise ValueError("file metadata must not be negative")
+
+    statement = (
+        update(FileEntry)
+        .where(
+            FileEntry.workspace_id == workspace_id,
+            FileEntry.id == file_entry_id,
+            FileEntry.relative_path == expected_relative_path,
+        )
+        .values(
+            relative_path=next_relative_path,
+            name=path.name,
+            extension=path.suffix,
+            size_bytes=size_bytes,
+            mtime_ns=mtime_ns,
+        )
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
