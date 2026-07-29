@@ -28,6 +28,7 @@ from backend.app.repositories import (
 WORKFLOW_ID = "66c8d4ba-a042-4491-a5d2-ad28cb47b8d9"
 PLAN_ID = "2d053752-d3c4-45cb-b696-bd043e78ed92"
 COMPLETED_AT = datetime(2026, 8, 31, 9, 0, tzinfo=timezone.utc)
+FAILED_AT = datetime(2026, 8, 31, 9, 2, tzinfo=timezone.utc)
 UNDONE_AT = datetime(2026, 8, 31, 9, 5, tzinfo=timezone.utc)
 
 
@@ -188,6 +189,8 @@ def test_status_updates_are_atomic_and_preserve_recorded_evidence(
                 execution_item.id,
                 "PENDING",
                 next_status="FAILED",
+                error_code="safe_move_source_unavailable",
+                failed_at=FAILED_AT,
             )
 
             assert compare_and_set_operation_execution_status(
@@ -244,6 +247,225 @@ def test_status_updates_are_atomic_and_preserve_recorded_evidence(
                 tzinfo=None
             )
             assert restored_item.undone_at == UNDONE_AT.replace(tzinfo=None)
+    finally:
+        engine.dispose()
+
+
+def test_item_failure_evidence_is_atomic_and_cannot_be_overwritten(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'execution-item-failure.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine) as session:
+            workspace = _workspace(session, str(tmp_path / "workspace"))
+            execution = _execution(workspace.id)
+            add_operation_execution(session, execution)
+            session.flush()
+            execution_item = _execution_item(execution.id, 1)
+            add_operation_execution_item(session, execution_item)
+            session.commit()
+
+            with pytest.raises(
+                ValueError,
+                match="requires error_code and failed_at",
+            ):
+                compare_and_set_operation_execution_item_status(
+                    session,
+                    execution_item.id,
+                    "PENDING",
+                    next_status="FAILED",
+                )
+
+            assert compare_and_set_operation_execution_item_status(
+                session,
+                execution_item.id,
+                "PENDING",
+                next_status="FAILED",
+                error_code="safe_move_target_conflict",
+                failed_at=FAILED_AT,
+            )
+            assert not compare_and_set_operation_execution_item_status(
+                session,
+                execution_item.id,
+                "PENDING",
+                next_status="COMPLETED",
+                after_size_bytes=10,
+                after_mtime_ns=101,
+                completed_at=COMPLETED_AT,
+            )
+
+            with pytest.raises(
+                ValueError,
+                match="FAILED -> COMPLETED",
+            ):
+                compare_and_set_operation_execution_item_status(
+                    session,
+                    execution_item.id,
+                    "FAILED",
+                    next_status="COMPLETED",
+                    after_size_bytes=10,
+                    after_mtime_ns=101,
+                    completed_at=COMPLETED_AT,
+                )
+
+            session.commit()
+            session.expire_all()
+
+            restored_item = find_operation_execution_items(
+                session,
+                execution.id,
+            )[0]
+            assert restored_item.status == "FAILED"
+            assert restored_item.error_code == "safe_move_target_conflict"
+            assert restored_item.failed_at == FAILED_AT.replace(tzinfo=None)
+            assert restored_item.after_size_bytes is None
+            assert restored_item.after_mtime_ns is None
+            assert restored_item.completed_at is None
+    finally:
+        engine.dispose()
+
+
+def test_execution_status_graph_rejects_illegal_transitions(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'execution-state-graph.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine) as session:
+            workspace = _workspace(session, str(tmp_path / "workspace"))
+            execution = _execution(workspace.id)
+            add_operation_execution(session, execution)
+            session.commit()
+
+            with pytest.raises(
+                ValueError,
+                match="EXECUTING -> UNDONE",
+            ):
+                compare_and_set_operation_execution_status(
+                    session,
+                    execution.id,
+                    "EXECUTING",
+                    next_status="UNDONE",
+                )
+
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "EXECUTING",
+                next_status="PARTIALLY_COMPLETED",
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "PARTIALLY_COMPLETED",
+                next_status="EXECUTING",
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "EXECUTING",
+                next_status="FAILED",
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "FAILED",
+                next_status="EXECUTING",
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "EXECUTING",
+                next_status="COMPLETED",
+                completed_at=COMPLETED_AT,
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "COMPLETED",
+                next_status="UNDOING",
+            )
+            assert compare_and_set_operation_execution_status(
+                session,
+                execution.id,
+                "UNDOING",
+                next_status="UNDONE",
+                undone_at=UNDONE_AT,
+            )
+
+            with pytest.raises(
+                ValueError,
+                match="UNDONE -> EXECUTING",
+            ):
+                compare_and_set_operation_execution_status(
+                    session,
+                    execution.id,
+                    "UNDONE",
+                    next_status="EXECUTING",
+                )
+
+            session.commit()
+            session.expire_all()
+
+            restored = get_operation_execution_by_id(session, execution.id)
+            assert restored.status == "UNDONE"
+            assert restored.attempt == 3
+    finally:
+        engine.dispose()
+
+
+def test_retry_attempt_increments_once_when_expected_state_is_stale(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'execution-retry-cas.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine) as setup_session:
+            workspace = _workspace(
+                setup_session,
+                str(tmp_path / "workspace"),
+            )
+            execution = _execution(workspace.id)
+            execution.status = "FAILED"
+            add_operation_execution(setup_session, execution)
+            setup_session.commit()
+            execution_id = execution.id
+
+        with Session(engine) as first_retry:
+            assert compare_and_set_operation_execution_status(
+                first_retry,
+                execution_id,
+                "FAILED",
+                next_status="EXECUTING",
+            )
+            first_retry.commit()
+
+        with Session(engine) as stale_retry:
+            assert not compare_and_set_operation_execution_status(
+                stale_retry,
+                execution_id,
+                "FAILED",
+                next_status="EXECUTING",
+            )
+            stale_retry.commit()
+
+        with Session(engine) as verification_session:
+            restored = get_operation_execution_by_id(
+                verification_session,
+                execution_id,
+            )
+            assert restored.status == "EXECUTING"
+            assert restored.attempt == 2
     finally:
         engine.dispose()
 

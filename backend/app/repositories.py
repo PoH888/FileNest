@@ -34,6 +34,7 @@ ApprovalStatus = Literal["WAITING_APPROVAL", "APPROVED", "REJECTED"]
 ApprovalAction = Literal["approve", "edit", "reject"]
 OperationExecutionStatus = Literal[
     "EXECUTING",
+    "PARTIALLY_COMPLETED",
     "COMPLETED",
     "UNDOING",
     "UNDONE",
@@ -52,6 +53,31 @@ _FILE_ENTRY_SORT_COLUMNS = {
     "name": FileEntry.name,
     "size_bytes": FileEntry.size_bytes,
     "mtime_ns": FileEntry.mtime_ns,
+}
+
+_OPERATION_EXECUTION_TRANSITIONS: dict[
+    OperationExecutionStatus,
+    frozenset[OperationExecutionStatus],
+] = {
+    "EXECUTING": frozenset(
+        {"PARTIALLY_COMPLETED", "COMPLETED", "FAILED"}
+    ),
+    "PARTIALLY_COMPLETED": frozenset({"EXECUTING", "UNDOING"}),
+    "COMPLETED": frozenset({"UNDOING"}),
+    "UNDOING": frozenset({"UNDONE"}),
+    "UNDONE": frozenset(),
+    "FAILED": frozenset({"EXECUTING"}),
+}
+
+_OPERATION_EXECUTION_ITEM_TRANSITIONS: dict[
+    OperationExecutionItemStatus,
+    frozenset[OperationExecutionItemStatus],
+] = {
+    "PENDING": frozenset({"COMPLETED", "FAILED"}),
+    "COMPLETED": frozenset({"UNDOING"}),
+    "UNDOING": frozenset({"UNDONE"}),
+    "UNDONE": frozenset(),
+    "FAILED": frozenset({"PENDING"}),
 }
 
 def get_workspace_by_id(
@@ -438,9 +464,27 @@ def compare_and_set_operation_execution_status(
     completed_at: datetime | None = None,
     undone_at: datetime | None = None,
 ) -> bool:
-    """仅在执行主记录仍处于预期状态时原子转换。"""
+    """仅按合法状态图原子转换，并在真实重试时增加 attempt。"""
+
+    allowed_next_statuses = _OPERATION_EXECUTION_TRANSITIONS.get(
+        expected_status
+    )
+    if (
+        allowed_next_statuses is None
+        or next_status not in allowed_next_statuses
+    ):
+        raise ValueError(
+            "illegal operation execution transition: "
+            f"{expected_status} -> {next_status}"
+        )
 
     values: dict[str, object] = {"status": next_status}
+    if (
+        expected_status in {"PARTIALLY_COMPLETED", "FAILED"}
+        and next_status == "EXECUTING"
+    ):
+        values["attempt"] = OperationExecution.attempt + 1
+        values["completed_at"] = None
     if completed_at is not None:
         values["completed_at"] = completed_at
     if undone_at is not None:
@@ -471,11 +515,45 @@ def compare_and_set_operation_execution_item_status(
     after_mtime_ns: int | None = None,
     after_sha256: str | None = None,
     completed_at: datetime | None = None,
+    error_code: str | None = None,
+    failed_at: datetime | None = None,
     undone_at: datetime | None = None,
 ) -> bool:
-    """原子转换明细状态，并按需补充 after 或撤销时间。"""
+    """按合法状态图原子转换明细，并持久化成功或失败证据。"""
+
+    allowed_next_statuses = _OPERATION_EXECUTION_ITEM_TRANSITIONS.get(
+        expected_status
+    )
+    if (
+        allowed_next_statuses is None
+        or next_status not in allowed_next_statuses
+    ):
+        raise ValueError(
+            "illegal operation execution item transition: "
+            f"{expected_status} -> {next_status}"
+        )
+    if next_status == "FAILED":
+        if (
+            error_code is None
+            or not error_code.strip()
+            or error_code != error_code.strip()
+            or len(error_code) > 100
+            or failed_at is None
+            or failed_at.tzinfo is None
+            or failed_at.utcoffset() is None
+        ):
+            raise ValueError(
+                "failed execution item requires error_code and failed_at"
+            )
+    elif error_code is not None or failed_at is not None:
+        raise ValueError(
+            "failure evidence is only valid for FAILED execution items"
+        )
 
     values: dict[str, object] = {"status": next_status}
+    if expected_status == "FAILED" and next_status == "PENDING":
+        values["error_code"] = None
+        values["failed_at"] = None
     if after_size_bytes is not None:
         values["after_size_bytes"] = after_size_bytes
     if after_mtime_ns is not None:
@@ -484,6 +562,10 @@ def compare_and_set_operation_execution_item_status(
         values["after_sha256"] = after_sha256
     if completed_at is not None:
         values["completed_at"] = completed_at
+    if error_code is not None:
+        values["error_code"] = error_code
+    if failed_at is not None:
+        values["failed_at"] = failed_at
     if undone_at is not None:
         values["undone_at"] = undone_at
 

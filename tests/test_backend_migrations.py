@@ -1,9 +1,10 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -216,6 +217,7 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "started_at",
             "completed_at",
             "undone_at",
+            "attempt",
         ]
         assert {
             constraint["name"]: constraint["column_names"]
@@ -231,7 +233,10 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             for constraint in schema.get_check_constraints(
                 "operation_executions"
             )
-        } == {"ck_operation_executions_status"}
+        } == {
+            "ck_operation_executions_attempt_positive",
+            "ck_operation_executions_status",
+        }
         execution_foreign_keys = schema.get_foreign_keys(
             "operation_executions"
         )
@@ -276,6 +281,8 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "recorded_at",
             "completed_at",
             "undone_at",
+            "error_code",
+            "failed_at",
         ]
         assert {
             constraint["name"]
@@ -354,6 +361,32 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             session.commit()
             execution_id = execution.id
 
+            assert execution.idempotency_key == approval.plan_id
+            assert execution.attempt == 1
+
+            partial_execution = OperationExecution(
+                workflow_id="8933c981-fe44-4d3f-a4e0-3d7ed66be0ca",
+                plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                workspace_id=workspace.id,
+                status="PARTIALLY_COMPLETED",
+            )
+            session.add(partial_execution)
+            session.commit()
+
+            assert partial_execution.attempt == 1
+
+            with pytest.raises(IntegrityError):
+                session.add(
+                    OperationExecution(
+                        workflow_id="f3ce116c-118c-48cb-ac15-ad189e32ace4",
+                        plan_id="5c11356a-1cb5-466c-be44-7d774ba4390c",
+                        workspace_id=workspace.id,
+                        attempt=0,
+                    )
+                )
+                session.commit()
+            session.rollback()
+
             execution_item = OperationExecutionItem(
                 execution_id=execution.id,
                 sequence_no=1,
@@ -372,6 +405,22 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             session.commit()
             execution_item_id = execution_item.id
 
+            assert execution_item.error_code is None
+            assert execution_item.failed_at is None
+
+            failure_time = datetime(
+                2026,
+                8,
+                31,
+                10,
+                30,
+                tzinfo=timezone.utc,
+            )
+            execution_item.status = "FAILED"
+            execution_item.error_code = "safe_move_target_conflict"
+            execution_item.failed_at = failure_time
+            session.commit()
+
             with pytest.raises(IntegrityError):
                 session.add(
                     OperationExecution(
@@ -386,8 +435,8 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             with pytest.raises(IntegrityError):
                 session.add(
                     OperationExecution(
-                        workflow_id="8933c981-fe44-4d3f-a4e0-3d7ed66be0ca",
-                        plan_id="37cb1621-44db-49cd-9251-31c7e871e34d",
+                        workflow_id="6795b2e2-6f96-47ce-9ff8-7535845435b1",
+                        plan_id="ae4bd5b0-bf54-4c91-8a64-03da759255ad",
                         workspace_id=workspace.id,
                         status="EXECUTED_WITHOUT_HISTORY",
                     )
@@ -485,6 +534,10 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             )
             assert restored_execution is not None
             assert restored_execution.status == "EXECUTING"
+            assert restored_execution.attempt == 1
+            assert restored_execution.idempotency_key == (
+                "2d053752-d3c4-45cb-b696-bd043e78ed92"
+            )
             assert restored_execution.completed_at is None
             assert restored_execution.undone_at is None
 
@@ -493,7 +546,13 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
                 execution_item_id,
             )
             assert restored_execution_item is not None
-            assert restored_execution_item.status == "PENDING"
+            assert restored_execution_item.status == "FAILED"
+            assert restored_execution_item.error_code == (
+                "safe_move_target_conflict"
+            )
+            assert restored_execution_item.failed_at == failure_time.replace(
+                tzinfo=None
+            )
             assert restored_execution_item.before_relative_path == (
                 "inbox/report.pdf"
             )
@@ -508,6 +567,39 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             )
     finally:
         reopened_engine.dispose()
+
+    command.downgrade(alembic_config, "a25e01a7c4d1")
+
+    previous_failure_evidence_engine = create_engine(database_url)
+    try:
+        previous_failure_schema = inspect(previous_failure_evidence_engine)
+        assert "error_code" not in {
+            column["name"]
+            for column in previous_failure_schema.get_columns(
+                "operation_execution_items"
+            )
+        }
+        assert "failed_at" not in {
+            column["name"]
+            for column in previous_failure_schema.get_columns(
+                "operation_execution_items"
+            )
+        }
+
+        with previous_failure_evidence_engine.connect() as connection:
+            preserved_item = connection.execute(
+                text(
+                    "SELECT id, status FROM operation_execution_items "
+                    "WHERE id = :execution_item_id"
+                ),
+                {"execution_item_id": execution_item_id},
+            ).mappings().one()
+            assert dict(preserved_item) == {
+                "id": execution_item_id,
+                "status": "FAILED",
+            }
+    finally:
+        previous_failure_evidence_engine.dispose()
 
     command.downgrade(alembic_config, "e23a01c7d4f2")
 
@@ -572,5 +664,153 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
         assert "file_entries" not in downgraded_schema.get_table_names()
         assert "agent_runs" not in downgraded_schema.get_table_names()
         assert "agent_tool_calls" not in downgraded_schema.get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_execution_attempt_migration_preserves_existing_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "execution-attempt-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "f24e05a1b2c3")
+
+    old_engine = create_engine(database_url)
+    try:
+        with old_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO workspaces (name, root_path) "
+                    "VALUES (:name, :root_path)"
+                ),
+                {
+                    "name": "旧执行记录工作区",
+                    "root_path": str(tmp_path / "legacy-workspace"),
+                },
+            )
+            workspace_id = connection.execute(
+                text("SELECT id FROM workspaces")
+            ).scalar_one()
+            execution_insert = connection.execute(
+                text(
+                    "INSERT INTO operation_executions "
+                    "(workflow_id, plan_id, workspace_id, status) "
+                    "VALUES "
+                    "(:workflow_id, :plan_id, :workspace_id, 'EXECUTING')"
+                ),
+                {
+                    "workflow_id": "428981e6-97e3-4fd7-9460-38b366061490",
+                    "plan_id": "b6f45f30-55b0-491c-b243-cf57de3ef774",
+                    "workspace_id": workspace_id,
+                },
+            )
+            execution_id = execution_insert.lastrowid
+            connection.execute(
+                text(
+                    "INSERT INTO operation_execution_items "
+                    "(execution_id, sequence_no, operation_type, "
+                    "source_file_id, before_location, "
+                    "before_relative_path, before_size_bytes, "
+                    "before_mtime_ns, after_location, "
+                    "after_relative_path, undo_source_relative_path, "
+                    "undo_target_relative_path, status) "
+                    "VALUES (:execution_id, 1, 'move', 7, 'workspace', "
+                    "'inbox/legacy.txt', 10, 100, 'workspace', "
+                    "'archive/legacy.txt', 'archive/legacy.txt', "
+                    "'inbox/legacy.txt', 'PENDING')"
+                ),
+                {"execution_id": execution_id},
+            )
+    finally:
+        old_engine.dispose()
+
+    command.upgrade(alembic_config, "head")
+
+    upgraded_engine = create_engine(database_url)
+    try:
+        upgraded_schema = inspect(upgraded_engine)
+        assert "attempt" in {
+            column["name"]
+            for column in upgraded_schema.get_columns("operation_executions")
+        }
+
+        with upgraded_engine.begin() as connection:
+            restored = connection.execute(
+                text(
+                    "SELECT plan_id, status, attempt "
+                    "FROM operation_executions"
+                )
+            ).mappings().one()
+
+            assert dict(restored) == {
+                "plan_id": "b6f45f30-55b0-491c-b243-cf57de3ef774",
+                "status": "EXECUTING",
+                "attempt": 1,
+            }
+
+            restored_item = connection.execute(
+                text(
+                    "SELECT status, error_code, failed_at "
+                    "FROM operation_execution_items"
+                )
+            ).mappings().one()
+            assert dict(restored_item) == {
+                "status": "PENDING",
+                "error_code": None,
+                "failed_at": None,
+            }
+
+            connection.execute(
+                text(
+                    "UPDATE operation_executions "
+                    "SET status = 'PARTIALLY_COMPLETED'"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE operation_execution_items "
+                    "SET status = 'FAILED', "
+                    "error_code = 'safe_move_source_unavailable', "
+                    "failed_at = '2026-08-31 10:30:00'"
+                )
+            )
+    finally:
+        upgraded_engine.dispose()
+
+    command.downgrade(alembic_config, "f24e05a1b2c3")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        downgraded_schema = inspect(downgraded_engine)
+        assert "attempt" not in {
+            column["name"]
+            for column in downgraded_schema.get_columns(
+                "operation_executions"
+            )
+        }
+
+        with downgraded_engine.connect() as connection:
+            restored = connection.execute(
+                text(
+                    "SELECT plan_id, status "
+                    "FROM operation_executions"
+                )
+            ).mappings().one()
+
+            assert dict(restored) == {
+                "plan_id": "b6f45f30-55b0-491c-b243-cf57de3ef774",
+                "status": "FAILED",
+            }
+
+            restored_item = connection.execute(
+                text(
+                    "SELECT status FROM operation_execution_items"
+                )
+            ).mappings().one()
+            assert dict(restored_item) == {"status": "FAILED"}
     finally:
         downgraded_engine.dispose()

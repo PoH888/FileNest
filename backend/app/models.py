@@ -235,8 +235,13 @@ class OperationExecution(Base):
         ),
         CheckConstraint(
             "status IN "
-            "('EXECUTING', 'COMPLETED', 'UNDOING', 'UNDONE', 'FAILED')",
+            "('EXECUTING', 'PARTIALLY_COMPLETED', 'COMPLETED', "
+            "'UNDOING', 'UNDONE', 'FAILED')",
             name="ck_operation_executions_status",
+        ),
+        CheckConstraint(
+            "attempt >= 1",
+            name="ck_operation_executions_attempt_positive",
         ),
     )
 
@@ -254,6 +259,11 @@ class OperationExecution(Base):
         default="EXECUTING",
         server_default="EXECUTING",
     )
+    attempt: Mapped[int] = mapped_column(
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -267,6 +277,12 @@ class OperationExecution(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+    @property
+    def idempotency_key(self) -> str:
+        """复用不可变且唯一的计划标识，避免另一套执行身份发生漂移。"""
+
+        return self.plan_id
 
 
 class OperationExecutionItem(Base):
@@ -356,12 +372,20 @@ class OperationExecutionItem(Base):
         default="PENDING",
         server_default="PENDING",
     )
+    error_code: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.current_timestamp(),
     )
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

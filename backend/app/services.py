@@ -266,15 +266,21 @@ def _transition_approval_request(
             ApprovalTransitionErrorCode.NOT_FOUND,
             "审批任务不存在",
         )
-    if approval.status != "WAITING_APPROVAL":
-        raise ApprovalTransitionError(
-            ApprovalTransitionErrorCode.NOT_WAITING,
-            "审批任务已结束，不能再次转换",
-        )
     if approval.plan_id != expected_plan_key:
         raise ApprovalTransitionError(
             ApprovalTransitionErrorCode.PLAN_MISMATCH,
             "待审批计划已经变化",
+        )
+    if _is_repeated_approval(
+        approval,
+        action=action,
+        expected_plan_id=expected_plan_key,
+    ):
+        return approval
+    if approval.status != "WAITING_APPROVAL":
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.NOT_WAITING,
+            "审批任务已结束，不能再次转换",
         )
 
     previous_status = approval.status
@@ -289,6 +295,28 @@ def _transition_approval_request(
             next_plan_id=str(next_plan_id),
         )
         if not updated:
+            session.rollback()
+            current_approval = get_approval_request_by_workflow_id(
+                session,
+                workflow_key,
+            )
+            if (
+                current_approval is not None
+                and current_approval.plan_id != expected_plan_key
+            ):
+                raise ApprovalTransitionError(
+                    ApprovalTransitionErrorCode.PLAN_MISMATCH,
+                    "待审批计划已经变化",
+                )
+            if (
+                current_approval is not None
+                and _is_repeated_approval(
+                    current_approval,
+                    action=action,
+                    expected_plan_id=expected_plan_key,
+                )
+            ):
+                return current_approval
             raise ApprovalTransitionError(
                 ApprovalTransitionErrorCode.STATE_CHANGED,
                 "审批状态在提交前已经变化",
@@ -317,6 +345,21 @@ def _transition_approval_request(
         raise
 
     return approval
+
+
+def _is_repeated_approval(
+    approval: ApprovalRequest,
+    *,
+    action: ApprovalAction,
+    expected_plan_id: str,
+) -> bool:
+    """只把同一计划的重复批准视为幂等成功。"""
+
+    return (
+        action == "approve"
+        and approval.status == "APPROVED"
+        and approval.plan_id == expected_plan_id
+    )
 
 
 def create_workspace(

@@ -6,9 +6,14 @@ import pytest
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session
 
+import backend.app.services as services_module
 from backend.app.database import Base
 from backend.app.models import ApprovalAuditEvent, ApprovalRequest
-from backend.app.repositories import find_approval_audit_events
+from backend.app.repositories import (
+    add_approval_audit_event,
+    compare_and_set_approval_request,
+    find_approval_audit_events,
+)
 from backend.app.services import (
     ApprovalTransitionError,
     ApprovalTransitionErrorCode,
@@ -142,6 +147,101 @@ def test_terminal_approval_cannot_transition_again(engine: Engine) -> None:
 
         assert restored is not None
         assert restored.status == "APPROVED"
+        assert [event.action for event in audit_events] == ["approve"]
+
+
+def test_repeated_approval_returns_existing_state_without_duplicate_audit(
+    engine: Engine,
+) -> None:
+    with Session(engine) as session:
+        approval_id = _add_waiting_approval(session)
+        first_result = approve_operation_plan(session, WORKFLOW_ID, PLAN_ID)
+        repeated_result = approve_operation_plan(
+            session,
+            WORKFLOW_ID,
+            PLAN_ID,
+        )
+
+        assert first_result.id == approval_id
+        assert repeated_result.id == approval_id
+        assert repeated_result.status == "APPROVED"
+
+    with Session(engine) as session:
+        audit_events = find_approval_audit_events(session, approval_id)
+        assert [event.action for event in audit_events] == ["approve"]
+
+
+def test_repeated_approval_does_not_hide_plan_mismatch(engine: Engine) -> None:
+    with Session(engine) as session:
+        approval_id = _add_waiting_approval(session)
+        approve_operation_plan(session, WORKFLOW_ID, PLAN_ID)
+
+        with pytest.raises(ApprovalTransitionError) as error:
+            approve_operation_plan(
+                session,
+                WORKFLOW_ID,
+                REPLACEMENT_PLAN_ID,
+            )
+
+        assert error.value.code == ApprovalTransitionErrorCode.PLAN_MISMATCH
+
+    with Session(engine) as session:
+        audit_events = find_approval_audit_events(session, approval_id)
+        assert [event.action for event in audit_events] == ["approve"]
+
+
+def test_concurrent_repeated_approval_reloads_winning_state(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with Session(engine) as setup_session:
+        approval_id = _add_waiting_approval(setup_session)
+
+    def approve_in_competing_transaction(
+        current_session: Session,
+        workflow_id: str,
+        expected_plan_id: str,
+        *,
+        next_status: str,
+        next_plan_id: str,
+    ) -> bool:
+        current_session.rollback()
+        with Session(engine) as winning_session:
+            assert compare_and_set_approval_request(
+                winning_session,
+                workflow_id,
+                expected_plan_id,
+                next_status=next_status,
+                next_plan_id=next_plan_id,
+            )
+            add_approval_audit_event(
+                winning_session,
+                ApprovalAuditEvent(
+                    approval_request_id=approval_id,
+                    action="approve",
+                    previous_status="WAITING_APPROVAL",
+                    next_status="APPROVED",
+                    previous_plan_id=str(PLAN_ID),
+                    next_plan_id=str(PLAN_ID),
+                ),
+            )
+            winning_session.commit()
+        return False
+
+    monkeypatch.setattr(
+        services_module,
+        "compare_and_set_approval_request",
+        approve_in_competing_transaction,
+    )
+
+    with Session(engine) as session:
+        result = approve_operation_plan(session, WORKFLOW_ID, PLAN_ID)
+
+        assert result.id == approval_id
+        assert result.status == "APPROVED"
+
+    with Session(engine) as session:
+        audit_events = find_approval_audit_events(session, approval_id)
         assert [event.action for event in audit_events] == ["approve"]
 
 
