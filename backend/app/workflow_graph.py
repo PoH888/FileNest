@@ -96,6 +96,8 @@ def build_workflow_graph(
 @contextmanager
 def open_checkpointed_workflow_graph(
     checkpoint_path: Path,
+    *,
+    operation_plan_validator: OperationPlanValidator | None = None,
 ) -> Iterator[CompiledStateGraph]:
     """使用独立 SQLite 文件打开图，并明确管理数据库连接生命周期。"""
 
@@ -114,7 +116,10 @@ def open_checkpointed_workflow_graph(
     )
     checkpointer = SqliteSaver(connection, serde=serializer)
     try:
-        yield build_workflow_graph(checkpointer=checkpointer)
+        yield build_workflow_graph(
+            checkpointer=checkpointer,
+            operation_plan_validator=operation_plan_validator,
+        )
     finally:
         connection.close()
 
@@ -191,15 +196,15 @@ def _apply_event(
 
     workflow = WorkflowState.model_validate(state["workflow"])
     event = WorkflowEvent.model_validate(state["event"])
-    if event.kind == "workflow_completed":
+    next_workflow = transition_workflow(workflow, event)
+    if event.kind in {"workflow_completed", "plan_replaced"}:
         if operation_plan_validator is None:
             raise WorkflowBoundaryError(
                 WorkflowBoundaryErrorCode.OPERATION_PLAN_VALIDATOR_REQUIRED,
-                "完成工作流前必须经过操作计划验证 Service",
+                "计划替换或完成工作流前必须经过操作计划验证 Service",
             )
-        operation_plan_validator(workflow.operation_plan)
+        operation_plan_validator(next_workflow.operation_plan)
 
-    next_workflow = transition_workflow(workflow, event)
     return {
         "workflow": next_workflow.model_dump(mode="json"),
     }

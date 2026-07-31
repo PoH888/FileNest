@@ -27,6 +27,7 @@ settings.json.tmp
 settings.json.bak
 logs/
 backend/filenest.db
+backend/workflow-checkpoints.sqlite
 
 # --- 本地环境变量/密钥 ---
 .env

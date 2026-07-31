@@ -39,6 +39,7 @@ from backend.app.workflow_graph import (
 
 WORKFLOW_ID = UUID("66c8d4ba-a042-4491-a5d2-ad28cb47b8d9")
 PLAN_ID = UUID("2d053752-d3c4-45cb-b696-bd043e78ed92")
+REPLACEMENT_PLAN_ID = UUID("f213584e-77a9-48a7-913e-a8352134092c")
 PLAN_CREATED_AT = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
 
 
@@ -81,6 +82,29 @@ def _state() -> WorkflowState:
     return WorkflowState(
         workflow_id=WORKFLOW_ID,
         operation_plan=_plan(),
+    )
+
+
+def _replacement_plan(*, plan_id: UUID = REPLACEMENT_PLAN_ID) -> OperationPlan:
+    return OperationPlan(
+        plan_id=plan_id,
+        workspace_id=3,
+        created_at=PLAN_CREATED_AT,
+        operations=[
+            OperationPlanItem(
+                source_file_id=7,
+                source_relative_path="inbox/report.pdf",
+                target_relative_path="archive/report.pdf",
+                source_precondition=FilePrecondition(
+                    size_bytes=4096,
+                    mtime_ns=1_777_777_777_000_000_000,
+                ),
+                reason=OperationReason(
+                    kind="manual_selection",
+                    description="由用户修改目标目录",
+                ),
+            )
+        ],
     )
 
 
@@ -186,6 +210,82 @@ def test_graph_runs_pause_and_resume_through_existing_state_machine() -> None:
     assert resumed.status == "ready"
     assert resumed.revision == 2
     assert resumed.operation_plan == initial.operation_plan
+
+
+def test_graph_replaces_waiting_plan_through_validator() -> None:
+    validated_plans: list[OperationPlan] = []
+    graph = build_workflow_graph(
+        operation_plan_validator=validated_plans.append,
+    )
+    waiting = run_workflow_event(
+        graph,
+        _state(),
+        _event("pause_requested", 1, reason_code="human_approval_required"),
+    )
+    replacement = _replacement_plan()
+
+    updated = run_workflow_event(
+        graph,
+        waiting,
+        _event("plan_replaced", 2, replacement_plan=replacement),
+    )
+
+    assert updated.status == "waiting"
+    assert updated.revision == 2
+    assert updated.wait_reason_code == "human_approval_required"
+    assert updated.operation_plan == replacement
+    assert validated_plans == [replacement]
+
+
+def test_graph_rejects_plan_replacement_without_validator() -> None:
+    graph = build_workflow_graph()
+    waiting = run_workflow_event(
+        graph,
+        _state(),
+        _event("pause_requested", 1, reason_code="human_approval_required"),
+    )
+
+    with pytest.raises(WorkflowBoundaryError) as error:
+        run_workflow_event(
+            graph,
+            waiting,
+            _event(
+                "plan_replaced",
+                2,
+                replacement_plan=_replacement_plan(),
+            ),
+        )
+
+    assert (
+        error.value.code
+        == WorkflowBoundaryErrorCode.OPERATION_PLAN_VALIDATOR_REQUIRED
+    )
+
+
+def test_graph_rejects_replacement_without_new_plan_id() -> None:
+    validated_plans: list[OperationPlan] = []
+    graph = build_workflow_graph(
+        operation_plan_validator=validated_plans.append,
+    )
+    waiting = run_workflow_event(
+        graph,
+        _state(),
+        _event("pause_requested", 1, reason_code="human_approval_required"),
+    )
+
+    with pytest.raises(WorkflowTransitionError) as error:
+        run_workflow_event(
+            graph,
+            waiting,
+            _event(
+                "plan_replaced",
+                2,
+                replacement_plan=_replacement_plan(plan_id=PLAN_ID),
+            ),
+        )
+
+    assert error.value.code == WorkflowTransitionErrorCode.INVALID_TRANSITION
+    assert validated_plans == []
 
 
 def test_graph_preserves_workflow_transition_errors() -> None:

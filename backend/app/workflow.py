@@ -13,6 +13,7 @@ WorkflowStatus = Literal["ready", "waiting", "completed", "failed"]
 WorkflowEventKind = Literal[
     "pause_requested",
     "resume_requested",
+    "plan_replaced",
     "workflow_completed",
     "workflow_failed",
 ]
@@ -56,7 +57,6 @@ class WorkflowState(BaseModel):
         default=None,
         pattern=r"^[a-z][a-z0-9_]{0,63}$",
     )
-
     @model_validator(mode="after")
     def validate_status_details(self) -> "WorkflowState":
         if self.status == "waiting" and self.wait_reason_code is None:
@@ -87,6 +87,7 @@ class WorkflowEvent(BaseModel):
         default=None,
         pattern=r"^[a-z][a-z0-9_]{0,63}$",
     )
+    replacement_plan: OperationPlan | None = None
 
     @model_validator(mode="after")
     def validate_event_details(self) -> "WorkflowEvent":
@@ -98,6 +99,10 @@ class WorkflowEvent(BaseModel):
             raise ValueError("failed event must contain an error code")
         if self.kind != "workflow_failed" and self.error_code is not None:
             raise ValueError("non-failed event must not contain an error code")
+        if self.kind == "plan_replaced" and self.replacement_plan is None:
+            raise ValueError("plan replacement event requires a replacement plan")
+        if self.kind != "plan_replaced" and self.replacement_plan is not None:
+            raise ValueError("non-replacement event must not contain a plan")
         return self
 
 
@@ -119,9 +124,19 @@ def transition_workflow(
         )
 
     next_status, wait_reason_code, error_code = _next_status(state, event)
+    operation_plan = state.operation_plan
+    if event.kind == "plan_replaced":
+        replacement_plan = event.replacement_plan
+        if replacement_plan is None:
+            raise WorkflowTransitionError(
+                WorkflowTransitionErrorCode.INVALID_TRANSITION,
+                "计划替换事件缺少替代计划",
+            )
+        _validate_replacement_plan(state.operation_plan, replacement_plan)
+        operation_plan = replacement_plan
     return WorkflowState(
         workflow_id=state.workflow_id,
-        operation_plan=state.operation_plan,
+        operation_plan=operation_plan,
         status=next_status,
         revision=event.sequence_no,
         wait_reason_code=wait_reason_code,
@@ -137,6 +152,8 @@ def _next_status(
         return "waiting", event.reason_code, None
     if state.status == "waiting" and event.kind == "resume_requested":
         return "ready", None, None
+    if state.status == "waiting" and event.kind == "plan_replaced":
+        return "waiting", state.wait_reason_code, None
     if state.status == "ready" and event.kind == "workflow_completed":
         return "completed", None, None
     if state.status in {"ready", "waiting"} and event.kind == "workflow_failed":
@@ -146,3 +163,26 @@ def _next_status(
         WorkflowTransitionErrorCode.INVALID_TRANSITION,
         f"状态 {state.status} 不接受事件 {event.kind}",
     )
+
+
+def _validate_replacement_plan(
+    current_plan: OperationPlan,
+    replacement_plan: OperationPlan,
+) -> None:
+    current_sources = {
+        (operation.source_file_id, operation.source_relative_path)
+        for operation in current_plan.operations
+    }
+    replacement_sources = {
+        (operation.source_file_id, operation.source_relative_path)
+        for operation in replacement_plan.operations
+    }
+    if (
+        replacement_plan.plan_id == current_plan.plan_id
+        or replacement_plan.workspace_id != current_plan.workspace_id
+        or replacement_sources != current_sources
+    ):
+        raise WorkflowTransitionError(
+            WorkflowTransitionErrorCode.INVALID_TRANSITION,
+            "替代计划必须保留工作区和源文件，并使用新的 plan_id",
+        )

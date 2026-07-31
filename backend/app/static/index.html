@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FileNest</title>
+  <style>
+    body {
+      max-width: 48rem;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      color: #1f2937;
+      font-family: system-ui, sans-serif;
+      line-height: 1.5;
+    }
+    form, #run-result {
+      display: grid;
+      gap: 0.75rem;
+    }
+    textarea, select, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 0.65rem;
+      font: inherit;
+    }
+    textarea {
+      min-height: 7rem;
+      resize: vertical;
+    }
+    button {
+      width: auto;
+      justify-self: start;
+    }
+    #run-result {
+      margin-top: 1.5rem;
+      border-top: 1px solid #d1d5db;
+      padding-top: 1rem;
+    }
+    #result-answer {
+      white-space: pre-wrap;
+    }
+    #result-sources[hidden] {
+      display: none;
+    }
+    #plan-panel[hidden] {
+      display: none;
+    }
+    #plan-targets {
+      display: grid;
+      gap: 0.75rem;
+    }
+    #plan-targets input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 0.65rem;
+      font: inherit;
+    }
+    #plan-list {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+    #plan-actions {
+      display: flex;
+      gap: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FileNest</h1>
+    <p>在已授权工作区中提交一次只读文件查询。</p>
+
+    <form id="request-form">
+      <label for="workspace-select">工作区</label>
+      <select id="workspace-select" name="workspace_id" required disabled>
+        <option value="">正在加载工作区…</option>
+      </select>
+
+      <label for="request-text">请求</label>
+      <textarea
+        id="request-text"
+        name="request_text"
+        maxlength="2000"
+        required
+        placeholder="例如：查找季度报告"
+      ></textarea>
+
+      <button id="submit-request" type="submit" disabled>提交只读请求</button>
+    </form>
+
+    <section id="run-result" aria-labelledby="result-heading">
+      <h2 id="result-heading">运行结果</h2>
+      <p id="result-status" role="status" aria-live="polite">等待提交。</p>
+      <p id="result-answer"></p>
+      <section id="result-sources" aria-labelledby="sources-heading" hidden>
+        <h3 id="sources-heading">文件出处</h3>
+        <ul id="source-list"></ul>
+      </section>
+      <section id="plan-panel" aria-labelledby="plan-heading" hidden>
+        <h3 id="plan-heading">整理计划预览</h3>
+        <form id="plan-form">
+          <div id="plan-targets"></div>
+          <button id="preview-plan" type="submit">生成计划预览</button>
+        </form>
+        <p id="plan-status" role="status" aria-live="polite"></p>
+        <ul id="plan-list"></ul>
+        <div id="plan-actions" hidden>
+          <button id="approve-plan" type="button">批准计划</button>
+          <button id="reject-plan" type="button">拒绝计划</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const form = document.querySelector("#request-form");
+    const workspaceSelect = document.querySelector("#workspace-select");
+    const requestText = document.querySelector("#request-text");
+    const submitButton = document.querySelector("#submit-request");
+    const resultStatus = document.querySelector("#result-status");
+    const resultAnswer = document.querySelector("#result-answer");
+    const resultSources = document.querySelector("#result-sources");
+    const sourceList = document.querySelector("#source-list");
+    const planPanel = document.querySelector("#plan-panel");
+    const planForm = document.querySelector("#plan-form");
+    const planTargets = document.querySelector("#plan-targets");
+    const previewPlanButton = document.querySelector("#preview-plan");
+    const planStatus = document.querySelector("#plan-status");
+    const planList = document.querySelector("#plan-list");
+    const planActions = document.querySelector("#plan-actions");
+    const approvePlanButton = document.querySelector("#approve-plan");
+    const rejectPlanButton = document.querySelector("#reject-plan");
+    let currentSources = [];
+    let currentWorkflow = null;
+
+    function showStatus(message, answer = "") {
+      resultStatus.textContent = message;
+      resultAnswer.textContent = answer;
+    }
+
+    function safeErrorMessage(payload, fallback) {
+      const message = payload?.detail?.message;
+      return typeof message === "string" && message ? message : fallback;
+    }
+
+    function showSources(sources, workspaceName = "") {
+      currentSources = Array.isArray(sources) ? sources : [];
+      sourceList.replaceChildren();
+      resultSources.hidden = true;
+      if (currentSources.length === 0) {
+        return;
+      }
+
+      for (const source of currentSources) {
+        const item = document.createElement("li");
+        const prefix = workspaceName ? `${workspaceName} / ` : "";
+        item.textContent = `${prefix}${String(source.name)} — ${String(source.relative_path)}`;
+        sourceList.append(item);
+      }
+      resultSources.hidden = false;
+    }
+
+    function showPlanPreview(sources) {
+      planTargets.replaceChildren();
+      planList.replaceChildren();
+      planStatus.textContent = "";
+      planPanel.hidden = true;
+      planActions.hidden = true;
+      currentWorkflow = null;
+      if (!Array.isArray(sources) || sources.length === 0) {
+        return;
+      }
+
+      for (const [index, source] of sources.entries()) {
+        const field = document.createElement("div");
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.id = `target-directory-${index}`;
+        input.dataset.fileId = String(source.file_id);
+        input.required = true;
+        input.maxLength = 400;
+        input.placeholder = "例如：reports/quarterly";
+        label.htmlFor = input.id;
+        label.textContent = `目标目录：${String(source.relative_path)}`;
+        field.append(label, input);
+        planTargets.append(field);
+      }
+      planPanel.hidden = false;
+    }
+
+    function showPlanResult(payload) {
+      planList.replaceChildren();
+      const plan = payload?.operation_plan;
+      const operations = plan?.operations;
+      const workflowId = payload?.workflow_id;
+      const planId = plan?.plan_id;
+      if (
+        !plan ||
+        !Array.isArray(operations) ||
+        typeof workflowId !== "string" ||
+        typeof planId !== "string"
+      ) {
+        planStatus.textContent = "计划响应不可用，请稍后重试。";
+        planActions.hidden = true;
+        currentWorkflow = null;
+        return;
+      }
+
+      currentWorkflow = {workflowId, planId};
+      planStatus.textContent =
+        `计划 ${planId} 已生成，当前等待审批。`;
+      planActions.hidden = false;
+      approvePlanButton.disabled = false;
+      rejectPlanButton.disabled = false;
+      for (const operation of operations) {
+        const item = document.createElement("li");
+        item.textContent = `${String(operation.source_relative_path)} → ${String(operation.target_relative_path)}`;
+        planList.append(item);
+      }
+    }
+
+    async function loadWorkspaces() {
+      try {
+        const response = await fetch("/api/v1/workspaces");
+        const payload = await response.json();
+        if (!response.ok || !Array.isArray(payload)) {
+          throw new Error("workspace request failed");
+        }
+
+        workspaceSelect.replaceChildren();
+        if (payload.length === 0) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "没有可用工作区";
+          workspaceSelect.append(option);
+          showStatus("请先通过现有 API 添加并扫描工作区。");
+          return;
+        }
+
+        for (const workspace of payload) {
+          const option = document.createElement("option");
+          option.value = String(workspace.id);
+          option.textContent = String(workspace.name);
+          workspaceSelect.append(option);
+        }
+        workspaceSelect.disabled = false;
+        submitButton.disabled = false;
+      } catch {
+        workspaceSelect.replaceChildren();
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "工作区加载失败";
+        workspaceSelect.append(option);
+        showStatus("工作区当前不可用，请稍后重试。");
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!workspaceSelect.value || !requestText.value.trim()) {
+        return;
+      }
+
+      submitButton.disabled = true;
+      const selectedWorkspaceName =
+        workspaceSelect.selectedOptions[0]?.textContent ?? "";
+      showStatus("请求处理中…");
+      showSources([]);
+      showPlanPreview([]);
+      try {
+        const response = await fetch("/api/v1/agent-runs", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            workspace_id: Number(workspaceSelect.value),
+            request_text: requestText.value,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          showStatus(safeErrorMessage(payload, "请求失败，请稍后重试。"));
+          return;
+        }
+
+        if (payload.status === "completed") {
+          showStatus(`运行 #${payload.run_id} 已完成。`, payload.final_answer ?? "");
+          showSources(payload.sources, selectedWorkspaceName);
+          showPlanPreview(payload.sources);
+          return;
+        }
+
+        const errorCode = payload.error?.code;
+        const suffix = typeof errorCode === "string" ? `（${errorCode}）` : "";
+        showStatus(`运行 #${payload.run_id} 已停止${suffix}。`);
+      } catch {
+        showStatus("无法连接 FileNest API，请稍后重试。");
+      } finally {
+        submitButton.disabled = false;
+      }
+    });
+
+    planForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!workspaceSelect.value || currentSources.length === 0) {
+        return;
+      }
+
+      const inputs = [
+        ...planTargets.querySelectorAll("input[data-file-id]"),
+      ];
+      const selections = inputs.map((input) => ({
+        source_file_id: Number(input.dataset.fileId),
+        target_directory: input.value.trim(),
+      }));
+      if (selections.some((selection) => !selection.target_directory)) {
+        planStatus.textContent = "请为每个出处填写目标目录。";
+        return;
+      }
+
+      previewPlanButton.disabled = true;
+      planStatus.textContent = "计划生成中…";
+      planList.replaceChildren();
+      try {
+        const targetDirectories = [
+          ...new Set(selections.map((selection) => selection.target_directory)),
+        ];
+        const response = await fetch("/api/v1/workflows", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            workspace_id: Number(workspaceSelect.value),
+            target_directories: targetDirectories,
+            selections,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          planStatus.textContent = safeErrorMessage(
+            payload,
+            "计划生成失败，请稍后重试。",
+          );
+          return;
+        }
+        showPlanResult(payload);
+      } catch {
+        planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        previewPlanButton.disabled = false;
+      }
+    });
+
+    async function submitPlanDecision(action) {
+      if (!currentWorkflow) {
+        return;
+      }
+
+      approvePlanButton.disabled = true;
+      rejectPlanButton.disabled = true;
+      planStatus.textContent = action === "approve" ? "批准提交中…" : "拒绝提交中…";
+      try {
+        const response = await fetch(
+          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/decisions`,
+          {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              action,
+              expected_plan_id: currentWorkflow.planId,
+            }),
+          },
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          planStatus.textContent = safeErrorMessage(
+            payload,
+            "审批提交失败，请刷新计划后重试。",
+          );
+          return;
+        }
+
+        if (payload.approval_status === "APPROVED") {
+          planStatus.textContent = "计划已批准，尚未执行文件操作。";
+        } else if (payload.approval_status === "REJECTED") {
+          planStatus.textContent = "计划已拒绝。";
+        } else {
+          planStatus.textContent = "审批状态已更新。";
+        }
+        currentWorkflow = null;
+        planActions.hidden = true;
+      } catch {
+        planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        if (currentWorkflow) {
+          approvePlanButton.disabled = false;
+          rejectPlanButton.disabled = false;
+        }
+      }
+    }
+
+    approvePlanButton.addEventListener("click", () => {
+      submitPlanDecision("approve");
+    });
+
+    rejectPlanButton.addEventListener("click", () => {
+      submitPlanDecision("reject");
+    });
+
+    loadWorkspaces();
+  </script>
+</body>
+</html>

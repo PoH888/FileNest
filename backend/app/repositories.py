@@ -323,6 +323,15 @@ def get_approval_request_by_workflow_id(
     return session.scalar(statement)
 
 
+def add_approval_request(
+    session: Session,
+    approval_request: ApprovalRequest,
+) -> None:
+    """将待审批业务状态加入当前事务，提交时机由 Service 决定。"""
+
+    session.add(approval_request)
+
+
 def find_waiting_approval_requests(
     session: Session,
 ) -> list[ApprovalRequest]:

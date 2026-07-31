@@ -1,11 +1,15 @@
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query # Depends：告诉 FastAPI：执行这个路由前，先调用指定的依赖函数，并把结果交给路由。
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
 from sqlalchemy.orm import Session
 
+from .agent_api import router as agent_router
+from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
 from .database import get_session
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
@@ -32,6 +36,16 @@ from .schemas import (
 )
 
 app = FastAPI(title="FileNest API")
+app.include_router(agent_router)
+app.include_router(organization_router)
+_MINIMAL_UI_PATH = Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def minimal_ui() -> FileResponse:
+    """返回不绕过 HTTP API 的最小单页界面。"""
+
+    return FileResponse(_MINIMAL_UI_PATH, media_type="text/html")
 
 class WorkspaceCreate(BaseModel):
     """校验客户端提交的数据"""
