@@ -42,6 +42,16 @@
     #result-sources[hidden] {
       display: none;
     }
+    #timeline-panel[hidden] {
+      display: none;
+    }
+    #timeline-list {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+    #timeline-list li + li {
+      margin-top: 0.35rem;
+    }
     #plan-panel[hidden] {
       display: none;
     }
@@ -91,6 +101,10 @@
     <section id="run-result" aria-labelledby="result-heading">
       <h2 id="result-heading">运行结果</h2>
       <p id="result-status" role="status" aria-live="polite">等待提交。</p>
+      <section id="timeline-panel" aria-labelledby="timeline-heading" hidden>
+        <h3 id="timeline-heading">运行时间线</h3>
+        <ol id="timeline-list" aria-live="polite"></ol>
+      </section>
       <p id="result-answer"></p>
       <section id="result-sources" aria-labelledby="sources-heading" hidden>
         <h3 id="sources-heading">文件出处</h3>
@@ -119,6 +133,8 @@
     const submitButton = document.querySelector("#submit-request");
     const resultStatus = document.querySelector("#result-status");
     const resultAnswer = document.querySelector("#result-answer");
+    const timelinePanel = document.querySelector("#timeline-panel");
+    const timelineList = document.querySelector("#timeline-list");
     const resultSources = document.querySelector("#result-sources");
     const sourceList = document.querySelector("#source-list");
     const planPanel = document.querySelector("#plan-panel");
@@ -132,6 +148,27 @@
     const rejectPlanButton = document.querySelector("#reject-plan");
     let currentSources = [];
     let currentWorkflow = null;
+    let activeRunEventSource = null;
+
+    const TERMINAL_RUN_STATUSES = new Set([
+      "completed",
+      "max_steps_reached",
+      "timed_out",
+      "cancelled",
+      "failed",
+    ]);
+    const RUN_STATUS_LABELS = Object.freeze({
+      max_steps_reached: "达到最大步数",
+      timed_out: "超时",
+      cancelled: "已取消",
+      failed: "失败",
+    });
+    const TOOL_STATUS_LABELS = Object.freeze({
+      requested: "已请求",
+      succeeded: "已完成",
+      rejected: "已拒绝",
+      failed: "失败",
+    });
 
     function showStatus(message, answer = "") {
       resultStatus.textContent = message;
@@ -141,6 +178,202 @@
     function safeErrorMessage(payload, fallback) {
       const message = payload?.detail?.message;
       return typeof message === "string" && message ? message : fallback;
+    }
+
+    function closeRunEventStream() {
+      if (activeRunEventSource !== null) {
+        activeRunEventSource.close();
+        activeRunEventSource = null;
+      }
+    }
+
+    function resetRunTimeline() {
+      closeRunEventStream();
+      timelineList.replaceChildren();
+      timelinePanel.hidden = true;
+    }
+
+    function parseRunEvent(event) {
+      try {
+        const payload = JSON.parse(event.data);
+        return payload && typeof payload === "object" ? payload : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function addRunTimelineItem(message) {
+      const item = document.createElement("li");
+      item.textContent = message;
+      timelineList.append(item);
+      timelinePanel.hidden = false;
+    }
+
+    function updateRunStatus(payload) {
+      const runId = String(payload.run_id);
+      if (payload.status === "running") {
+        resultStatus.textContent = `运行 #${runId} 处理中…`;
+        return;
+      }
+      if (payload.status === "completed") {
+        resultStatus.textContent = `运行 #${runId} 已完成。`;
+        return;
+      }
+      const errorSuffix =
+        typeof payload.error_code === "string"
+          ? `（${payload.error_code}）`
+          : "";
+      const statusLabel = RUN_STATUS_LABELS[payload.status] ?? "已停止";
+      resultStatus.textContent =
+        `运行 #${runId} ${statusLabel}${errorSuffix}。`;
+    }
+
+    function describeRunEvent(payload) {
+      const runId = String(payload.run_id);
+      if (payload.status === "running") {
+        return `运行 #${runId} 已开始。`;
+      }
+      if (payload.status === "completed") {
+        return `运行 #${runId} 已完成。`;
+      }
+      const errorSuffix =
+        typeof payload.error_code === "string"
+          ? `（${payload.error_code}）`
+          : "";
+      const statusLabel = RUN_STATUS_LABELS[payload.status] ?? "已停止";
+      return `运行 #${runId} ${statusLabel}${errorSuffix}。`;
+    }
+
+    function describeToolEvent(payload) {
+      const sequenceNo = String(payload.sequence_no);
+      const toolName = String(payload.tool_name);
+      const statusLabel = TOOL_STATUS_LABELS[payload.status] ?? "状态已更新";
+      const errorSuffix =
+        typeof payload.error_code === "string"
+          ? `（${payload.error_code}）`
+          : "";
+      return `工具调用 ${sequenceNo}：${toolName}${statusLabel}${errorSuffix}。`;
+    }
+
+    function handleRunEvent(runId, eventType, event, eventSource) {
+      const payload = parseRunEvent(event);
+      if (
+        payload === null ||
+        (eventType === "agent_run.status_changed" &&
+          String(payload.run_id) !== String(runId))
+      ) {
+        eventSource.close();
+        if (activeRunEventSource === eventSource) {
+          activeRunEventSource = null;
+        }
+        resultStatus.textContent = "实时状态数据不可用。";
+        return;
+      }
+
+      if (eventType === "agent_run.status_changed") {
+        updateRunStatus(payload);
+        addRunTimelineItem(describeRunEvent(payload));
+        if (TERMINAL_RUN_STATUSES.has(payload.status)) {
+          eventSource.close();
+          if (activeRunEventSource === eventSource) {
+            activeRunEventSource = null;
+          }
+        }
+        return;
+      }
+
+      if (eventType === "agent_tool_call.status_changed") {
+        addRunTimelineItem(describeToolEvent(payload));
+      }
+    }
+
+    async function recoverRunEventStream(runId, eventSource) {
+      resultStatus.textContent = `运行 #${runId} 正在补取当前状态…`;
+
+      try {
+        const response = await fetch(
+          `/api/v1/agent-runs/${encodeURIComponent(runId)}`,
+        );
+        const payload = await response.json();
+        if (
+          !response.ok ||
+          !payload ||
+          typeof payload !== "object" ||
+          String(payload.run_id) !== String(runId)
+        ) {
+          throw new Error("Agent Run 当前状态不可用。");
+        }
+
+        if (activeRunEventSource !== eventSource) {
+          return;
+        }
+
+        updateRunStatus(payload);
+        if (TERMINAL_RUN_STATUSES.has(payload.status)) {
+          addRunTimelineItem(`当前状态补取：${describeRunEvent(payload)}`);
+          eventSource.close();
+          activeRunEventSource = null;
+          return;
+        }
+
+        addRunTimelineItem(`实时连接恢复中：${describeRunEvent(payload)}`);
+        resultStatus.textContent = `运行 #${runId} 实时连接恢复中…`;
+        // 保持同一 EventSource，由浏览器携带 Last-Event-ID 自动续接。
+      } catch {
+        eventSource.close();
+        if (activeRunEventSource === eventSource) {
+          activeRunEventSource = null;
+        }
+        resultStatus.textContent = "当前状态补取失败，请稍后刷新。";
+      }
+    }
+
+    function startRunEventStream(runId, fallbackPayload) {
+      closeRunEventStream();
+      timelineList.replaceChildren();
+      timelinePanel.hidden = false;
+      if (typeof EventSource !== "function") {
+        addRunTimelineItem("当前浏览器不支持实时状态。");
+        updateRunStatus(fallbackPayload);
+        return;
+      }
+
+      let recoveryInProgress = false;
+      const eventSource = new EventSource(
+        `/api/v1/agent-runs/${encodeURIComponent(runId)}/events`,
+      );
+      activeRunEventSource = eventSource;
+      eventSource.addEventListener("agent_run.status_changed", (event) => {
+        handleRunEvent(
+          runId,
+          "agent_run.status_changed",
+          event,
+          eventSource,
+        );
+      });
+      eventSource.addEventListener(
+        "agent_tool_call.status_changed",
+        (event) => {
+          handleRunEvent(
+            runId,
+            "agent_tool_call.status_changed",
+            event,
+            eventSource,
+          );
+        },
+      );
+      eventSource.onerror = async () => {
+        if (
+          recoveryInProgress ||
+          activeRunEventSource !== eventSource
+        ) {
+          return;
+        }
+
+        recoveryInProgress = true;
+        await recoverRunEventStream(runId, eventSource);
+        recoveryInProgress = false;
+      };
     }
 
     function showSources(sources, workspaceName = "") {
@@ -265,6 +498,7 @@
       const selectedWorkspaceName =
         workspaceSelect.selectedOptions[0]?.textContent ?? "";
       showStatus("请求处理中…");
+      resetRunTimeline();
       showSources([]);
       showPlanPreview([]);
       try {
@@ -282,16 +516,15 @@
           return;
         }
 
+        resultAnswer.textContent =
+          typeof payload.final_answer === "string" ? payload.final_answer : "";
         if (payload.status === "completed") {
-          showStatus(`运行 #${payload.run_id} 已完成。`, payload.final_answer ?? "");
           showSources(payload.sources, selectedWorkspaceName);
           showPlanPreview(payload.sources);
-          return;
+        } else {
+          showSources([]);
         }
-
-        const errorCode = payload.error?.code;
-        const suffix = typeof errorCode === "string" ? `（${errorCode}）` : "";
-        showStatus(`运行 #${payload.run_id} 已停止${suffix}。`);
+        startRunEventStream(payload.run_id, payload);
       } catch {
         showStatus("无法连接 FileNest API，请稍后重试。");
       } finally {

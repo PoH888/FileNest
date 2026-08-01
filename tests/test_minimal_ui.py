@@ -13,12 +13,15 @@ def test_minimal_ui_serves_safe_read_only_request_form() -> None:
     assert 'id="request-text"' in response.text
     assert 'id="result-status"' in response.text
     assert 'id="result-answer"' in response.text
+    assert 'id="timeline-panel"' in response.text
+    assert 'id="timeline-list"' in response.text
     assert 'id="plan-form"' in response.text
     assert 'id="plan-status"' in response.text
     assert 'id="approve-plan"' in response.text
     assert 'id="reject-plan"' in response.text
     assert 'fetch("/api/v1/workspaces")' in response.text
     assert 'fetch("/api/v1/agent-runs"' in response.text
+    assert "new EventSource" in response.text
     assert 'fetch("/api/v1/workflows"' in response.text
     assert "/decisions" in response.text
     assert "expected_plan_id" in response.text
@@ -41,3 +44,7 @@ def test_minimal_ui_wires_plan_preview_and_decision_path() -> None:
     assert 'expected_plan_id: currentWorkflow.planId' in html
     assert 'submitPlanDecision("approve")' in html
     assert 'submitPlanDecision("reject")' in html
+    assert 'addEventListener("agent_run.status_changed"' in html
+    assert 'addEventListener(\n        "agent_tool_call.status_changed"' in html
+    assert "eventSource.close()" in html
+    assert "eventSource.onerror" in html

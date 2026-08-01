@@ -1,4 +1,6 @@
 from collections.abc import Iterator
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import pytest
@@ -7,15 +9,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.agent_api import (
+    _stream_agent_run_events,
     AgentRunResponse,
     ReadOnlyAgentRunExecutor,
     get_agent_run_executor,
 )
+from backend.app.agent_observability import SqlAlchemyAgentRunRecorder
 from backend.app.database import Base, get_session
 from backend.app.fake_model_client import FakeModelClient
 from backend.app.main import app
 from backend.app.model_client import ModelMessage, ModelResponse, ModelToolCall
-from backend.app.models import AgentRun, FileEntry, Workspace
+from backend.app.models import AgentRun, AgentToolCall, FileEntry, Workspace
 from backend.app.tool_contracts import ToolResult
 
 
@@ -213,3 +217,183 @@ def test_agent_run_api_rejects_model_access_to_another_workspace(
     assert tool_result.error is not None
     assert tool_result.error.code == "invalid_arguments"
     assert response.json()["sources"] == []
+
+
+def test_agent_run_events_stream_persisted_statuses_with_ordered_ids(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    started_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 8, 31, 12, 1, tzinfo=timezone.utc)
+
+    with session_factory() as session:
+        agent_run = AgentRun(
+            status="completed",
+            started_at=started_at,
+            finished_at=finished_at,
+            model_turns=2,
+        )
+        session.add(agent_run)
+        session.flush()
+        session.add(
+            AgentToolCall(
+                agent_run_id=agent_run.id,
+                sequence_no=1,
+                model_call_id="call_1",
+                tool_name="search_files",
+                status="succeeded",
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        )
+        session.commit()
+        run_id = agent_run.id
+
+    response = client.get(f"/api/v1/agent-runs/{run_id}/events")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    blocks = [block for block in response.text.split("\n\n") if block]
+    assert len(blocks) == 4
+    event_lines = [block.splitlines() for block in blocks]
+    assert [lines[0] for lines in event_lines] == [
+        "id: 1",
+        "id: 2",
+        "id: 3",
+        "id: 4",
+    ]
+    assert [lines[1] for lines in event_lines] == [
+        "event: agent_run.status_changed",
+        "event: agent_tool_call.status_changed",
+        "event: agent_tool_call.status_changed",
+        "event: agent_run.status_changed",
+    ]
+    payloads = [json.loads(lines[2].removeprefix("data: ")) for lines in event_lines]
+    assert [payload["status"] for payload in payloads] == [
+        "running",
+        "requested",
+        "succeeded",
+        "completed",
+    ]
+    assert payloads[-1]["run_id"] == run_id
+
+
+def test_agent_run_recovery_fetches_state_and_resumes_after_last_event_id(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    started_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 8, 31, 12, 1, tzinfo=timezone.utc)
+
+    with session_factory() as session:
+        agent_run = AgentRun(
+            status="completed",
+            started_at=started_at,
+            finished_at=finished_at,
+            model_turns=2,
+        )
+        session.add(agent_run)
+        session.flush()
+        session.add(
+            AgentToolCall(
+                agent_run_id=agent_run.id,
+                sequence_no=1,
+                model_call_id="call_1",
+                tool_name="search_files",
+                status="succeeded",
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        )
+        session.commit()
+        run_id = agent_run.id
+
+    state_response = client.get(f"/api/v1/agent-runs/{run_id}")
+    event_response = client.get(
+        f"/api/v1/agent-runs/{run_id}/events",
+        headers={"Last-Event-ID": "2"},
+    )
+
+    assert state_response.status_code == 200
+    assert state_response.json() == {
+        "run_id": run_id,
+        "status": "completed",
+        "model_turns": 2,
+        "error_code": None,
+    }
+    blocks = [block for block in event_response.text.split("\n\n") if block]
+    event_lines = [block.splitlines() for block in blocks]
+    assert event_response.status_code == 200
+    assert [lines[0] for lines in event_lines] == ["id: 3", "id: 4"]
+    payloads = [
+        json.loads(lines[2].removeprefix("data: ")) for lines in event_lines
+    ]
+    assert [payload["status"] for payload in payloads] == [
+        "succeeded",
+        "completed",
+    ]
+
+
+def test_agent_run_events_rejects_unknown_run(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, _ = agent_client
+
+    response = client.get("/api/v1/agent-runs/999/events")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "agent_run_not_found",
+            "message": "Agent 运行记录不存在。",
+        }
+    }
+
+
+def test_agent_run_stream_disconnect_does_not_lose_background_run(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    started_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 8, 31, 12, 1, tzinfo=timezone.utc)
+
+    with session_factory() as session:
+        recorder = SqlAlchemyAgentRunRecorder(
+            session,
+            clock=lambda: started_at,
+        )
+        run_id = recorder.start_run()
+
+    with session_factory() as stream_session:
+        event_stream = _stream_agent_run_events(stream_session, run_id)
+        first_event = next(event_stream)
+        event_stream.close()
+
+    with session_factory() as session:
+        persisted_run = session.get(AgentRun, run_id)
+        assert persisted_run is not None
+        assert persisted_run.status == "running"
+
+    with session_factory() as session:
+        recorder = SqlAlchemyAgentRunRecorder(
+            session,
+            clock=lambda: finished_at,
+        )
+        recorder.finish_run(
+            agent_run_id=run_id,
+            status="completed",
+            model_turns=1,
+            error_code=None,
+        )
+
+    state_response = client.get(f"/api/v1/agent-runs/{run_id}")
+    first_payload = json.loads(first_event.split("data: ", 1)[1])
+
+    assert first_payload["status"] == "running"
+    assert state_response.status_code == 200
+    assert state_response.json() == {
+        "run_id": run_id,
+        "status": "completed",
+        "model_turns": 1,
+        "error_code": None,
+    }

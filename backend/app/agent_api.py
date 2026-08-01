@@ -1,10 +1,13 @@
 """最小界面使用的同步只读 Agent HTTP 边界。"""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from time import sleep
 from typing import Protocol
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .agent_loop import AgentLoop, AgentRunStatus
@@ -13,13 +16,16 @@ from .agent_observability import (
     SqlAlchemyAgentRunRecorder,
 )
 from .database import get_session
+from .events import AgentRunEventStatus, build_agent_run_event_stream
 from .model_client import ModelClient, ModelMessage
 from .model_settings import ModelSettings
+from .models import AgentToolCall
 from .openai_compatible_model_client import (
     OpenAICompatibleModelClient,
     UnsupportedModelProviderError,
 )
 from .read_tools import build_get_file_metadata_tool, build_search_files_tool
+from .repositories import get_agent_run_by_id
 from .services import get_workspace as get_workspace_service
 from .tool_contracts import ToolResult
 from .tool_registry import ToolRegistry
@@ -76,6 +82,17 @@ class AgentRunResponse(BaseModel):
     final_answer: str | None = None
     error: AgentRunResponseError | None = None
     sources: tuple[AgentSourceReference, ...] = ()
+
+
+class AgentRunStateResponse(BaseModel):
+    """断线恢复时从持久化记录读取的最小 Agent Run 当前状态。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: int = Field(ge=1)
+    status: AgentRunEventStatus
+    model_turns: int = Field(ge=0)
+    error_code: str | None = None
 
 
 class AgentRunExecutor(Protocol):
@@ -269,12 +286,47 @@ def _source_references(
 
 
 _default_executor = ReadOnlyAgentRunExecutor()
+_AGENT_EVENT_POLL_SECONDS = 0.1
 
 
 def get_agent_run_executor() -> AgentRunExecutor:
     """返回延迟读取模型环境配置的正式执行器。"""
 
     return _default_executor
+
+
+def _stream_agent_run_events(
+    session: Session,
+    run_id: int,
+    *,
+    after_event_id: int = 0,
+) -> Iterator[str]:
+    emitted_event_count = after_event_id
+
+    while True:
+        # 每轮重新结束只读事务，保证长连接能看到记录器独立提交的最新状态。
+        session.rollback()
+        agent_run = get_agent_run_by_id(session, run_id)
+        if agent_run is None:
+            return
+        tool_calls = list(
+            session.scalars(
+                select(AgentToolCall)
+                .where(AgentToolCall.agent_run_id == run_id)
+                .order_by(AgentToolCall.sequence_no)
+            )
+        )
+        events = build_agent_run_event_stream(agent_run, tool_calls)
+        is_terminal = agent_run.status != "running"
+        session.rollback()
+
+        for event in events[emitted_event_count:]:
+            emitted_event_count = event.event_id
+            yield event.encode()
+
+        if is_terminal:
+            return
+        sleep(_AGENT_EVENT_POLL_SECONDS)
 
 
 @router.post("/agent-runs", response_model=AgentRunResponse)
@@ -316,3 +368,60 @@ def create_agent_run(
                 "message": "Agent 运行当前不可用。",
             },
         ) from error
+
+
+@router.get("/agent-runs/{run_id}", response_model=AgentRunStateResponse)
+def get_agent_run_state(
+    run_id: int,
+    session: Session = Depends(get_session),
+) -> AgentRunStateResponse:
+    """读取 Agent Run 的持久化当前状态，不介入任务执行。"""
+
+    agent_run = get_agent_run_by_id(session, run_id)
+    if agent_run is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "agent_run_not_found",
+                "message": "Agent 运行记录不存在。",
+            },
+        )
+
+    return AgentRunStateResponse(
+        run_id=agent_run.id,
+        status=agent_run.status,
+        model_turns=agent_run.model_turns,
+        error_code=agent_run.error_code,
+    )
+
+
+@router.get("/agent-runs/{run_id}/events")
+def stream_agent_run_events(
+    run_id: int,
+    last_event_id: int | None = Header(
+        default=None,
+        alias="Last-Event-ID",
+        ge=1,
+    ),
+    session: Session = Depends(get_session),
+) -> StreamingResponse:
+    """以 SSE 只读传递已记录的 Agent Run 状态，不参与任务执行。"""
+
+    if get_agent_run_by_id(session, run_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "agent_run_not_found",
+                "message": "Agent 运行记录不存在。",
+            },
+        )
+
+    return StreamingResponse(
+        _stream_agent_run_events(
+            session,
+            run_id,
+            after_event_id=last_event_id or 0,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
