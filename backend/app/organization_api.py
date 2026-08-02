@@ -24,10 +24,20 @@ from .organization_planning import (
 )
 from .path_policy import PathPolicyError
 from .repositories import get_approval_request_by_workflow_id
+from .safe_execution import (
+    SafeExecutionError,
+    SafeExecutionErrorCode,
+    SafeExecutionRequest,
+    SafeExecutionResult,
+    execute_safe_operation_plan,
+    undo_safe_operation_execution,
+)
 from .services import (
     ApprovalTransitionError,
     ApprovalTransitionErrorCode,
     FileEntryNotFoundError,
+    OperationPlanApprovalError,
+    OperationPlanApprovalErrorCode,
     OperationPlanExpiredError,
     OperationPlanSourceChangedError,
     OperationPlanSourceMismatchError,
@@ -81,6 +91,51 @@ class OrganizationDecisionRequest(BaseModel):
         if self.action != "edit" and self.changes is not None:
             raise ValueError("changes are only allowed for edit action")
         return self
+
+
+class SafeExecutionItemResponse(BaseModel):
+    """供界面展示的一条安全执行或撤销结果。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sequence_no: int
+    source_file_id: int
+    status: str
+    before_relative_path: str
+    after_relative_path: str
+    error_code: str | None
+
+
+class SafeExecutionResponse(BaseModel):
+    """安全执行边界对界面公开的最小结果。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    execution_id: int
+    workflow_id: UUID
+    plan_id: UUID
+    status: str
+    items: tuple[SafeExecutionItemResponse, ...]
+
+    @classmethod
+    def from_result(cls, result: SafeExecutionResult) -> "SafeExecutionResponse":
+        return cls(
+            execution_id=result.execution_id,
+            workflow_id=result.workflow_id,
+            plan_id=result.plan_id,
+            status=result.status,
+            items=tuple(
+                SafeExecutionItemResponse(
+                    sequence_no=item.sequence_no,
+                    source_file_id=item.source_file_id,
+                    status=item.status,
+                    before_relative_path=item.before_relative_path,
+                    after_relative_path=item.after_relative_path,
+                    error_code=item.error_code,
+                )
+                for item in result.items
+            ),
+        )
 
 
 def _workflow_response(
@@ -146,6 +201,73 @@ def _workflow_response(
         operation_plan=workflow.operation_plan,
         approval_status=approval.status,
     )
+
+
+def _ready_workflow_response(
+    session: Session,
+    graph: CompiledStateGraph,
+    workflow_id: UUID,
+) -> OrganizationWorkflowResponse:
+    """只让已批准且进入 ready 的工作流进入文件副作用边界。"""
+
+    workflow = _workflow_response(session, graph, workflow_id)
+    if workflow.status != "ready" or workflow.approval_status != "APPROVED":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "organization_workflow_not_ready",
+                "message": "工作流尚未获得批准，不能执行文件操作。",
+            },
+        )
+    return workflow
+
+
+def _safe_execution_http_error(
+    error: SafeExecutionError | OperationPlanApprovalError,
+) -> HTTPException:
+    """把安全执行失败收敛为稳定的 HTTP 错误，不泄露底层异常细节。"""
+
+    not_found_codes = {
+        SafeExecutionErrorCode.HISTORY_NOT_FOUND,
+        SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
+        SafeExecutionErrorCode.FILE_ENTRY_NOT_FOUND,
+        OperationPlanApprovalErrorCode.NOT_FOUND,
+    }
+    status_code = 404 if error.code in not_found_codes else 409
+    if error.code == SafeExecutionErrorCode.HISTORY_NOT_FOUND:
+        message = "找不到可撤销的执行历史。"
+    elif isinstance(error, OperationPlanApprovalError):
+        message = "操作计划尚未获得人工批准。"
+    else:
+        message = "安全文件操作当前不可用。"
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": str(error.code), "message": message},
+    )
+
+
+def _operation_plan_http_error(error: Exception) -> HTTPException:
+    """把执行前的工作区、计划和路径校验失败映射到 API 边界。"""
+
+    if isinstance(error, WorkspaceNotFoundError):
+        status_code = 404
+        detail = {
+            "code": "workspace_not_found",
+            "message": "工作区不存在。",
+        }
+    elif isinstance(error, FileEntryNotFoundError):
+        status_code = 404
+        detail = {
+            "code": "file_not_found",
+            "message": "文件索引不存在。",
+        }
+    else:
+        status_code = 409
+        detail = {
+            "code": "organization_plan_unavailable",
+            "message": "当前文件状态无法安全执行。",
+        }
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 @router.post(
@@ -222,6 +344,63 @@ def get_organization_workflow(
     """读取 checkpoint 与审批记录一致的计划快照。"""
 
     return _workflow_response(session, graph, workflow_id)
+
+
+@router.post(
+    "/workflows/{workflow_id}/execute",
+    response_model=SafeExecutionResponse,
+)
+def execute_organization_workflow(
+    workflow_id: UUID,
+    session: Session = Depends(get_session),
+    graph: CompiledStateGraph = Depends(get_workflow_graph),
+) -> SafeExecutionResponse:
+    """执行当前已批准工作流中的服务器端计划。"""
+
+    workflow = _ready_workflow_response(session, graph, workflow_id)
+    request = SafeExecutionRequest(
+        workflow_id=workflow_id,
+        plan=workflow.operation_plan,
+    )
+    try:
+        result = execute_safe_operation_plan(session, request)
+    except OperationPlanApprovalError as error:
+        raise _safe_execution_http_error(error) from error
+    except SafeExecutionError as error:
+        raise _safe_execution_http_error(error) from error
+    except (
+        FileEntryNotFoundError,
+        OperationPlanExpiredError,
+        OperationPlanSourceChangedError,
+        OperationPlanSourceMismatchError,
+        OperationPlanTargetConflictError,
+        OperationPlanTargetUnavailableError,
+        PathPolicyError,
+        WorkspaceNotFoundError,
+    ) as error:
+        raise _operation_plan_http_error(error) from error
+
+    return SafeExecutionResponse.from_result(result)
+
+
+@router.post(
+    "/workflows/{workflow_id}/undo",
+    response_model=SafeExecutionResponse,
+)
+def undo_organization_workflow(
+    workflow_id: UUID,
+    session: Session = Depends(get_session),
+    graph: CompiledStateGraph = Depends(get_workflow_graph),
+) -> SafeExecutionResponse:
+    """撤销当前已批准工作流对应的安全执行历史。"""
+
+    _ready_workflow_response(session, graph, workflow_id)
+    try:
+        result = undo_safe_operation_execution(session, workflow_id)
+    except SafeExecutionError as error:
+        raise _safe_execution_http_error(error) from error
+
+    return SafeExecutionResponse.from_result(result)
 
 
 @router.post(

@@ -305,3 +305,117 @@ def test_edit_api_rejects_stale_plan_id(
             "message": "审批决定与当前工作流状态冲突。",
         }
     }
+
+
+def test_execute_and_undo_organization_workflow_via_api(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_root = tmp_path / "execute-undo-api-workspace"
+    workspace_id, file_id = _seed_workspace(session_factory, workspace_root)
+    source_path = workspace_root / "inbox" / "quarterly-report.txt"
+    target_path = workspace_root / "reports" / "quarterly" / "quarterly-report.txt"
+    source_content = source_path.read_bytes()
+
+    create_response = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    )
+    assert create_response.status_code == 201
+    created = create_response.json()
+
+    approve_response = client.post(
+        f"/api/v1/workflows/{created['workflow_id']}/decisions",
+        json={
+            "action": "approve",
+            "expected_plan_id": created["operation_plan"]["plan_id"],
+        },
+    )
+    assert approve_response.status_code == 200
+    assert approve_response.json()["approval_status"] == "APPROVED"
+
+    execute_response = client.post(
+        f"/api/v1/workflows/{created['workflow_id']}/execute"
+    )
+    assert execute_response.status_code == 200
+    executed = execute_response.json()
+    assert executed["status"] == "COMPLETED"
+    assert executed["items"][0]["before_relative_path"] == (
+        "inbox/quarterly-report.txt"
+    )
+    assert executed["items"][0]["after_relative_path"] == (
+        "reports/quarterly/quarterly-report.txt"
+    )
+    assert not source_path.exists()
+    assert target_path.read_bytes() == source_content
+
+    undo_response = client.post(
+        f"/api/v1/workflows/{created['workflow_id']}/undo"
+    )
+    assert undo_response.status_code == 200
+    undone = undo_response.json()
+    assert undone["status"] == "UNDONE"
+    assert source_path.read_bytes() == source_content
+    assert not target_path.exists()
+
+
+def test_execute_api_rejects_unapproved_workflow_without_disk_change(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_root = tmp_path / "unapproved-execute-api-workspace"
+    workspace_id, file_id = _seed_workspace(session_factory, workspace_root)
+    source_path = workspace_root / "inbox" / "quarterly-report.txt"
+    source_content = source_path.read_bytes()
+
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+
+    response = client.post(
+        f"/api/v1/workflows/{created['workflow_id']}/execute"
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "organization_workflow_not_ready",
+            "message": "工作流尚未获得批准，不能执行文件操作。",
+        }
+    }
+    assert source_path.read_bytes() == source_content
+
+
+def test_minimal_ui_wires_execution_and_undo_path() -> None:
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    assert 'id="execute-plan"' in html
+    assert 'id="undo-plan"' in html
+    assert "/execute`" in html
+    assert "/undo`" in html
+    assert 'executePlanButton.addEventListener("click"' in html
+    assert 'undoPlanButton.addEventListener("click"' in html
+    assert "showExecutionAction();" in html
+    assert "showUndoAction();" in html

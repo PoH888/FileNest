@@ -121,6 +121,8 @@
         <div id="plan-actions" hidden>
           <button id="approve-plan" type="button">批准计划</button>
           <button id="reject-plan" type="button">拒绝计划</button>
+          <button id="execute-plan" type="button" hidden disabled>执行计划</button>
+          <button id="undo-plan" type="button" hidden disabled>撤销执行</button>
         </div>
       </section>
     </section>
@@ -146,6 +148,8 @@
     const planActions = document.querySelector("#plan-actions");
     const approvePlanButton = document.querySelector("#approve-plan");
     const rejectPlanButton = document.querySelector("#reject-plan");
+    const executePlanButton = document.querySelector("#execute-plan");
+    const undoPlanButton = document.querySelector("#undo-plan");
     let currentSources = [];
     let currentWorkflow = null;
     let activeRunEventSource = null;
@@ -393,12 +397,60 @@
       resultSources.hidden = false;
     }
 
+    function resetPlanActions() {
+      planActions.hidden = true;
+      approvePlanButton.hidden = false;
+      approvePlanButton.disabled = false;
+      rejectPlanButton.hidden = false;
+      rejectPlanButton.disabled = false;
+      executePlanButton.hidden = true;
+      executePlanButton.disabled = true;
+      undoPlanButton.hidden = true;
+      undoPlanButton.disabled = true;
+    }
+
+    function showApprovalActions() {
+      planActions.hidden = false;
+      approvePlanButton.hidden = false;
+      approvePlanButton.disabled = false;
+      rejectPlanButton.hidden = false;
+      rejectPlanButton.disabled = false;
+      executePlanButton.hidden = true;
+      executePlanButton.disabled = true;
+      undoPlanButton.hidden = true;
+      undoPlanButton.disabled = true;
+    }
+
+    function showExecutionAction() {
+      planActions.hidden = false;
+      approvePlanButton.hidden = true;
+      approvePlanButton.disabled = true;
+      rejectPlanButton.hidden = true;
+      rejectPlanButton.disabled = true;
+      executePlanButton.hidden = false;
+      executePlanButton.disabled = false;
+      undoPlanButton.hidden = true;
+      undoPlanButton.disabled = true;
+    }
+
+    function showUndoAction() {
+      planActions.hidden = false;
+      approvePlanButton.hidden = true;
+      approvePlanButton.disabled = true;
+      rejectPlanButton.hidden = true;
+      rejectPlanButton.disabled = true;
+      executePlanButton.hidden = true;
+      executePlanButton.disabled = true;
+      undoPlanButton.hidden = false;
+      undoPlanButton.disabled = false;
+    }
+
     function showPlanPreview(sources) {
       planTargets.replaceChildren();
       planList.replaceChildren();
       planStatus.textContent = "";
       planPanel.hidden = true;
-      planActions.hidden = true;
+      resetPlanActions();
       currentWorkflow = null;
       if (!Array.isArray(sources) || sources.length === 0) {
         return;
@@ -442,9 +494,7 @@
       currentWorkflow = {workflowId, planId};
       planStatus.textContent =
         `计划 ${planId} 已生成，当前等待审批。`;
-      planActions.hidden = false;
-      approvePlanButton.disabled = false;
-      rejectPlanButton.disabled = false;
+      showApprovalActions();
       for (const operation of operations) {
         const item = document.createElement("li");
         item.textContent = `${String(operation.source_relative_path)} → ${String(operation.target_relative_path)}`;
@@ -613,19 +663,97 @@
 
         if (payload.approval_status === "APPROVED") {
           planStatus.textContent = "计划已批准，尚未执行文件操作。";
+          currentWorkflow = {
+            workflowId: String(payload.workflow_id),
+            planId: String(payload.operation_plan.plan_id),
+          };
+          showExecutionAction();
         } else if (payload.approval_status === "REJECTED") {
           planStatus.textContent = "计划已拒绝。";
+          currentWorkflow = null;
+          resetPlanActions();
         } else {
           planStatus.textContent = "审批状态已更新。";
         }
-        currentWorkflow = null;
-        planActions.hidden = true;
       } catch {
         planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
       } finally {
-        if (currentWorkflow) {
+        if (currentWorkflow && !approvePlanButton.hidden) {
           approvePlanButton.disabled = false;
           rejectPlanButton.disabled = false;
+        }
+      }
+    }
+
+    async function executeCurrentPlan() {
+      if (!currentWorkflow) {
+        return;
+      }
+
+      executePlanButton.disabled = true;
+      planStatus.textContent = "文件执行中…";
+      try {
+        const response = await fetch(
+          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/execute`,
+          {method: "POST"},
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          planStatus.textContent = safeErrorMessage(
+            payload,
+            "文件执行失败，请检查当前文件状态。",
+          );
+          return;
+        }
+
+        if (payload.status === "COMPLETED") {
+          planStatus.textContent = "计划已执行，文件已移动，可以撤销。";
+          showUndoAction();
+        } else {
+          planStatus.textContent = `执行结果：${String(payload.status)}。`;
+        }
+      } catch {
+        planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        if (currentWorkflow && !executePlanButton.hidden) {
+          executePlanButton.disabled = false;
+        }
+      }
+    }
+
+    async function undoCurrentPlan() {
+      if (!currentWorkflow) {
+        return;
+      }
+
+      undoPlanButton.disabled = true;
+      planStatus.textContent = "撤销执行中…";
+      try {
+        const response = await fetch(
+          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/undo`,
+          {method: "POST"},
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          planStatus.textContent = safeErrorMessage(
+            payload,
+            "撤销失败，请检查当前文件状态。",
+          );
+          return;
+        }
+
+        if (payload.status === "UNDONE") {
+          planStatus.textContent = "执行已撤销，文件已恢复原位置。";
+          currentWorkflow = null;
+          resetPlanActions();
+        } else {
+          planStatus.textContent = `撤销结果：${String(payload.status)}。`;
+        }
+      } catch {
+        planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        if (currentWorkflow && !undoPlanButton.hidden) {
+          undoPlanButton.disabled = false;
         }
       }
     }
@@ -636,6 +764,14 @@
 
     rejectPlanButton.addEventListener("click", () => {
       submitPlanDecision("reject");
+    });
+
+    executePlanButton.addEventListener("click", () => {
+      executeCurrentPlan();
+    });
+
+    undoPlanButton.addEventListener("click", () => {
+      undoCurrentPlan();
     });
 
     loadWorkspaces();
