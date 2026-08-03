@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 # Mapped 用来标记：这个类属性不是普通属性，而是需要映射到数据库字段的 ORM 属性。
 
 from .database import Base
+from .document_contracts import Chunk, Document
 
 class Workspace(Base): # 继承 FileNest 的 ORM 基类
     """告诉 SQLAlchemy：
@@ -57,6 +59,136 @@ class FileEntry(Base):
     extension: Mapped[str] = mapped_column(String, nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     mtime_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class DocumentRecord(Base):
+    """规范化文档的文件追踪、版本和更新时间持久化记录。"""
+
+    __tablename__ = "documents"
+    __table_args__ = (
+        CheckConstraint(
+            "source_format IN ('markdown', 'text')",
+            name="ck_documents_source_format",
+        ),
+        UniqueConstraint(
+            "file_entry_id",
+            "source_version",
+            name="uq_documents_file_entry_source_version",
+        ),
+    )
+
+    document_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=False,
+        index=True,
+    )
+    file_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("file_entries.id"),
+        nullable=False,
+        index=True,
+    )
+    source_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    source_format: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+    normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    source_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    @classmethod
+    def from_contract(cls, document: Document) -> "DocumentRecord":
+        """将已验证的 Document 转换为待提交的 ORM 记录。"""
+
+        return cls(
+            document_id=str(document.document_id),
+            workspace_id=document.workspace_id,
+            file_entry_id=document.file_entry_id,
+            source_relative_path=document.source_relative_path,
+            source_format=document.source_format,
+            normalized_text=document.normalized_text,
+            source_version=document.source_version,
+            source_updated_at=document.source_updated_at,
+        )
+
+
+class ChunkRecord(Base):
+    """文档片段的来源位置与顺序持久化记录。"""
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "chunk_index >= 0",
+            name="ck_document_chunks_index_non_negative",
+        ),
+        CheckConstraint(
+            "start_offset >= 0 AND end_offset > start_offset",
+            name="ck_document_chunks_offset_order",
+        ),
+        CheckConstraint(
+            "start_line >= 1 AND end_line >= start_line",
+            name="ck_document_chunks_line_order",
+        ),
+        UniqueConstraint(
+            "document_id",
+            "chunk_index",
+            name="uq_document_chunks_document_index",
+        ),
+        UniqueConstraint(
+            "chunk_id",
+            name="uq_document_chunks_chunk_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.document_id"),
+        nullable=False,
+        index=True,
+    )
+    file_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("file_entries.id"),
+        nullable=False,
+        index=True,
+    )
+    source_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    start_offset: Mapped[int] = mapped_column(nullable=False)
+    end_offset: Mapped[int] = mapped_column(nullable=False)
+    start_line: Mapped[int] = mapped_column(nullable=False)
+    end_line: Mapped[int] = mapped_column(nullable=False)
+
+    @classmethod
+    def from_contract(cls, chunk: Chunk) -> "ChunkRecord":
+        """将已验证的 Chunk 转换为待提交的 ORM 记录。"""
+
+        return cls(
+            chunk_id=str(chunk.chunk_id),
+            document_id=str(chunk.document_id),
+            file_entry_id=chunk.file_entry_id,
+            source_relative_path=chunk.source_relative_path,
+            chunk_index=chunk.chunk_index,
+            text=chunk.text,
+            start_offset=chunk.start_offset,
+            end_offset=chunk.end_offset,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+        )
 
 
 class AgentRun(Base):
