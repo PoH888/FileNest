@@ -1,0 +1,123 @@
+{
+  "schema_version": "1.0",
+  "dataset": "keyword_retrieval_baseline_v1",
+  "method": {
+    "matcher": "casefold_substring",
+    "score": "non_overlapping_occurrence_count",
+    "tie_break": "fixed_document_order"
+  },
+  "samples": [
+    {
+      "sample_id": "hit-approval-file",
+      "question_id": "approval-before-move",
+      "keyword": "文件",
+      "expected_related_document_paths": ["guides/approval-flow.md"],
+      "outcome": "hit",
+      "observed_results": [
+        {
+          "relative_path": "guides/approval-flow.md",
+          "score": 2,
+          "sources": [
+            {
+              "source_relative_path": "guides/approval-flow.md",
+              "matched_text": "文件",
+              "start_offset": 0,
+              "end_offset": 2,
+              "start_line": 1,
+              "end_line": 1
+            },
+            {
+              "source_relative_path": "guides/approval-flow.md",
+              "matched_text": "文件",
+              "start_offset": 29,
+              "end_offset": 31,
+              "start_line": 1,
+              "end_line": 1
+            }
+          ]
+        },
+        {
+          "relative_path": "guides/persistence.md",
+          "score": 1,
+          "sources": [
+            {
+              "source_relative_path": "guides/persistence.md",
+              "matched_text": "文件",
+              "start_offset": 4,
+              "end_offset": 6,
+              "start_line": 1,
+              "end_line": 1
+            }
+          ]
+        },
+        {
+          "relative_path": "archive/legacy-plan.md",
+          "score": 1,
+          "sources": [
+            {
+              "source_relative_path": "archive/legacy-plan.md",
+              "matched_text": "文件",
+              "start_offset": 6,
+              "end_offset": 8,
+              "start_line": 1,
+              "end_line": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sample_id": "hit-sqlite",
+      "question_id": "sqlite-persistence",
+      "keyword": "sqlite",
+      "expected_related_document_paths": ["guides/persistence.md"],
+      "outcome": "hit",
+      "observed_results": [
+        {
+          "relative_path": "guides/persistence.md",
+          "score": 1,
+          "sources": [
+            {
+              "source_relative_path": "guides/persistence.md",
+              "matched_text": "SQLite",
+              "start_offset": 13,
+              "end_offset": 19,
+              "start_line": 1,
+              "end_line": 1
+            }
+          ]
+        },
+        {
+          "relative_path": "archive/legacy-plan.md",
+          "score": 1,
+          "sources": [
+            {
+              "source_relative_path": "archive/legacy-plan.md",
+              "matched_text": "SQLite",
+              "start_offset": 17,
+              "end_offset": 23,
+              "start_line": 1,
+              "end_line": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sample_id": "miss-vector-database",
+      "question_id": "no-vector-database",
+      "keyword": "向量数据库",
+      "expected_related_document_paths": [],
+      "outcome": "no_match",
+      "observed_results": []
+    },
+    {
+      "sample_id": "invalid-blank-keyword",
+      "question_id": null,
+      "keyword": "   ",
+      "expected_related_document_paths": [],
+      "outcome": "invalid_query",
+      "error": "keyword must not be blank"
+    }
+  ]
+}

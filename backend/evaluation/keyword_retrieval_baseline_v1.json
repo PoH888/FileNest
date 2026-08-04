@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "name": "FileNest 关键词检索固定基线",
+  "documents": [
+    {
+      "relative_path": "guides/approval-flow.md",
+      "content": "文件整理流程：先生成预览，再等待用户审批；批准后才允许移动文件。\n"
+    },
+    {
+      "relative_path": "guides/persistence.md",
+      "content": "工作区和文件索引默认使用 SQLite 持久化保存。\n"
+    },
+    {
+      "relative_path": "notes/document-tracking.md",
+      "content": "Markdown 和 TXT 文档会被规范化，并切分为可追踪片段。\n"
+    },
+    {
+      "relative_path": "notes/retrieval-baseline.txt",
+      "content": "关键词检索基线使用固定问题、固定文档集合和可复现结果。\n"
+    },
+    {
+      "relative_path": "archive/legacy-plan.md",
+      "content": "旧计划只记录文件扫描，不涉及当前 SQLite 持久化或用户审批。\n"
+    }
+  ],
+  "questions": [
+    {
+      "question_id": "approval-before-move",
+      "question": "文件移动前需要经过什么流程？",
+      "related_document_paths": ["guides/approval-flow.md"]
+    },
+    {
+      "question_id": "sqlite-persistence",
+      "question": "工作区和文件索引使用什么持久化方式？",
+      "related_document_paths": ["guides/persistence.md"]
+    },
+    {
+      "question_id": "document-formats",
+      "question": "哪些格式的文档会被规范化？",
+      "related_document_paths": ["notes/document-tracking.md"]
+    },
+    {
+      "question_id": "retrieval-baseline",
+      "question": "关键词检索基线由什么组成？",
+      "related_document_paths": ["notes/retrieval-baseline.txt"]
+    },
+    {
+      "question_id": "no-vector-database",
+      "question": "当前文档集合是否包含向量数据库？",
+      "related_document_paths": []
+    }
+  ]
+}
