@@ -13,6 +13,7 @@ from backend.app.document_chunker import chunk_document
 from backend.app.document_contracts import Document
 from backend.app.models import (
     ChunkRecord,
+    ChunkEmbeddingRecord,
     DocumentRecord,
     FileEntry,
     Workspace,
@@ -121,6 +122,79 @@ def test_document_and_chunks_persist_traceability_metadata(
                 and chunk.source_relative_path == "notes/project.md"
                 for chunk in restored_chunks
             )
+    finally:
+        engine.dispose()
+
+
+def test_chunk_embedding_persists_vector_and_rejects_duplicate_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _upgrade_database(tmp_path, monkeypatch)
+    try:
+        with Session(engine) as session:
+            workspace = Workspace(
+                name="片段向量持久化测试",
+                root_path=str(tmp_path / "workspace"),
+            )
+            session.add(workspace)
+            session.flush()
+
+            file_entry = FileEntry(
+                workspace_id=workspace.id,
+                relative_path="notes/project.md",
+                name="project.md",
+                extension=".md",
+                size_bytes=12,
+                mtime_ns=1_800_000_000_000_000_000,
+            )
+            session.add(file_entry)
+            session.flush()
+
+            document = Document(
+                document_id=DOCUMENT_ID,
+                workspace_id=workspace.id,
+                file_entry_id=file_entry.id,
+                source_relative_path=file_entry.relative_path,
+                source_format="markdown",
+                normalized_text="one\ntwo\nthree",
+                source_version="e" * 64,
+                source_updated_at=SOURCE_UPDATED_AT,
+            )
+            chunk = chunk_document(document, max_chars=8)[0]
+            session.add(DocumentRecord.from_contract(document))
+            session.add(ChunkRecord.from_contract(chunk))
+            session.flush()
+
+            embedding = ChunkEmbeddingRecord.from_vector(
+                chunk_id=str(chunk.chunk_id),
+                embedding_model="fake-v1",
+                vector=(0.25, 0.75),
+            )
+            session.add(embedding)
+            session.commit()
+            embedding_id = embedding.id
+
+        with Session(engine) as session:
+            restored = session.get(ChunkEmbeddingRecord, embedding_id)
+
+            assert restored is not None
+            assert restored.chunk_id == str(chunk.chunk_id)
+            assert restored.embedding_model == "fake-v1"
+            assert restored.dimension == 2
+            assert restored.vector_json == "[0.25,0.75]"
+            assert restored.vector == (0.25, 0.75)
+
+            session.add(
+                ChunkEmbeddingRecord.from_vector(
+                    chunk_id=str(chunk.chunk_id),
+                    embedding_model="fake-v1",
+                    vector=(0.25, 0.75),
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
     finally:
         engine.dispose()
 

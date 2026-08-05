@@ -73,6 +73,7 @@ def test_recorded_baseline_samples_match_current_search_results() -> None:
     assert report["dataset"] == "keyword_retrieval_baseline_v1"
     assert [sample["sample_id"] for sample in report["samples"]] == [
         "hit-approval-file",
+        "miss-approval-consent",
         "hit-sqlite",
         "miss-vector-database",
         "invalid-blank-keyword",

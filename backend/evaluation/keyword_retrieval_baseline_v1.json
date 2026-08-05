@@ -26,7 +26,7 @@
   "questions": [
     {
       "question_id": "approval-before-move",
-      "question": "文件移动前需要经过什么流程？",
+      "question": "文件整理前是否必须征得用户同意？",
       "related_document_paths": ["guides/approval-flow.md"]
     },
     {

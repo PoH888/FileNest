@@ -67,6 +67,14 @@
       ]
     },
     {
+      "sample_id": "miss-approval-consent",
+      "question_id": "approval-before-move",
+      "keyword": "用户同意",
+      "expected_related_document_paths": ["guides/approval-flow.md"],
+      "outcome": "no_match",
+      "observed_results": []
+    },
+    {
       "sample_id": "hit-sqlite",
       "question_id": "sqlite-persistence",
       "keyword": "sqlite",

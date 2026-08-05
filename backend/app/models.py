@@ -1,3 +1,5 @@
+import json
+from collections.abc import Sequence
 from datetime import datetime
 
 from sqlalchemy import (
@@ -16,6 +18,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
 from .document_contracts import Chunk, Document
+from .embedding_client import (
+    EmbeddingVector,
+    InvalidEmbeddingVectorError,
+    validate_embedding_vector,
+)
 
 class Workspace(Base): # 继承 FileNest 的 ORM 基类
     """告诉 SQLAlchemy：
@@ -189,6 +196,104 @@ class ChunkRecord(Base):
             start_line=chunk.start_line,
             end_line=chunk.end_line,
         )
+
+
+class ChunkEmbeddingRecord(Base):
+    """一个文档片段在指定 Embedding 模型下的最小持久化向量记录。"""
+
+    __tablename__ = "chunk_embeddings"
+    __table_args__ = (
+        CheckConstraint(
+            "dimension > 0",
+            name="ck_chunk_embeddings_dimension_positive",
+        ),
+        CheckConstraint(
+            "length(embedding_model) > 0",
+            name="ck_chunk_embeddings_model_non_empty",
+        ),
+        CheckConstraint(
+            "length(vector_json) > 0",
+            name="ck_chunk_embeddings_vector_non_empty",
+        ),
+        UniqueConstraint(
+            "chunk_id",
+            "embedding_model",
+            name="uq_chunk_embeddings_chunk_model",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("document_chunks.chunk_id"),
+        nullable=False,
+        index=True,
+    )
+    embedding_model: Mapped[str] = mapped_column(
+        String(200),
+        nullable=False,
+    )
+    dimension: Mapped[int] = mapped_column(nullable=False)
+    vector_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    @classmethod
+    def from_vector(
+        cls,
+        *,
+        chunk_id: str,
+        embedding_model: str,
+        vector: Sequence[float],
+    ) -> "ChunkEmbeddingRecord":
+        """从已验证向量创建可持久化记录，不改变原始片段记录。"""
+
+        if (
+            not isinstance(chunk_id, str)
+            or not chunk_id
+            or chunk_id != chunk_id.strip()
+        ):
+            raise ValueError("chunk_id must be non-empty without surrounding whitespace")
+        if (
+            not isinstance(embedding_model, str)
+            or not embedding_model
+            or embedding_model != embedding_model.strip()
+        ):
+            raise ValueError(
+                "embedding_model must be non-empty without surrounding whitespace"
+            )
+        if len(embedding_model) > 200:
+            raise ValueError("embedding_model must be at most 200 characters")
+
+        validated_vector = validate_embedding_vector(vector)
+        return cls(
+            chunk_id=chunk_id,
+            embedding_model=embedding_model,
+            dimension=len(validated_vector),
+            vector_json=json.dumps(
+                validated_vector,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    @property
+    def vector(self) -> EmbeddingVector:
+        """读取并重新校验持久化向量，损坏时明确失败。"""
+
+        try:
+            raw_vector = json.loads(self.vector_json)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise InvalidEmbeddingVectorError(
+                "持久化向量 JSON 无效"
+            ) from error
+
+        if not isinstance(raw_vector, list):
+            raise InvalidEmbeddingVectorError("持久化向量必须是数组")
+
+        vector = validate_embedding_vector(raw_vector)
+        if len(vector) != self.dimension:
+            raise InvalidEmbeddingVectorError(
+                "持久化向量维度与记录不一致"
+            )
+        return vector
 
 
 class AgentRun(Base):

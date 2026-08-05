@@ -1,0 +1,164 @@
+{
+  "schema_version": "1.0",
+  "dataset": "keyword_retrieval_baseline_v1",
+  "evaluation_scope": {
+    "embedding_source": "scripted_fake",
+    "embedding_design": "one_hot_document_vectors",
+    "ranking_depth": 5,
+    "top_k": [1, 3],
+    "limitations": [
+      "离线固定向量只验证评测管线和排序组合，不代表真实 Embedding 模型能力。",
+      "仅覆盖 3 个固定问题，不替代规模测试或生产 benchmark。"
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "approval-consent",
+      "question_id": "approval-before-move",
+      "query": "用户同意",
+      "relevant_document_paths": [
+        "guides/approval-flow.md"
+      ],
+      "rankings": {
+        "keyword": [],
+        "vector": [
+          "guides/approval-flow.md",
+          "archive/legacy-plan.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ],
+        "hybrid": [
+          "guides/approval-flow.md",
+          "archive/legacy-plan.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ]
+      }
+    },
+    {
+      "case_id": "sqlite-persistence",
+      "question_id": "sqlite-persistence",
+      "query": "sqlite",
+      "relevant_document_paths": [
+        "guides/persistence.md"
+      ],
+      "rankings": {
+        "keyword": [
+          "guides/persistence.md",
+          "archive/legacy-plan.md"
+        ],
+        "vector": [
+          "guides/persistence.md",
+          "archive/legacy-plan.md",
+          "guides/approval-flow.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ],
+        "hybrid": [
+          "guides/persistence.md",
+          "archive/legacy-plan.md",
+          "guides/approval-flow.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ]
+      }
+    },
+    {
+      "case_id": "approval-file",
+      "question_id": "approval-before-move",
+      "query": "文件",
+      "relevant_document_paths": [
+        "guides/approval-flow.md"
+      ],
+      "rankings": {
+        "keyword": [
+          "guides/approval-flow.md",
+          "guides/persistence.md",
+          "archive/legacy-plan.md"
+        ],
+        "vector": [
+          "guides/approval-flow.md",
+          "archive/legacy-plan.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ],
+        "hybrid": [
+          "guides/approval-flow.md",
+          "archive/legacy-plan.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "notes/retrieval-baseline.txt"
+        ]
+      }
+    }
+  ],
+  "metrics": {
+    "keyword": {
+      "case_count": 3,
+      "recall_at_k": [
+        {
+          "k": 1,
+          "value": 0.6666666666666666
+        },
+        {
+          "k": 3,
+          "value": 0.6666666666666666
+        }
+      ],
+      "mrr": 0.6666666666666666
+    },
+    "vector": {
+      "case_count": 3,
+      "recall_at_k": [
+        {
+          "k": 1,
+          "value": 1.0
+        },
+        {
+          "k": 3,
+          "value": 1.0
+        }
+      ],
+      "mrr": 1.0
+    },
+    "hybrid": {
+      "case_count": 3,
+      "recall_at_k": [
+        {
+          "k": 1,
+          "value": 1.0
+        },
+        {
+          "k": 3,
+          "value": 1.0
+        }
+      ],
+      "mrr": 1.0
+    }
+  },
+  "decision": {
+    "status": "retain_minimal_experiment",
+    "default_retrieval": "keyword",
+    "retained": [
+      "replaceable_embedding_client",
+      "sqlite_chunk_embedding_storage",
+      "vector_search_as_experimental_path",
+      "hybrid_search_as_comparison_only"
+    ],
+    "not_adopted": [
+      "external_vector_database",
+      "hybrid_search_as_default",
+      "production_quality_claim"
+    ],
+    "evidence": {
+      "keyword_gap_confirmed": true,
+      "offline_vector_gain_observed": true,
+      "hybrid_gain_over_vector_observed": false,
+      "real_embedding_quality_established": false
+    },
+    "next_evidence_gate": "evaluate_a_real_embedding_client_on_the_same_fixed_cases_before_runtime_integration"
+  }
+}
