@@ -58,3 +58,7 @@ PHASE1_HANDOFF.md
 lessons/
 docs/
 backend/backups/
+<<<<<<< Updated upstream
+=======
+backend/workflow-checkpoints.sqlite
+>>>>>>> Stashed changes
