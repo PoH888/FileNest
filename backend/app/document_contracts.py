@@ -32,8 +32,58 @@ def _validate_source_relative_path(value: str) -> str:
     return value
 
 
+class DocumentPage(BaseModel):
+    """一页来源文本在规范化文档中的可追踪区间。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_number: int = Field(ge=1)
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_page_position(self) -> "DocumentPage":
+        if self.end_offset < self.start_offset:
+            raise ValueError("end_offset must not be earlier than start_offset")
+        return self
+
+
+class DocumentPosition(BaseModel):
+    """DOCX 段落或表格单元格在规范化文档中的可追踪位置。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    element_type: Literal["paragraph", "table_cell"]
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(ge=0)
+    paragraph_index: int | None = Field(default=None, ge=0)
+    table_index: int | None = Field(default=None, ge=0)
+    row_index: int | None = Field(default=None, ge=0)
+    cell_index: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_position(self) -> "DocumentPosition":
+        if self.end_offset < self.start_offset:
+            raise ValueError("end_offset must not be earlier than start_offset")
+
+        if self.element_type == "paragraph":
+            if self.paragraph_index is None or any(
+                value is not None
+                for value in (self.table_index, self.row_index, self.cell_index)
+            ):
+                raise ValueError("paragraph position metadata is inconsistent")
+        elif (
+            self.paragraph_index is not None
+            or self.table_index is None
+            or self.row_index is None
+            or self.cell_index is None
+        ):
+            raise ValueError("table cell position metadata is inconsistent")
+        return self
+
+
 class Document(BaseModel):
-    """一个 Markdown/TXT 文件规范化后的不可变文档。"""
+    """一个来源文件规范化后的不可变文档。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -42,8 +92,10 @@ class Document(BaseModel):
     workspace_id: int = Field(ge=1)
     file_entry_id: int = Field(ge=1)
     source_relative_path: str
-    source_format: Literal["markdown", "text"]
+    source_format: Literal["markdown", "text", "pdf", "docx"]
     normalized_text: str
+    pages: tuple[DocumentPage, ...] = Field(default_factory=tuple)
+    source_positions: tuple[DocumentPosition, ...] = Field(default_factory=tuple)
     source_version: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_updated_at: AwareDatetime
 
@@ -51,6 +103,49 @@ class Document(BaseModel):
     @classmethod
     def validate_source_relative_path(cls, value: str) -> str:
         return _validate_source_relative_path(value)
+
+    @model_validator(mode="after")
+    def validate_page_metadata(self) -> "Document":
+        if self.source_format == "pdf":
+            if self.source_positions:
+                raise ValueError("source_positions are not used for PDF documents")
+        elif self.source_format == "docx":
+            if self.pages:
+                raise ValueError("pages are not used for DOCX documents")
+        elif self.pages or self.source_positions:
+            raise ValueError(
+                "page and source position metadata require PDF or DOCX documents"
+            )
+        if self.source_format != "pdf":
+            return self
+
+        if not self.pages:
+            raise ValueError("PDF documents must preserve at least one page")
+
+        previous_page_number = 0
+        previous_end_offset = 0
+        for page in self.pages:
+            if page.page_number != previous_page_number + 1:
+                raise ValueError("PDF page numbers must be consecutive from 1")
+            if page.start_offset < previous_end_offset:
+                raise ValueError("PDF page offsets must not overlap")
+            if page.end_offset > len(self.normalized_text):
+                raise ValueError("PDF page offsets must fit normalized_text")
+            previous_page_number = page.page_number
+            previous_end_offset = page.end_offset
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_source_positions(self) -> "Document":
+        previous_end_offset = 0
+        for position in self.source_positions:
+            if position.start_offset < previous_end_offset:
+                raise ValueError("source position offsets must not overlap")
+            if position.end_offset > len(self.normalized_text):
+                raise ValueError("source position offsets must fit normalized_text")
+            previous_end_offset = position.end_offset
+        return self
 
 
 class Chunk(BaseModel):
