@@ -1,6 +1,7 @@
 """FileNest Agent 可调用的只读业务工具。"""
 
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import cast
 
 from pydantic import (
@@ -10,14 +11,16 @@ from pydantic import (
     Field,
     field_validator,
 )
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import FileEntry
+from .models import ChunkRecord, DocumentRecord, FileEntry
 from .path_policy import PathPolicyError
 from .services import (
     FileEntryNotFoundError,
     WorkspaceNotFoundError,
     get_authorized_file_metadata as get_file_metadata_service,
+    get_workspace as get_workspace_service,
     list_workspaces as list_workspaces_service,
     search_files as search_files_service,
 )
@@ -127,6 +130,57 @@ class SearchFilesData(BaseModel):
     has_more: bool
 
 
+class KnowledgeSearchArguments(BaseModel):
+    """知识搜索工具允许模型提供的受限参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: int = Field(ge=1)
+    query: str = Field(min_length=1, max_length=200)
+    top_k: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        """拒绝空查询并固定查询文本，避免无边界返回文档片段。"""
+
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("query must not be blank")
+        return normalized
+
+
+class KnowledgeSearchToolItem(BaseModel):
+    """知识搜索返回的原始片段及其文件出处。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_id: int = Field(ge=1)
+    name: str = Field(min_length=1)
+    chunk_id: str = Field(min_length=1)
+    document_id: str = Field(min_length=1)
+    source_relative_path: str = Field(min_length=1)
+    chunk_index: int = Field(ge=0)
+    text: str = Field(min_length=1)
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(gt=0)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    score: int = Field(ge=1)
+
+
+class KnowledgeSearchData(BaseModel):
+    """知识搜索的有上限结果集合。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    items: list[KnowledgeSearchToolItem]
+    total: int = Field(ge=0)
+    top_k: int = Field(ge=1, le=10)
+    has_more: bool
+
+
 class GetFileMetadataArguments(BaseModel):
     """读取单个文件元数据工具允许模型提供的标识。"""
 
@@ -205,6 +259,105 @@ def build_search_files_tool(session: Session) -> Tool:
             "每次最多返回 20 条。"
         ),
         arguments_model=SearchFilesArguments,
+        handler=handle,
+    )
+
+
+def build_knowledge_search_tool(session: Session) -> Tool:
+    """为当前数据库会话构建有上限的只读知识搜索工具。"""
+
+    def handle(arguments: BaseModel) -> ToolResult:
+        options = cast(KnowledgeSearchArguments, arguments)
+
+        with session.no_autoflush:
+            if get_workspace_service(session, options.workspace_id) is None:
+                return ToolResult.failure(
+                    code="workspace_not_found",
+                    message="工作区不存在",
+                    details={"workspace_id": options.workspace_id},
+                )
+
+            statement = (
+                select(ChunkRecord)
+                .join(
+                    FileEntry,
+                    FileEntry.id == ChunkRecord.file_entry_id,
+                )
+                .join(
+                    DocumentRecord,
+                    DocumentRecord.document_id == ChunkRecord.document_id,
+                )
+                .where(
+                    FileEntry.workspace_id == options.workspace_id,
+                    DocumentRecord.workspace_id == options.workspace_id,
+                    DocumentRecord.file_entry_id == FileEntry.id,
+                    DocumentRecord.source_relative_path
+                    == FileEntry.relative_path,
+                    ChunkRecord.source_relative_path
+                    == FileEntry.relative_path,
+                    ChunkRecord.text.icontains(
+                        options.query,
+                        autoescape=True,
+                    ),
+                )
+                .order_by(
+                    ChunkRecord.source_relative_path.asc(),
+                    ChunkRecord.chunk_index.asc(),
+                    ChunkRecord.chunk_id.asc(),
+                )
+            )
+            chunks = list(session.scalars(statement).all())
+
+        normalized_query = options.query.casefold()
+        ranked_chunks: list[tuple[int, str, int, str, ChunkRecord]] = []
+        for chunk in chunks:
+            score = chunk.text.casefold().count(normalized_query)
+            if score > 0:
+                ranked_chunks.append(
+                    (
+                        -score,
+                        chunk.source_relative_path,
+                        chunk.chunk_index,
+                        chunk.chunk_id,
+                        chunk,
+                    )
+                )
+
+        ranked_chunks.sort(key=lambda item: item[:4])
+        data = KnowledgeSearchData(
+            query=options.query,
+            items=[
+                KnowledgeSearchToolItem(
+                    file_id=chunk.file_entry_id,
+                    name=PurePosixPath(chunk.source_relative_path).name,
+                    chunk_id=chunk.chunk_id,
+                    document_id=chunk.document_id,
+                    source_relative_path=chunk.source_relative_path,
+                    chunk_index=chunk.chunk_index,
+                    text=chunk.text,
+                    start_offset=chunk.start_offset,
+                    end_offset=chunk.end_offset,
+                    start_line=chunk.start_line,
+                    end_line=chunk.end_line,
+                    score=-negative_score,
+                )
+                for negative_score, _, _, _, chunk in ranked_chunks[
+                    : options.top_k
+                ]
+            ],
+            total=len(ranked_chunks),
+            top_k=options.top_k,
+            has_more=len(ranked_chunks) > options.top_k,
+        )
+        return ToolResult.success(data.model_dump(mode="json"))
+
+    return Tool(
+        name="knowledge_search",
+        description=(
+            "在指定 FileNest 工作区的已索引文档片段中执行只读关键词检索；"
+            "最多返回 10 个片段，并保留文件名、行号和字符偏移出处。"
+        ),
+        arguments_model=KnowledgeSearchArguments,
         handler=handle,
     )
 

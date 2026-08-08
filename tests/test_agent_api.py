@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,10 +17,19 @@ from backend.app.agent_api import (
 )
 from backend.app.agent_observability import SqlAlchemyAgentRunRecorder
 from backend.app.database import Base, get_session
+from backend.app.document_chunker import chunk_document
+from backend.app.document_contracts import Document
 from backend.app.fake_model_client import FakeModelClient
 from backend.app.main import app
 from backend.app.model_client import ModelMessage, ModelResponse, ModelToolCall
-from backend.app.models import AgentRun, AgentToolCall, FileEntry, Workspace
+from backend.app.models import (
+    AgentRun,
+    AgentToolCall,
+    ChunkRecord,
+    DocumentRecord,
+    FileEntry,
+    Workspace,
+)
 from backend.app.tool_contracts import ToolResult
 
 
@@ -66,6 +76,32 @@ def _seed_workspace(
         session.add(file_entry)
         session.commit()
         return workspace.id, file_entry.id
+
+
+def _seed_knowledge_document(
+    session_factory: sessionmaker[Session],
+    *,
+    workspace_id: int,
+    file_id: int,
+) -> None:
+    text = "第一行：审批流程\n第二行：批准后才能移动文件。"
+    with session_factory() as session:
+        document = Document(
+            document_id=uuid4(),
+            workspace_id=workspace_id,
+            file_entry_id=file_id,
+            source_relative_path="reports/quarterly.txt",
+            source_format="text",
+            normalized_text=text,
+            source_version="a" * 64,
+            source_updated_at="2026-09-01T00:00:00+00:00",
+        )
+        session.add(DocumentRecord.from_contract(document))
+        session.add_all(
+            ChunkRecord.from_contract(chunk)
+            for chunk in chunk_document(document)
+        )
+        session.commit()
 
 
 def _tool_call_response(
@@ -138,6 +174,10 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
                 "file_id": 1,
                 "name": "quarterly.txt",
                 "relative_path": "reports/quarterly.txt",
+                "start_line": None,
+                "end_line": None,
+                "start_offset": None,
+                "end_offset": None,
             },
         ),
     }
@@ -146,6 +186,99 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
         persisted_run = session.get(AgentRun, 1)
         assert persisted_run is not None
         assert persisted_run.status == "completed"
+
+
+def test_agent_run_api_returns_knowledge_source_location(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        name="知识出处请求",
+    )
+    _seed_knowledge_document(
+        session_factory,
+        workspace_id=workspace_id,
+        file_id=file_id,
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_knowledge_search",
+                name="knowledge_search",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "query": "审批",
+                },
+            ),
+            _final_response("文档显示需要先完成审批。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "审批流程是什么？",
+        },
+    )
+
+    assert response.status_code == 200
+    result = AgentRunResponse.model_validate(response.json())
+    assert result.final_answer == "文档显示需要先完成审批。"
+    assert len(result.sources) == 1
+    source = result.sources[0]
+    assert source.workspace_id == workspace_id
+    assert source.file_id == file_id
+    assert source.name == "quarterly.txt"
+    assert source.relative_path == "reports/quarterly.txt"
+    assert (source.start_line, source.end_line) == (1, 2)
+    assert source.start_offset == 0
+    assert source.end_offset == len("第一行：审批流程\n第二行：批准后才能移动文件。")
+
+
+def test_agent_run_api_refuses_knowledge_answer_without_evidence(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="无知识证据请求",
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_empty_knowledge_search",
+                name="knowledge_search",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "query": "不存在的审批证据",
+                },
+            ),
+            _final_response("根据常识可以直接回答。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "这个问题应该怎么回答？",
+        },
+    )
+
+    assert response.status_code == 200
+    result = AgentRunResponse.model_validate(response.json())
+    assert result.status == "completed"
+    assert result.final_answer == "没有足够的文档证据，无法回答该问题。"
+    assert result.sources == ()
+    assert "根据常识可以直接回答。" not in response.text
 
 
 def test_agent_run_api_rejects_missing_workspace_before_model_call(
