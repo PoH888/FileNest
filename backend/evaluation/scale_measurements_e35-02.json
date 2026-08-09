@@ -1,0 +1,185 @@
+{
+  "measurements": [
+    {
+      "agent": {
+        "maximum_ms": 4.334,
+        "median_ms": 2.528,
+        "minimum_ms": 2.488,
+        "samples_ms": [
+          4.334,
+          2.528,
+          2.488
+        ]
+      },
+      "agent_model_turns": [
+        2,
+        2,
+        2
+      ],
+      "agent_statuses": [
+        "completed",
+        "completed",
+        "completed"
+      ],
+      "agent_tool_calls": [
+        1,
+        1,
+        1
+      ],
+      "document_file_count": 80,
+      "file_count": 100,
+      "fixture_bytes": 87040,
+      "fixture_content_sha256": "2b4c7e67dd5fec475b5f9e5d687beb4dabc72ac33485ae0b8226d191a7d894ef",
+      "repeats": 3,
+      "scale": "small",
+      "scan": {
+        "maximum_ms": 183.033,
+        "median_ms": 179.85,
+        "minimum_ms": 176.494,
+        "samples_ms": [
+          183.033,
+          179.85,
+          176.494
+        ]
+      },
+      "search": {
+        "maximum_ms": 2.774,
+        "median_ms": 2.498,
+        "minimum_ms": 2.297,
+        "samples_ms": [
+          2.774,
+          2.498,
+          2.297
+        ]
+      },
+      "search_keyword": "item-",
+      "search_total": 100,
+      "seed": 3501
+    },
+    {
+      "agent": {
+        "maximum_ms": 2.803,
+        "median_ms": 2.801,
+        "minimum_ms": 2.725,
+        "samples_ms": [
+          2.725,
+          2.801,
+          2.803
+        ]
+      },
+      "agent_model_turns": [
+        2,
+        2,
+        2
+      ],
+      "agent_statuses": [
+        "completed",
+        "completed",
+        "completed"
+      ],
+      "agent_tool_calls": [
+        1,
+        1,
+        1
+      ],
+      "document_file_count": 800,
+      "file_count": 1000,
+      "fixture_bytes": 870400,
+      "fixture_content_sha256": "15f01cd1c9979ad87e1516aeb9157d2667dc41a1bc17698bcacd23dc4adde5c6",
+      "repeats": 3,
+      "scale": "medium",
+      "scan": {
+        "maximum_ms": 1564.938,
+        "median_ms": 1551.43,
+        "minimum_ms": 1548.058,
+        "samples_ms": [
+          1564.938,
+          1548.058,
+          1551.43
+        ]
+      },
+      "search": {
+        "maximum_ms": 2.609,
+        "median_ms": 2.584,
+        "minimum_ms": 2.444,
+        "samples_ms": [
+          2.609,
+          2.584,
+          2.444
+        ]
+      },
+      "search_keyword": "item-",
+      "search_total": 1000,
+      "seed": 3501
+    },
+    {
+      "agent": {
+        "maximum_ms": 4.41,
+        "median_ms": 3.945,
+        "minimum_ms": 3.938,
+        "samples_ms": [
+          3.938,
+          4.41,
+          3.945
+        ]
+      },
+      "agent_model_turns": [
+        2,
+        2,
+        2
+      ],
+      "agent_statuses": [
+        "completed",
+        "completed",
+        "completed"
+      ],
+      "agent_tool_calls": [
+        1,
+        1,
+        1
+      ],
+      "document_file_count": 8000,
+      "file_count": 10000,
+      "fixture_bytes": 8704000,
+      "fixture_content_sha256": "d1b79d2897efd044a8bba25d5c4415086595344d9e409e27b8232207c8d7a5b6",
+      "repeats": 3,
+      "scale": "large",
+      "scan": {
+        "maximum_ms": 14762.789,
+        "median_ms": 14742.75,
+        "minimum_ms": 14644.923,
+        "samples_ms": [
+          14762.789,
+          14644.923,
+          14742.75
+        ]
+      },
+      "search": {
+        "maximum_ms": 4.159,
+        "median_ms": 3.951,
+        "minimum_ms": 3.883,
+        "samples_ms": [
+          3.883,
+          4.159,
+          3.951
+        ]
+      },
+      "search_keyword": "item-",
+      "search_total": 10000,
+      "seed": 3501
+    }
+  ],
+  "method": {
+    "agent": "AgentLoop with one search_files tool call and one final turn",
+    "agent_client": "FakeModelClient",
+    "database": "fresh temporary SQLite database per repeat",
+    "repeats": 3,
+    "scan": "scan_workspace including FileEntry persistence",
+    "search": "services.search_files with page_size=20",
+    "search_keyword": "item-",
+    "timing": "time.perf_counter wall-clock milliseconds",
+    "workspace_seed": 3501
+  },
+  "schema_version": "1.0",
+  "task": "E35-02"
+}

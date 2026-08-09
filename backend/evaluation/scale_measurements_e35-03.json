@@ -1,0 +1,138 @@
+{
+  "measurements": [
+    {
+      "database_bytes": {
+        "maximum": 417792,
+        "median": 417792,
+        "minimum": 417792,
+        "samples": [
+          417792,
+          417792,
+          417792
+        ]
+      },
+      "file_count": 100,
+      "fixture_bytes": 87040,
+      "fixture_content_sha256": "2b4c7e67dd5fec475b5f9e5d687beb4dabc72ac33485ae0b8226d191a7d894ef",
+      "index": {
+        "maximum_ms": 316.121,
+        "median_ms": 249.522,
+        "minimum_ms": 248.963,
+        "samples_ms": [
+          316.121,
+          248.963,
+          249.522
+        ]
+      },
+      "indexed_chunk_count": 160,
+      "indexed_document_count": 80,
+      "peak_python_allocations": {
+        "maximum": 3669933,
+        "median": 1759268,
+        "minimum": 1745476,
+        "samples": [
+          1759268,
+          1745476,
+          3669933
+        ]
+      },
+      "repeats": 3,
+      "scale": "small",
+      "seed": 3501,
+      "source_document_file_count": 80
+    },
+    {
+      "database_bytes": {
+        "maximum": 2859008,
+        "median": 2859008,
+        "minimum": 2859008,
+        "samples": [
+          2859008,
+          2859008,
+          2859008
+        ]
+      },
+      "file_count": 1000,
+      "fixture_bytes": 870400,
+      "fixture_content_sha256": "15f01cd1c9979ad87e1516aeb9157d2667dc41a1bc17698bcacd23dc4adde5c6",
+      "index": {
+        "maximum_ms": 10201.385,
+        "median_ms": 2461.45,
+        "minimum_ms": 2416.048,
+        "samples_ms": [
+          10201.385,
+          2416.048,
+          2461.45
+        ]
+      },
+      "indexed_chunk_count": 1600,
+      "indexed_document_count": 800,
+      "peak_python_allocations": {
+        "maximum": 10129068,
+        "median": 8033499,
+        "minimum": 7949989,
+        "samples": [
+          8033499,
+          7949989,
+          10129068
+        ]
+      },
+      "repeats": 3,
+      "scale": "medium",
+      "seed": 3501,
+      "source_document_file_count": 800
+    },
+    {
+      "database_bytes": {
+        "maximum": 27213824,
+        "median": 27213824,
+        "minimum": 27213824,
+        "samples": [
+          27213824,
+          27213824,
+          27213824
+        ]
+      },
+      "file_count": 10000,
+      "fixture_bytes": 8704000,
+      "fixture_content_sha256": "d1b79d2897efd044a8bba25d5c4415086595344d9e409e27b8232207c8d7a5b6",
+      "index": {
+        "maximum_ms": 80762.585,
+        "median_ms": 26201.679,
+        "minimum_ms": 25439.039,
+        "samples_ms": [
+          80762.585,
+          25439.039,
+          26201.679
+        ]
+      },
+      "indexed_chunk_count": 16000,
+      "indexed_document_count": 8000,
+      "peak_python_allocations": {
+        "maximum": 84917593,
+        "median": 84917465,
+        "minimum": 84915057,
+        "samples": [
+          84915057,
+          84917465,
+          84917593
+        ]
+      },
+      "repeats": 3,
+      "scale": "large",
+      "seed": 3501,
+      "source_document_file_count": 8000
+    }
+  ],
+  "method": {
+    "database": "main SQLite file plus -wal/-shm sidecars after engine disposal",
+    "index": "load_document -> chunk_document -> DocumentRecord/ChunkRecord commit",
+    "memory": "tracemalloc peak Python allocations during document indexing",
+    "repeats": 3,
+    "scope": "Markdown/TXT documents only; no embeddings",
+    "timing": "time.perf_counter wall-clock milliseconds",
+    "workspace_seed": 3501
+  },
+  "schema_version": "1.0",
+  "task": "E35-03"
+}
