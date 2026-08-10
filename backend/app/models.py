@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -629,4 +630,210 @@ class OperationExecutionItem(Base):
     undone_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+
+class JobRecord(Base):
+    """一个可跨进程重启恢复的逻辑后台任务。"""
+
+    __tablename__ = "background_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_background_jobs_idempotency_key",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_background_jobs_schema_version",
+        ),
+        CheckConstraint(
+            "kind IN ('workspace_scan', 'document_index')",
+            name="ck_background_jobs_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'cancel_requested', "
+            "'succeeded', 'failed', 'cancelled')",
+            name="ck_background_jobs_status",
+        ),
+        CheckConstraint(
+            "length(idempotency_key) BETWEEN 1 AND 128 "
+            "AND idempotency_key = trim(idempotency_key)",
+            name="ck_background_jobs_idempotency_key",
+        ),
+        CheckConstraint(
+            "max_attempts BETWEEN 1 AND 10",
+            name="ck_background_jobs_max_attempts",
+        ),
+        CheckConstraint(
+            "revision >= 0",
+            name="ck_background_jobs_revision_non_negative",
+        ),
+        CheckConstraint(
+            "((status IN ('succeeded', 'failed', 'cancelled')) "
+            "AND finished_at IS NOT NULL) OR "
+            "((status IN ('pending', 'running', 'cancel_requested')) "
+            "AND finished_at IS NULL)",
+            name="ck_background_jobs_finished_at",
+        ),
+        CheckConstraint(
+            "(status = 'failed' AND error_code IS NOT NULL) OR "
+            "(status <> 'failed' AND error_code IS NULL)",
+            name="ck_background_jobs_error_code",
+        ),
+        CheckConstraint(
+            "status NOT IN ('cancel_requested', 'cancelled') "
+            "OR cancel_requested_at IS NOT NULL",
+            name="ck_background_jobs_cancellation",
+        ),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=False,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
+    max_attempts: Mapped[int] = mapped_column(nullable=False)
+    revision: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    error_code: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+
+
+class JobAttemptRecord(Base):
+    """一次不可覆盖的后台任务执行尝试及其最新进度。"""
+
+    __tablename__ = "background_job_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "attempt_no",
+            name="uq_background_job_attempts_job_number",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_background_job_attempts_schema_version",
+        ),
+        CheckConstraint(
+            "attempt_no >= 1",
+            name="ck_background_job_attempts_number_positive",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'succeeded', 'failed', "
+            "'cancelled', 'interrupted')",
+            name="ck_background_job_attempts_status",
+        ),
+        CheckConstraint(
+            "completed_units >= 0 AND "
+            "(total_units IS NULL OR (total_units >= 0 "
+            "AND completed_units <= total_units))",
+            name="ck_background_job_attempts_progress",
+        ),
+        CheckConstraint(
+            "length(phase_code) BETWEEN 1 AND 64 "
+            "AND phase_code = trim(phase_code)",
+            name="ck_background_job_attempts_phase_code",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND finished_at IS NULL) OR "
+            "(status <> 'running' AND finished_at IS NOT NULL)",
+            name="ck_background_job_attempts_finished_at",
+        ),
+        CheckConstraint(
+            "(status IN ('failed', 'interrupted') "
+            "AND error_code IS NOT NULL) OR "
+            "(status NOT IN ('failed', 'interrupted') "
+            "AND error_code IS NULL)",
+            name="ck_background_job_attempts_error_code",
+        ),
+        CheckConstraint(
+            "(status = 'interrupted' AND retryable = 1) OR "
+            "(status IN ('running', 'succeeded', 'cancelled') "
+            "AND retryable = 0) OR status = 'failed'",
+            name="ck_background_job_attempts_retryable",
+        ),
+    )
+
+    attempt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("background_jobs.job_id"),
+        nullable=False,
+        index=True,
+    )
+    attempt_no: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="running",
+        server_default="running",
+    )
+    completed_units: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    total_units: Mapped[int | None] = mapped_column(nullable=True)
+    phase_code: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="starting",
+        server_default="starting",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    error_code: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    retryable: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
     )

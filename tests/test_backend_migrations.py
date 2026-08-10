@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from backend.app.models import (
     ApprovalAuditEvent,
     ApprovalRequest,
+    JobAttemptRecord,
+    JobRecord,
     OperationExecution,
     OperationExecutionItem,
     Workspace,
@@ -812,5 +814,122 @@ def test_execution_attempt_migration_preserves_existing_history(
                 )
             ).mappings().one()
             assert dict(restored_item) == {"status": "FAILED"}
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_background_job_migration_persists_identity_and_attempt_constraints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "background-job-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    job_id = "166c65f0-c5d5-40d3-b1cf-f21abbb3f9bd"
+    attempt_id = "212f5adc-cdba-46eb-9758-3aa9e15265dc"
+    started_at = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    try:
+        schema = inspect(engine)
+        assert {
+            "background_jobs",
+            "background_job_attempts",
+        }.issubset(schema.get_table_names())
+        assert schema.get_unique_constraints("background_jobs") == [
+            {
+                "name": "uq_background_jobs_idempotency_key",
+                "column_names": ["idempotency_key"],
+            }
+        ]
+        assert schema.get_unique_constraints("background_job_attempts") == [
+            {
+                "name": "uq_background_job_attempts_job_number",
+                "column_names": ["job_id", "attempt_no"],
+            }
+        ]
+
+        with Session(engine) as session:
+            workspace = Workspace(
+                name="后台任务迁移测试",
+                root_path=str(tmp_path / "workspace"),
+            )
+            session.add(workspace)
+            session.flush()
+            session.add(
+                JobRecord(
+                    job_id=job_id,
+                    kind="workspace_scan",
+                    workspace_id=workspace.id,
+                    idempotency_key="scan:workspace:1",
+                    max_attempts=2,
+                    created_at=started_at,
+                )
+            )
+            session.add(
+                JobAttemptRecord(
+                    attempt_id=attempt_id,
+                    job_id=job_id,
+                    attempt_no=1,
+                    completed_units=3,
+                    total_units=10,
+                    phase_code="scanning",
+                    started_at=started_at,
+                )
+            )
+            session.commit()
+
+        with Session(engine) as session:
+            restored_job = session.get(JobRecord, job_id)
+            restored_attempt = session.get(JobAttemptRecord, attempt_id)
+            assert restored_job is not None
+            assert restored_job.status == "pending"
+            assert restored_job.revision == 0
+            assert restored_attempt is not None
+            assert restored_attempt.status == "running"
+            assert restored_attempt.completed_units == 3
+            workspace_id = restored_job.workspace_id
+
+        with Session(engine) as session:
+            session.add(
+                JobRecord(
+                    job_id="c37580cf-1eb8-44bb-bf29-99da7f65d523",
+                    kind="workspace_scan",
+                    workspace_id=workspace_id,
+                    idempotency_key="scan:workspace:1",
+                    max_attempts=1,
+                    created_at=started_at,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
+
+        with Session(engine) as session:
+            session.add(
+                JobAttemptRecord(
+                    attempt_id="59f5e540-d733-48f0-a74d-19dc6ea70fe8",
+                    job_id=job_id,
+                    attempt_no=2,
+                    completed_units=11,
+                    total_units=10,
+                    phase_code="scanning",
+                    started_at=started_at,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "e32a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        downgraded_tables = inspect(downgraded_engine).get_table_names()
+        assert "background_job_attempts" not in downgraded_tables
+        assert "background_jobs" not in downgraded_tables
     finally:
         downgraded_engine.dispose()
