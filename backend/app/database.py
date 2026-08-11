@@ -1,6 +1,8 @@
+import os
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -17,7 +19,13 @@ DATABASE_PATH = Path(__file__).resolve().parent.parent / "filenest.db"
 #                   当前位置    绝对路径    从 backend/app/ 返回到 backend/，最终位置：backend/filenest.db
 # D:\Project\FileNest\backend\filenest.db
 
-DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
+_DEFAULT_DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
+_configured_database_url = os.getenv("FILENEST_DATABASE_URL")
+DATABASE_URL = (
+    _configured_database_url.strip()
+    if _configured_database_url and _configured_database_url.strip()
+    else _DEFAULT_DATABASE_URL
+)
 # sqlite:///：告诉 SQLAlchemy 使用磁盘上的 SQLite 文件，
 # as_posix()：把 Path 对象转换成使用正斜杠 / 的字符串
 # sqlite:///D:/Project/FileNest/backend/filenest.db
@@ -34,6 +42,17 @@ SessionFactory = sessionmaker(
     bind=engine, # 把 Session 工厂绑定到现有 engine
     expire_on_commit=False, # 提交成功后，已经加载的 id、name 和 root_path 可以继续使用
 )
+
+
+def check_database_connection() -> bool:
+    """执行最小数据库探针，供健康检查判断存储是否可用。"""
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        return False
+    return True
 
 # 交出一个 Session
 def get_session() -> Iterator[Session]:

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .agent_api import router as agent_router
 from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
-from .database import get_session
+from .database import check_database_connection, get_session
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
 
 from .services import (
@@ -79,6 +79,15 @@ class FileIndexSyncResponse(BaseModel):
 @app.get("/api/v1/health")
 def health_check() -> dict[str, str]:
     """返回服务当前可用的健康状态。"""
+
+    if not check_database_connection():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "database_unavailable",
+                "message": "数据库不可用。",
+            },
+        )
 
     return {"status": "ok"}
 

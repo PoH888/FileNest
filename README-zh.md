@@ -70,97 +70,128 @@ FileNest 还可以持续监控 Downloads 或任意文件夹。
 
 ## 环境要求
 
-- Python 3.10+
-- Windows
+- Python 3.11+（V2 后端推荐 Python 3.13）
+- 桌面应用需要 Windows
+- 如果要用容器运行 V2 API，需要 Docker Desktop 和 Docker Compose
 
 ## 安装
 
-```bash
-# 克隆仓库
-git clone https://github.com/PoH888/FileNest.git
-cd FileNest
+在 PowerShell 中进入存放仓库的目录，执行：
 
-# 安装依赖
-pip install -r requirements.txt
+```powershell
+git clone https://github.com/PoH888/FileNest.git
+Set-Location .\FileNest
+
+py -3.13 -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+```
+
+CI 等价的测试命令还需要单独安装 `pytest` 和 `httpx`：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install pytest httpx
 ```
 
 ## 运行
 
-```bash
-python main.py
+### 桌面应用
+
+```powershell
+& .\.venv\Scripts\python.exe .\main.py
 ```
+
+### 本地运行 V2 API
+
+以下命令均从仓库根目录执行。本地默认数据库为
+`backend/filenest.db`。
+
+```powershell
+& .\.venv\Scripts\python.exe -m alembic -c .\backend\alembic.ini upgrade head
+& .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+```
+
+在另一个 PowerShell 窗口检查 API，并在浏览器打开
+<http://127.0.0.1:8000/docs> 查看交互式文档：
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/health
+```
+
+### 使用 Docker Compose 运行 V2 API
+
+Compose 文件只包含 API 和 SQLite 数据卷。从仓库根目录启动：
+
+```powershell
+docker compose up --build --detach
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/health
+docker compose down
+```
+
+如果需要模型配置，将 `.env.example` 复制为 `.env`，编辑本地值后再执行
+`docker compose up --build --detach`。Compose 会读取 `.env` 做变量替换；
+直接本地运行 Uvicorn 时，需要在当前 PowerShell 会话中设置环境变量，程序
+不会自动加载 `.env`。
 
 ## 依赖
 
 | 依赖 | 用途 |
 |------|------|
-| [fuzzywuzzy](https://github.com/seatgeek/fuzzywuzzy) | 文件名模糊匹配 |
-| [python-Levenshtein](https://github.com/rapidfuzz/python-Levenshtein) | 匹配算法 C 加速 |
+| [thefuzz](https://github.com/seatgeek/thefuzz) / [rapidfuzz](https://github.com/rapidfuzz/RapidFuzz) | 文件名模糊匹配 |
 | [watchdog](https://github.com/gorakhargosh/watchdog) | 文件系统监控 |
-| [pystray](https://github.com/moses-palmer/pystray) | 系统托盘图标 |
-| [Pillow](https://python-pillow.org) | 托盘图标图像处理 |
+| [pystray](https://github.com/moses-palmer/pystray) / [Pillow](https://python-pillow.org) | 系统托盘和图标支持 |
+| [tkinterdnd2](https://github.com/pmgagne/tkinterdnd2) | 桌面拖放支持 |
+| [FastAPI](https://fastapi.tiangolo.com) / [Uvicorn](https://www.uvicorn.org) | V2 HTTP API 和 ASGI 服务 |
+| [SQLAlchemy](https://www.sqlalchemy.org) / [Alembic](https://alembic.sqlalchemy.org) | SQLite 持久化和迁移 |
+| [Pydantic](https://docs.pydantic.dev) / `pydantic-settings` | 数据契约和环境配置 |
+| [OpenAI Python SDK](https://github.com/openai/openai-python) | OpenAI 兼容模型客户端 |
+| [LangGraph](https://github.com/langchain-ai/langgraph) / `langgraph-checkpoint-sqlite` | 工作流执行和检查点 |
+| `pypdf` / `python-docx` | PDF 和 DOCX 文本提取 |
+| `pytest` / `httpx` | 本地和 CI 测试；不随运行时依赖安装，需单独安装 |
 
-> tkinter 为 Python 标准库，无需额外安装。
+> tkinter 属于 Python 标准库，无需额外安装。
 
 ## 项目结构
 
 ```
 FileNest/
-├── main.py              # 程序入口
-├── core/                # 核心逻辑
-│   ├── __init__.py
-│   ├── matcher.py       # 文件名匹配引擎
-│   ├── config_manager.py# 配置读写、容错
-│   ├── file_mover.py    # 文件移动、回退、撤销
-│   ├── file_monitor.py  # watchdog 文件监控
-│   ├── folder_scanner.py# 目录树扫描
-│   ├── utils.py         # 日志、路径、托盘图标
-│   └── i18n.py          # 中/英文语言包
-├── gui/
-│   ├── main_window.py   # 主窗口
-│   ├── dialogs.py       # 候选选择、冲突处理对话框
-│   ├── settings_window.py  # 设置窗口
-│   └── notification.py  # 新文件通知弹窗
-├── tests/               # 测试用例
-│   ├── test_matcher.py
-│   ├── test_config_manager.py
-│   ├── test_file_mover.py
-│   ├── test_file_monitor.py
-│   ├── test_folder_scanner.py
-│   └── test_utils.py
-├── assets/              # 图标、图片、演示 GIF
-├── requirements.txt
-└── README.md
+├── main.py                    # 旧版桌面程序入口
+├── backend/
+│   ├── app/                   # V2 FastAPI 应用和服务
+│   ├── alembic/               # 数据库迁移
+│   └── alembic.ini
+├── core/                      # 共享的桌面和文件逻辑
+├── gui/                       # 桌面界面
+├── tests/                     # 单元、集成、安全和评测测试
+├── assets/                    # 图标、图片和演示媒体
+├── .github/workflows/ci.yml   # 精简 CI 测试分组
+├── Dockerfile                 # V2 API 镜像
+├── compose.yaml               # API 和 SQLite 数据卷
+├── .env.example               # 本地/Compose 环境变量模板
+└── requirements.txt           # 运行时依赖
 ```
 
 ## 打包
 
-```bash
-pip install pyinstaller
+以下命令打包现有的 Windows 桌面入口（`main.py`）。V2 API 使用 Uvicorn
+或 Docker Compose 运行，不会打入桌面 exe。请在仓库根目录的 PowerShell
+中执行：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install pyinstaller
+Remove-Item -Recurse -Force .\dist, .\build -ErrorAction SilentlyContinue
+& .\.venv\Scripts\pyinstaller.exe --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets\FileNest_big.ico" .\main.py
+New-Item -ItemType Directory -Force .\dist\FileNest | Out-Null
+Move-Item -Force .\dist\FileNest.exe .\dist\FileNest\
+& .\.venv\Scripts\python.exe -c "import zipfile; zipfile.ZipFile('FileNest.zip','w',zipfile.ZIP_DEFLATED).write('dist/FileNest/FileNest.exe','FileNest.exe')"
 ```
 
-所有依赖（assets/ 图标、tkinterdnd2 拖拽 DLL、Python 运行时）均被打入单个 exe 内部，没有零散文件。分发结构：
+分发结构：
 
 ```
 FileNest.zip
   └── 解压 → FileNest/
                 └── FileNest.exe    ← 首次运行后同级自动生成 settings.json
-```
-
-```bash
-# 1) 清除旧的构建产物
-rm -rf dist build
-
-# 2) 打包为单文件 exe（--onefile）
-pyinstaller --noconsole --onefile --name FileNest --add-data "assets;assets" --icon "assets/FileNest_big.ico" main.py
-
-# 3) 创建分发文件夹，把 exe 放进去
-mkdir -p dist/FileNest
-mv dist/FileNest.exe dist/FileNest/
-
-# 4) 压缩为 .zip（注意：exe 放在 zip 根级，不要文件夹前缀，
-#         Windows "Extract All…" 会自动创建 FileNest/ 目录）
-python -c "import zipfile; zipfile.ZipFile('FileNest.zip','w',zipfile.ZIP_DEFLATED).write('dist/FileNest/FileNest.exe','FileNest.exe')"
 ```
 
 > **注意**：`--onefile` 模式下 `settings.json` 首次运行时会自动生成在 exe 所在目录（即 `FileNest/` 下），随文件夹整体移动即可带走配置。
@@ -178,18 +209,43 @@ python -c "import zipfile; zipfile.ZipFile('FileNest.zip','w',zipfile.ZIP_DEFLAT
 | 忽略名单 | 跳过的文件名关键词 | — |
 | 语言 | zh / en | zh |
 
+V2 API 支持以下环境变量：
+
+| 变量 | 说明 | 默认值或示例 |
+|------|------|--------------|
+| `FILENEST_DATABASE_URL` | SQLAlchemy 数据库 URL | 本地默认为 `sqlite:///./backend/filenest.db` |
+| `FILENEST_MODEL_PROVIDER` | 模型提供方名称 | 参见 `.env.example` |
+| `FILENEST_MODEL_NAME` | 模型名称 | 参见 `.env.example` |
+| `FILENEST_MODEL_API_KEY` | 模型 API 密钥 | 仅保存在本地，禁止提交真实密钥 |
+
+使用 Docker Compose 时，以 `.env.example` 为 `.env` 模板。直接本地运行时，
+请在启动 Uvicorn 前于当前 PowerShell 会话设置这些变量。
+
 ## 运行测试
 
-```bash
-python -m pytest tests/ -v
+先安装两个测试专用包，再运行一组代表性的本地冒烟测试：
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install pytest httpx
+& .\.venv\Scripts\python.exe -m pip check
+& .\.venv\Scripts\python.exe -m pytest `
+  .\tests\test_matcher.py `
+  .\tests\test_backend_migrations.py `
+  .\tests\test_path_policy.py `
+  .\tests\test_agent_evaluation.py `
+  -q -p no:cacheprovider
 ```
+
+GitHub Actions 会执行 `.github/workflows/ci.yml` 中定义的完整且互不重复的
+单元、集成、安全和评测分组，触发方式包括 push、pull request 和手动运行。
+CI 不设置覆盖率门槛。
 
 ## 技术要点
 
 ### 匹配策略
 
 1. 文件名规范化 → 去扩展名、替换分隔符、全小写
-2. `fuzzywuzzy.token_sort_ratio` + `partial_ratio` 计算基础分
+2. `thefuzz.token_sort_ratio` + `partial_ratio` 计算基础分
 3. 关键词重叠加分（中英文 bigram + 连续子串）
 4. 父文件夹加权（父目录名命中加分）
 5. 低于 55 分的候选直接丢弃

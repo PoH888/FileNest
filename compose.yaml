@@ -1,0 +1,29 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      FILENEST_DATABASE_URL: sqlite:////app/data/filenest.db
+      FILENEST_MODEL_PROVIDER: ${FILENEST_MODEL_PROVIDER:-}
+      FILENEST_MODEL_NAME: ${FILENEST_MODEL_NAME:-}
+      FILENEST_MODEL_API_KEY: ${FILENEST_MODEL_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - filenest-data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  filenest-data:
