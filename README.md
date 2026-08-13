@@ -1,78 +1,71 @@
 # FileNest 📃 → 🪹
 
-> Let files find their way home
->
-> Drag files in
->
-> Or let FileNest watch in the background
->
-> Leave the rest to FileNest
->
-> Every file finds its own nest
+> A local-first file organization project with an evidence-first V2 backend.
+
+This repository contains two related paths:
+
+- **Legacy Windows desktop app**: drag-and-drop sorting, fuzzy directory matching, optional folder monitoring, and local undo.
+- **FileNest V2 backend**: a FastAPI application that makes file organization explicit, reviewable, and safe: query → plan preview → approval → execution → undo.
+
+The V2 status and boundaries below describe the current code, not a future roadmap.
 
 ---
 
-```
-　　　Report_Q4.docx　→　Work/Reports/
-　　　Travel_Alaska.jpg　→　Photos/Travel/
-　　　UI_Homepage.fig　→　Project A/UI Design/
-```
+## Current V2 capability
 
----
+The V2 backend currently provides:
 
-FileNest analyzes file names and your directory structure
+- authorized workspace registration, explicit workspace scanning, file search, and file metadata retrieval;
+- document loading, traceable chunks, keyword knowledge search, and an offline experimental vector path;
+- a read-only Agent run with persisted run/tool state and SSE state projection;
+- operation-plan preview, persisted approval decisions, safe execution, execution history, and guarded undo;
+- a local-stdio MCP server exposing `search_files`, `knowledge_search`, and `create_operation_proposal`.
 
-to automatically infer where each file belongs.
+The main V2 safety chain is deliberately explicit. Approval changes workflow state but does not write files. Execution reloads the approved checkpoint and revalidates authorization, the plan, and file preconditions. Undo relies on recorded execution history and current file metadata rather than unconditionally overwriting a path.
 
-**No searching.**
+## Existing desktop demo media
 
-**No manual organizing.**
-
-**No need to remember where files go.**
-
----
-
-Beyond drag-and-drop sorting,
-
-FileNest can continuously monitor Downloads or any folder.
-
-When new files appear,
-
-it recommends a target directory
-
-and you choose to **Categorize** or **Ignore**.
-
----
-
-✅ Smart directory matching
-
-✅ Auto-monitor Downloads or any folder
-
-✅ Real-time categorization suggestions for new files
-
-✅ One-click undo
-
-✅ Fully local, no internet required
+These clips show the legacy Windows desktop application. They are not evidence that the V2 backend has integrated the legacy file monitor.
 
 [📥 Download](https://github.com/PoH888/FileNest/releases)
 
 ---
 
-## Demo
-
 [![Drag & Drop](assets/English-Operate-thumb.png)](https://cdn.jsdelivr.net/gh/PoH888/FileNest@main/assets/English-Operate.mp4)
 
-*Drag files to automatically sort them into matching directories*
+*Legacy desktop drag-and-drop sorting*
 
 [![Auto Monitor](assets/English-Monitor-thumb.png)](https://cdn.jsdelivr.net/gh/PoH888/FileNest@main/assets/English-Monitor.mp4)
 
-*Monitor folders for new files and get real-time categorization suggestions*
+*Legacy desktop folder monitoring*
+
+## Representative V2 demonstration
+
+The reproducible local demonstration uses a dedicated workspace and a fixed 187-byte ZIP file. The recorded SHA-256 is:
+
+```text
+02394A5D0DB905108D69D44ADCCAE3036AB02727CF456848688DAF28C30C16C3
+```
+
+The demonstrated state sequence is:
+
+```text
+waiting / WAITING_APPROVAL
+        ↓ approve
+ready / APPROVED
+        ↓ execute
+COMPLETED
+        ↓ undo
+UNDONE
+```
+
+The existing run record checks that the source file returns after undo and that its SHA-256 is unchanged. The deterministic API path uses indexed file search and does not require an external model. The browser Agent query path requires valid local model settings; it is not treated as evidence of model quality.
 
 ## Requirements
 
-- Python 3.11+ (Python 3.13 is recommended for the V2 backend)
-- Windows for the desktop application
-- Docker Desktop with Docker Compose, if you want to run the V2 API in a container
+- Python 3.13 is the locally validated version for the V2 backend.
+- Windows is required for the legacy desktop application.
+- Docker Compose configuration is included for the V2 API, but this environment has not verified a local Docker build or container run.
 
 ## Installation
 
@@ -103,12 +96,17 @@ The CI-equivalent test commands additionally require `pytest` and `httpx`:
 
 ### V2 API locally
 
-Run these commands from the repository root. The default local database is
-`backend/filenest.db`.
+Run the migration from the `backend` directory, then start the existing FastAPI
+app from the repository root:
 
 ```powershell
-& .\.venv\Scripts\python.exe -m alembic -c .\backend\alembic.ini upgrade head
-& .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+$python = (Resolve-Path .\.venv\Scripts\python.exe).Path
+
+Push-Location .\backend
+& $python -m alembic upgrade head
+Pop-Location
+
+& $python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
 In another PowerShell window, check the API and open the interactive docs at
@@ -118,10 +116,22 @@ In another PowerShell window, check the API and open the interactive docs at
 Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/health
 ```
 
+The expected health response is `status: ok`. Open
+<http://127.0.0.1:8000/> for the current minimal V2 UI, or
+<http://127.0.0.1:8000/docs> for the OpenAPI UI.
+
+The UI can select a workspace, submit a read-only Agent request, inspect
+sources, create a plan, approve or reject it, execute an approved plan, and
+undo a completed execution. A valid model configuration is required for the
+Agent request. Without a model configuration, use the deterministic HTTP chain
+in the E39-03 local video script.
+
 ### V2 API with Docker Compose
 
-The Compose file contains only the API and its SQLite data volume. Start it
-from the repository root:
+The repository contains a Compose definition for the API and its SQLite data
+volume. This environment has not verified a local Docker build or container
+run, so the following is a configuration reference rather than a recorded
+execution result:
 
 ```powershell
 docker compose up --build --detach
@@ -129,11 +139,40 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/health
 docker compose down
 ```
 
-If model settings are needed, copy `.env.example` to `.env`, edit the local
-values, and then run `docker compose up --build --detach` again. Compose reads
-`.env` for interpolation; a direct local Uvicorn run reads environment
-variables from the current PowerShell session and does not load `.env`
-automatically.
+If model settings are needed, Compose reads `.env` for interpolation. A direct
+local Uvicorn run reads environment variables from the current PowerShell
+session and does not load `.env` automatically.
+
+### Deterministic HTTP chain
+
+The no-model demonstration uses current API responses and dynamic IDs. Its
+endpoint order is:
+
+1. `GET` or `POST /api/v1/workspaces` — find or register the dedicated workspace;
+2. `POST /api/v1/workspaces/{workspace_id}/scan` — synchronize the file index;
+3. `GET /api/v1/workspaces/{workspace_id}/files` — query the fixed ZIP;
+4. `POST /api/v1/workflows` — create a waiting approval plan;
+5. `POST /api/v1/workflows/{workflow_id}/decisions` — approve the displayed plan;
+6. `POST /api/v1/workflows/{workflow_id}/execute` — execute the approved plan;
+7. `POST /api/v1/workflows/{workflow_id}/undo` — restore the file from execution history.
+
+Use the fixed-file preparation and complete PowerShell chain in
+`docs/E29-04-可复现运行说明与工程调用链.md` when working from this checkout.
+Do not hard-code old workspace, file, workflow, or plan IDs. If the target file
+already exists, inspect the previous run and undo it instead of deleting files
+with a broad reset command.
+
+### Local-stdio MCP server
+
+The current MCP entrypoint is:
+
+```powershell
+& .\.venv\Scripts\python.exe -m backend.app.mcp_server
+```
+
+It exposes only the current read-only search tools and a pending operation
+proposal. It does not expose approval, execution, or undo tools, and it does
+not open a network transport.
 
 ## Dependencies
 
@@ -161,9 +200,10 @@ FileNest/
 ├── backend/
 │   ├── app/                   # V2 FastAPI application and services
 │   ├── alembic/               # Database migrations
+│   ├── evaluation/            # Recorded evaluation and scale results
 │   └── alembic.ini
-├── core/                      # Shared desktop/file logic
-├── gui/                       # Desktop UI
+├── core/                      # Legacy desktop/file logic
+├── gui/                       # Legacy desktop UI
 ├── tests/                     # Unit, integration, security, and evaluation tests
 ├── assets/                    # Icons, images, and demo media
 ├── .github/workflows/ci.yml   # Curated CI test groups
@@ -200,7 +240,10 @@ FileNest.zip
 
 ## Configuration
 
-`settings.json` is auto-generated on first run. It can be modified through the settings window:
+### Legacy desktop settings
+
+`settings.json` is auto-generated on first run of the desktop application. It
+can be modified through the settings window:
 
 | Config Key | Description | Default |
 |------------|-------------|---------|
@@ -210,6 +253,8 @@ FileNest.zip
 | Parent folder weighting | Bonus for matching parent dir name | On |
 | Ignore list | File name keywords to skip | — |
 | Language | zh / en | zh |
+
+### V2 API environment
 
 The V2 API accepts these environment variables:
 
@@ -245,7 +290,7 @@ pull requests, and manual dispatch. It does not require a coverage threshold.
 
 ## How It Works
 
-### Matching Strategy
+### Legacy desktop matching strategy
 
 1. File name normalization → strip extension, replace separators, lowercase
 2. `thefuzz.token_sort_ratio` + `partial_ratio` for base score
@@ -253,12 +298,21 @@ pull requests, and manual dispatch. It does not require a coverage threshold.
 4. Parent folder weighting (parent dir name match bonus)
 5. Candidates below 55 are discarded
 
-### Match Result Decision
+### Legacy desktop match decision
 
 - **No match** (0 candidates) → Prompt manual handling
 - **Strong match** (1 candidate ≥ 85) → Auto-move
 - **Multiple candidates** (≥2) → Selection window
 - **Nested overlap** (parent + child dirs in candidates) → Tree selection window
+
+## Current V2 boundaries
+
+- The legacy desktop monitor is not integrated into the V2 Job/Attempt or document-indexing path.
+- V2 Agent POST execution is currently synchronous; SSE projects persisted Agent state and does not itself execute or cancel business work.
+- Large workspace scans and document indexing have local long-task evidence, but the Job/Attempt baseline is not fully connected to HTTP, scanning, or document indexing.
+- Keyword retrieval remains the default; vector retrieval is experimental and no external vector database is adopted.
+- Redis, Celery, distributed workers, user authentication, multi-tenant isolation, and a remote MCP transport are not current V2 capabilities.
+- This repository contains no verified production deployment, production user count, QPS, SLA, real-model accuracy, or real-embedding quality claim.
 
 ## License
 
