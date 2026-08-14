@@ -25,6 +25,19 @@ CURRENT_PLAN_ID = UUID("bcd22e91-e18d-40dc-8267-7c442f60ba8c")
 REPLACEMENT_PLAN_ID = UUID("dfcb9aba-d95f-4c99-9e85-33f88d72bc0d")
 
 
+def test_runtime_resolves_configured_checkpoint_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_path = tmp_path / "persistent" / "workflow-checkpoints.sqlite"
+    monkeypatch.setenv(
+        "FILENEST_WORKFLOW_CHECKPOINT_PATH",
+        str(configured_path),
+    )
+
+    assert workflow_runtime._resolve_workflow_checkpoint_path() == configured_path
+
+
 def _plan(
     *,
     plan_id: UUID,

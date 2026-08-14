@@ -96,7 +96,9 @@ def apply_organization_decision(
             "页面所见计划已经变化",
         )
 
-    expected_status = "APPROVED" if action == "approve" else "REJECTED"
+    expected_status: Literal["APPROVED", "REJECTED"] = (
+        "APPROVED" if action == "approve" else "REJECTED"
+    )
     if approval.status == "WAITING_APPROVAL":
         transition = (
             approve_operation_plan

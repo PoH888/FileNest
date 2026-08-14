@@ -219,7 +219,8 @@ def create_tray_icon(
     # pylint: disable=import-outside-toplevel
     try:
         import pystray
-        from PIL import Image, ImageDraw
+        # 先探测 Pillow，避免托盘线程启动后才暴露可选依赖缺失。
+        from PIL import Image, ImageDraw  # noqa: F401
     except ImportError:
         logging.getLogger(APP_NAME).warning(
             "pystray 或 Pillow 不可用，系统托盘功能已跳过。"

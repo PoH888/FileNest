@@ -1,7 +1,6 @@
 """基于 SQLite 片段向量的向量检索与最小混合检索。"""
 
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field

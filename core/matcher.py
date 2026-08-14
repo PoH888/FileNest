@@ -6,7 +6,7 @@ FileNest — 文件名匹配模块
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 from rapidfuzz.distance import Levenshtein
 from thefuzz import fuzz
@@ -600,16 +600,6 @@ def build_family_tree(
                 result.append((p, s))
         result.sort(key=lambda x: x[1], reverse=True)
         return result
-
-    def build_node(folder: Path) -> Tuple[Path, Optional[List[Tuple[Path, int]]]]:
-        """递归构建单个节点及其子树。"""
-        children = build_children(folder)
-        score = dict(candidates).get(folder, 0)
-        if children:
-            return (folder, children)
-        return (folder, None)
-
-    result = [(build_node(root)) for root in roots]
 
     # 同时添加所有子节点中不在 trees 的嵌套子树
     def add_descendants(node_path: Path, node_children: Optional[List[Tuple[Path, int]]]) -> List[Tuple[Path, Optional[List[Tuple[Path, int]]]]]:

@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from pathlib import Path
 from uuid import UUID
 
 import pytest

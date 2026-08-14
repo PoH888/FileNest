@@ -6,7 +6,7 @@ from sqlalchemy import pool
 
 from alembic import context
 
-from backend.app import models  # Importing models registers ORM tables.
+from backend.app import models  # Importing models registers ORM tables.  # noqa: F401
 from backend.app.database import Base, DATABASE_URL
 
 # this is the Alembic Config object, which provides

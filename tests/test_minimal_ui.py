@@ -7,35 +7,36 @@ def test_minimal_ui_serves_safe_read_only_request_form() -> None:
     with TestClient(app) as client:
         response = client.get("/")
 
+    html = "\n".join(response.text.splitlines())
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    assert 'id="workspace-select"' in response.text
-    assert 'id="request-text"' in response.text
-    assert 'id="result-status"' in response.text
-    assert 'id="result-answer"' in response.text
-    assert 'id="timeline-panel"' in response.text
-    assert 'id="timeline-list"' in response.text
-    assert 'id="plan-form"' in response.text
-    assert 'id="plan-status"' in response.text
-    assert 'id="approve-plan"' in response.text
-    assert 'id="reject-plan"' in response.text
-    assert 'fetch("/api/v1/workspaces")' in response.text
-    assert 'fetch("/api/v1/agent-runs"' in response.text
-    assert "new EventSource" in response.text
-    assert 'fetch("/api/v1/workflows"' in response.text
-    assert "/decisions" in response.text
-    assert "expected_plan_id" in response.text
-    assert 'action,\n              expected_plan_id' in response.text
-    assert 'source_file_id' in response.text
-    assert "textContent" in response.text
-    assert "innerHTML" not in response.text
+    assert 'id="workspace-select"' in html
+    assert 'id="request-text"' in html
+    assert 'id="result-status"' in html
+    assert 'id="result-answer"' in html
+    assert 'id="timeline-panel"' in html
+    assert 'id="timeline-list"' in html
+    assert 'id="plan-form"' in html
+    assert 'id="plan-status"' in html
+    assert 'id="approve-plan"' in html
+    assert 'id="reject-plan"' in html
+    assert 'fetch("/api/v1/workspaces")' in html
+    assert 'fetch("/api/v1/agent-runs"' in html
+    assert "new EventSource" in html
+    assert 'fetch("/api/v1/workflows"' in html
+    assert "/decisions" in html
+    assert "expected_plan_id" in html
+    assert 'action,\n              expected_plan_id' in html
+    assert 'source_file_id' in html
+    assert "textContent" in html
+    assert "innerHTML" not in html
 
 
 def test_minimal_ui_wires_plan_preview_and_decision_path() -> None:
     with TestClient(app) as client:
         response = client.get("/")
 
-    html = response.text
+    html = "\n".join(response.text.splitlines())
     assert 'planForm.addEventListener("submit"' in html
     assert 'fetch("/api/v1/workflows"' in html
     assert 'approvePlanButton.addEventListener("click"' in html

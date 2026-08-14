@@ -23,6 +23,7 @@ from .repositories import (
     get_operation_execution_by_plan_id,
     get_operation_execution_by_workflow_id,
     get_workspace_by_id,
+    OperationExecutionStatus,
 )
 from .safe_file_mover import (
     SafeFileMoveError,
@@ -295,6 +296,7 @@ def execute_safe_operation_plan(
         )
         completed_count += 1
 
+    final_status: OperationExecutionStatus
     if completed_count == len(operation_items):
         final_status = "COMPLETED"
     elif failed_count == len(operation_items):
@@ -471,6 +473,7 @@ def retry_failed_operation_execution(
 
     persisted_items = find_operation_execution_items(session, execution.id)
     item_statuses = {item.status for item in persisted_items}
+    final_status: OperationExecutionStatus
     if item_statuses == {"COMPLETED"}:
         final_status = "COMPLETED"
     elif item_statuses == {"FAILED"}:
@@ -712,6 +715,7 @@ def recover_interrupted_operation_execution(
             execution.id,
         )
         item_statuses = {item.status for item in persisted_items}
+        final_status: OperationExecutionStatus
         if item_statuses == {"COMPLETED"}:
             final_status = "COMPLETED"
         elif item_statuses == {"FAILED"}:

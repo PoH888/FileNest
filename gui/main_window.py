@@ -6,6 +6,7 @@ FileNest — 主窗口模块
 
 import logging
 import os
+import queue
 import re
 import sys
 import tkinter as tk
@@ -21,7 +22,7 @@ from core import matcher
 from gui.dialogs import CollisionDialog, CandidateWindow, TreeCandidateWindow
 from gui.notification import NotificationWindow
 from gui.settings_window import SettingsWindow
-from core.i18n import tr, set_language, get_language, get_available_languages
+from core.i18n import tr, set_language
 from core.utils import create_tray_icon, destroy_tray_icon, ensure_icon_ico, get_big_ico_path, get_ico_path
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ class FileNestApp:
         self._title_click_count: int = 0
         self._observer: Optional[Any] = None
         self._tray_shown: bool = False
-        self.event_queue: "queue.Queue" = __import__("queue").Queue()
+        self.event_queue: "queue.Queue" = queue.Queue()
 
         # ---- 构建 UI ----
         self._build_ui()
@@ -293,7 +294,6 @@ class FileNestApp:
                    command=self._show_settings)
         self._settings_btn.pack(side=tk.LEFT, padx=5)
 
-        current_lang_label = "简体中文" if get_language() == "zh" else "English"
         self._lang_btn = ttk.Menubutton(bar, text="Language",
                                         direction="above")
         lang_menu = tk.Menu(self._lang_btn, tearoff=0)
@@ -489,7 +489,6 @@ class FileNestApp:
         display = self.history[:HISTORY_DISPLAY]
         for idx, rec in enumerate(display):
             current_path = Path(rec["current"])
-            original_path = Path(rec["original_path"])
 
             record_frame = ttk.Frame(self._history_inner)
             record_frame.pack(fill=tk.X, padx=2, pady=3)

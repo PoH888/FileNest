@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import cast
 from xml.etree import ElementTree
 
 
@@ -186,8 +187,8 @@ def _save_summary(summary: dict[str, object], result_path: Path) -> None:
 
 
 def render_milestone_report(summary: dict[str, object]) -> str:
-    source_hashes = summary["source_sha256"]
-    cases = summary["cases"]
+    source_hashes = cast(dict[str, str], summary["source_sha256"])
+    cases = cast(list[dict[str, str]], summary["cases"])
     lines = [
         "# FileNest 第 26 课：安全整理 Agent 综合评测",
         "",

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +41,7 @@ from .repositories import (
     get_file_entry_by_id,
     get_approval_request_by_workflow_id,
     get_workspace_by_id,
+    SortOrder,
 )
 from .workspace_scanner import ScannedFile, scan_workspace_files
 
@@ -604,26 +606,25 @@ def search_files(
     normalized_extension = _normalize_extension(extension)
     modified_from_ns = _datetime_to_epoch_ns(modified_from)
     modified_to_ns = _datetime_to_epoch_ns(modified_to)
-    filter_options = {
-        "keyword": normalized_keyword,
-        "extension": normalized_extension,
-        "modified_from_ns": modified_from_ns,
-        "modified_to_ns": modified_to_ns,
-    }
-
     total = count_file_entries(
         session,
         workspace_id,
-        **filter_options,
+        keyword=normalized_keyword,
+        extension=normalized_extension,
+        modified_from_ns=modified_from_ns,
+        modified_to_ns=modified_to_ns,
     )
     items = find_file_entries(
         session,
         workspace_id,
         sort_by=_FILE_SORT_FIELDS[sort_by],
-        sort_order=sort_order,
+        sort_order=cast(SortOrder, sort_order),
         offset=(page - 1) * page_size,
         limit=page_size,
-        **filter_options,
+        keyword=normalized_keyword,
+        extension=normalized_extension,
+        modified_from_ns=modified_from_ns,
+        modified_to_ns=modified_to_ns,
     )
 
     return FileSearchResult(

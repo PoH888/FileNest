@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 import logging
-from typing import Any, cast
+from typing import cast
 
 from pydantic import (
     BaseModel,
