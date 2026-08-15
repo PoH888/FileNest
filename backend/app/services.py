@@ -9,6 +9,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+import os
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -25,7 +26,11 @@ from .operation_preview import (
     rank_preview_candidates,
 )
 from .operation_plan import OperationPlan
-from .path_policy import PathPolicyError
+from .path_policy import (
+    PathPolicyError,
+    normalize_workspace_root,
+    validate_workspace_root,
+)
 from .repositories import (
     add_file_entry,
     add_approval_audit_event,
@@ -371,10 +376,19 @@ def create_workspace(
 ) -> Workspace:
     """创建并保存工作区；根路径重复时抛出业务冲突错误。"""
 
-    
+    normalized_root = validate_workspace_root(root_path)
+    normalized_key = os.path.normcase(str(normalized_root))
+    for existing_workspace in find_workspaces(session):
+        try:
+            existing_root = normalize_workspace_root(existing_workspace.root_path)
+        except PathPolicyError:
+            continue
+        if os.path.normcase(str(existing_root)) == normalized_key:
+            raise WorkspacePathConflictError
+
     workspace = Workspace(
         name=name,
-        root_path=root_path,
+        root_path=str(normalized_root),
     )
 
     add_workspace(session, workspace)

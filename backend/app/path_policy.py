@@ -38,6 +38,8 @@ class PathPolicyErrorCode(StrEnum):
     """Path Policy 对外稳定的错误码。"""
 
     INVALID_PATH = "invalid_path"
+    WORKSPACE_ROOT_NOT_FOUND = "workspace_root_not_found"
+    WORKSPACE_ROOT_NOT_DIRECTORY = "workspace_root_not_directory"
     PATH_OUTSIDE_WORKSPACE = "path_outside_workspace"
     PATH_LINK_OUTSIDE_WORKSPACE = "path_link_outside_workspace"
     SENSITIVE_PATH = "sensitive_path"
@@ -87,10 +89,55 @@ class PathPolicyError(Exception):
         }
 
 
+def normalize_workspace_root(root_path: str | Path) -> Path:
+    """将工作区根路径统一为绝对、解析后的路径。"""
+
+    try:
+        path = Path(root_path)
+    except (TypeError, ValueError) as error:
+        raise PathPolicyError(
+            PathPolicyErrorCode.INVALID_PATH,
+            "路径格式无效。",
+        ) from error
+
+    return _resolve_path(_normalize_path(path))
+
+
+def validate_workspace_root(root_path: str | Path) -> Path:
+    """验证工作区根路径安全可用，并返回规范化路径。"""
+
+    normalized_root = normalize_workspace_root(root_path)
+
+    if _is_sensitive_path(normalized_root):
+        raise PathPolicyError(
+            PathPolicyErrorCode.SENSITIVE_PATH,
+            "请求路径属于受保护的敏感文件或目录。",
+        )
+
+    try:
+        if not normalized_root.exists():
+            raise PathPolicyError(
+                PathPolicyErrorCode.WORKSPACE_ROOT_NOT_FOUND,
+                "工作区根目录不存在。",
+            )
+        if not normalized_root.is_dir():
+            raise PathPolicyError(
+                PathPolicyErrorCode.WORKSPACE_ROOT_NOT_DIRECTORY,
+                "工作区根路径不是目录。",
+            )
+    except OSError as error:
+        raise PathPolicyError(
+            PathPolicyErrorCode.INVALID_PATH,
+            "路径格式无效。",
+        ) from error
+
+    return normalized_root
+
+
 def authorize_path(request: PathPolicyRequest) -> AuthorizedPath:
     """规范化请求路径，并确保结果仍位于授权工作区内。"""
 
-    workspace_root = _normalize_path(request.workspace_root)
+    workspace_root = normalize_workspace_root(request.workspace_root)
     requested_path = request.requested_path
 
     if not requested_path.is_absolute():
@@ -104,10 +151,9 @@ def authorize_path(request: PathPolicyRequest) -> AuthorizedPath:
             "请求路径超出授权工作区。",
         )
 
-    resolved_workspace_root = _resolve_path(workspace_root)
     resolved_path = _resolve_path(normalized_path)
 
-    if not _is_within(resolved_path, resolved_workspace_root):
+    if not _is_within(resolved_path, workspace_root):
         raise PathPolicyError(
             PathPolicyErrorCode.PATH_LINK_OUTSIDE_WORKSPACE,
             "请求路径通过链接指向授权工作区之外。",
@@ -120,7 +166,7 @@ def authorize_path(request: PathPolicyRequest) -> AuthorizedPath:
         )
 
     return AuthorizedPath(
-        workspace_root=resolved_workspace_root,
+        workspace_root=workspace_root,
         path=resolved_path,
     )
 

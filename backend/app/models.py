@@ -14,7 +14,7 @@ from sqlalchemy import (
     func,
 )
 
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 # Mapped 用来标记：这个类属性不是普通属性，而是需要映射到数据库字段的 ORM 属性。
 
 from .database import Base
@@ -386,6 +386,189 @@ class AgentToolCall(Base):
         nullable=True,
     )
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class OperationPlanRecord(Base):
+    """一个独立于 workflow checkpoint 的不可变操作计划记录。"""
+
+    __tablename__ = "operation_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_operation_plans_schema_version",
+        ),
+        CheckConstraint(
+            "operation_type IN ('move')",
+            name="ck_operation_plans_operation_type",
+        ),
+        CheckConstraint(
+            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'SUPERSEDED')",
+            name="ck_operation_plans_status",
+        ),
+        CheckConstraint(
+            "parent_plan_id IS NULL OR parent_plan_id <> plan_id",
+            name="ck_operation_plans_parent_not_self",
+        ),
+    )
+
+    plan_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=False,
+        index=True,
+    )
+    workflow_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        index=True,
+    )
+    operation_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="move",
+        server_default="move",
+    )
+    metadata_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="WAITING_APPROVAL",
+        server_default="WAITING_APPROVAL",
+    )
+    parent_plan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("operation_plans.plan_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    items: Mapped[list["OperationItemRecord"]] = relationship(
+        back_populates="plan",
+        cascade="all, delete-orphan",
+        order_by="OperationItemRecord.sequence_no",
+    )
+
+
+class OperationItemRecord(Base):
+    """一个计划中的文件操作及其生成时的源文件校验信息。"""
+
+    __tablename__ = "operation_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id",
+            "sequence_no",
+            name="uq_operation_items_plan_sequence",
+        ),
+        CheckConstraint(
+            "sequence_no >= 1",
+            name="ck_operation_items_sequence_positive",
+        ),
+        CheckConstraint(
+            "operation_type IN ('move')",
+            name="ck_operation_items_operation_type",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'COMPLETED', 'FAILED', 'UNDONE')",
+            name="ck_operation_items_status",
+        ),
+        CheckConstraint(
+            "source_file_id >= 1",
+            name="ck_operation_items_source_file_positive",
+        ),
+        CheckConstraint(
+            "source_size_bytes >= 0 AND source_mtime_ns >= 0",
+            name="ck_operation_items_source_metadata",
+        ),
+        CheckConstraint(
+            "(source_hash_algorithm IS NULL AND source_sha256 IS NULL) OR "
+            "(source_hash_algorithm = 'sha256' AND source_sha256 IS NOT NULL "
+            "AND length(source_sha256) = 64)",
+            name="ck_operation_items_source_hash_pair",
+        ),
+        CheckConstraint(
+            "reason_kind IN ('matched_candidate', 'manual_selection')",
+            name="ck_operation_items_reason_kind",
+        ),
+        CheckConstraint(
+            "length(reason_description) BETWEEN 1 AND 500 "
+            "AND reason_description = trim(reason_description)",
+            name="ck_operation_items_reason_description",
+        ),
+        CheckConstraint(
+            "(reason_kind = 'matched_candidate' AND reason_match_score IS NOT NULL "
+            "AND reason_match_score BETWEEN 0 AND 100) OR "
+            "(reason_kind = 'manual_selection' AND reason_match_score IS NULL)",
+            name="ck_operation_items_reason_score",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("operation_plans.plan_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence_no: Mapped[int] = mapped_column(nullable=False)
+    operation_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="move",
+        server_default="move",
+    )
+    source_file_id: Mapped[int] = mapped_column(nullable=False)
+    source_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    target_relative_path: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+    )
+    source_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    source_mtime_ns: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    source_hash_algorithm: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+    )
+    source_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    reason_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_description: Mapped[str] = mapped_column(String(500), nullable=False)
+    reason_match_score: Mapped[int | None] = mapped_column(nullable=True)
+    risks_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="PENDING",
+        server_default="PENDING",
+    )
+    plan: Mapped[OperationPlanRecord] = relationship(back_populates="items")
 
 
 class ApprovalRequest(Base):

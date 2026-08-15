@@ -198,6 +198,139 @@ def test_execution_moves_file_and_persists_history_and_index(
         engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "include_hash", "expected_error_code"),
+    [
+        (
+            "size",
+            False,
+            SafeExecutionErrorCode.FILE_CHANGED.value,
+        ),
+        (
+            "mtime",
+            False,
+            SafeExecutionErrorCode.FILE_CHANGED.value,
+        ),
+        (
+            "hash",
+            True,
+            SafeExecutionErrorCode.FILE_CHANGED.value,
+        ),
+        (
+            "deleted",
+            False,
+            SafeExecutionErrorCode.FILE_CHANGED.value,
+        ),
+        (
+            "target_conflict",
+            False,
+            SafeFileMoveErrorCode.TARGET_CONFLICT.value,
+        ),
+    ],
+    ids=[
+        "size-changed",
+        "mtime-changed",
+        "hash-changed",
+        "source-deleted",
+        "target-conflict",
+    ],
+)
+def test_execution_revalidates_file_and_target_before_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    include_hash: bool,
+    expected_error_code: str,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        include_hash=include_hash,
+    )
+    source_path = workspace_root / "inbox" / "report-7.txt"
+    target_path = workspace_root / "archive" / "final-7.md"
+    original_validate = safe_execution_module.validate_operation_plan
+    mutation_applied = False
+
+    def validate_then_mutate(
+        session: Session,
+        plan: OperationPlan,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        nonlocal mutation_applied
+        original_validate(session, plan, now=now)
+        if mutation_applied:
+            return
+        mutation_applied = True
+        expected = plan.operations[0].source_precondition
+        if mutation == "size":
+            source_path.write_bytes(b"x" * (expected.size_bytes + 1))
+            os.utime(
+                source_path,
+                ns=(source_path.stat().st_atime_ns, expected.mtime_ns),
+            )
+        elif mutation == "mtime":
+            os.utime(
+                source_path,
+                ns=(
+                    source_path.stat().st_atime_ns,
+                    expected.mtime_ns + 1_000_000,
+                ),
+            )
+        elif mutation == "hash":
+            source_path.write_bytes(b"x" * expected.size_bytes)
+            os.utime(
+                source_path,
+                ns=(source_path.stat().st_atime_ns, expected.mtime_ns),
+            )
+        elif mutation == "deleted":
+            source_path.unlink()
+        elif mutation == "target_conflict":
+            target_path.write_text("competing", encoding="utf-8")
+        else:
+            raise AssertionError(f"unknown mutation: {mutation}")
+
+    monkeypatch.setattr(
+        safe_execution_module,
+        "validate_operation_plan",
+        validate_then_mutate,
+    )
+
+    try:
+        with Session(engine) as session:
+            result = execute_safe_operation_plan(session, request, now=NOW)
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_item = find_operation_execution_items(
+                session,
+                execution.id,
+            )[0]
+            file_entry = get_file_entry_by_id(session, 3, 7)
+
+            assert mutation_applied
+            assert result.status == "FAILED"
+            assert result.items[0].status == "FAILED"
+            assert result.items[0].error_code == expected_error_code
+            assert execution.status == "FAILED"
+            assert execution_item.status == "FAILED"
+            assert execution_item.error_code == expected_error_code
+            assert execution_item.failed_at is not None
+            assert file_entry.relative_path == "inbox/report-7.txt"
+
+        if mutation == "deleted":
+            assert not source_path.exists()
+        else:
+            assert source_path.exists()
+        if mutation == "target_conflict":
+            assert target_path.read_text(encoding="utf-8") == "competing"
+        else:
+            assert not target_path.exists()
+    finally:
+        engine.dispose()
+
+
 def test_undo_restores_file_index_and_history(
     tmp_path: Path,
 ) -> None:

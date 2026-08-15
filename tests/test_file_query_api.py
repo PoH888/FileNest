@@ -38,12 +38,17 @@ def file_client(tmp_path: Path) -> Iterator[tuple[TestClient, Engine]]:
     test_engine.dispose()
 
 
-def _create_workspace(client: TestClient, name: str = "文件 API 工作区") -> int:
+def _create_workspace(
+    client: TestClient,
+    root_path: Path,
+    name: str = "文件 API 工作区",
+) -> int:
+    root_path.mkdir()
     response = client.post(
         "/api/v1/workspaces",
         json={
             "name": name,
-            "root_path": f"D:/Test/{name}",
+            "root_path": str(root_path),
         },
     )
     assert response.status_code == 201
@@ -98,9 +103,10 @@ def _add_file_entries(engine: Engine, workspace_id: int) -> int:
 
 def test_file_list_api_returns_safe_paginated_response(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, engine = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
     _add_file_entries(engine, workspace_id)
 
     response = client.get(f"/api/v1/workspaces/{workspace_id}/files")
@@ -123,9 +129,10 @@ def test_file_list_api_returns_safe_paginated_response(
 
 def test_file_search_api_filters_sorts_and_paginates(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, engine = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
     _add_file_entries(engine, workspace_id)
 
     response = client.get(
@@ -178,9 +185,10 @@ def test_file_list_api_returns_workspace_not_found(
 
 def test_file_list_api_rejects_invalid_query(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, _ = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
 
     response = client.get(
         f"/api/v1/workspaces/{workspace_id}/files",
@@ -192,9 +200,10 @@ def test_file_list_api_rejects_invalid_query(
 
 def test_file_detail_api_returns_safe_index_metadata(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, engine = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
     file_id = _add_file_entries(engine, workspace_id)
 
     response = client.get(
@@ -216,10 +225,19 @@ def test_file_detail_api_returns_safe_index_metadata(
 
 def test_file_detail_api_hides_cross_workspace_file(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, engine = file_client
-    first_workspace_id = _create_workspace(client, "第一个详情工作区")
-    second_workspace_id = _create_workspace(client, "第二个详情工作区")
+    first_workspace_id = _create_workspace(
+        client,
+        tmp_path / "first-workspace",
+        "第一个详情工作区",
+    )
+    second_workspace_id = _create_workspace(
+        client,
+        tmp_path / "second-workspace",
+        "第二个详情工作区",
+    )
     file_id = _add_file_entries(engine, first_workspace_id)
 
     response = client.get(
@@ -237,9 +255,10 @@ def test_file_detail_api_hides_cross_workspace_file(
 
 def test_file_detail_api_returns_file_not_found(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, _ = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
 
     response = client.get(
         f"/api/v1/workspaces/{workspace_id}/files/999"
@@ -262,9 +281,10 @@ def test_file_detail_api_returns_workspace_not_found(
 
 def test_file_detail_api_rejects_non_integer_file_id(
     file_client: tuple[TestClient, Engine],
+    tmp_path: Path,
 ) -> None:
     client, _ = file_client
-    workspace_id = _create_workspace(client)
+    workspace_id = _create_workspace(client, tmp_path / "workspace")
 
     response = client.get(
         f"/api/v1/workspaces/{workspace_id}/files/not-an-integer"

@@ -12,6 +12,7 @@ from .agent_api import router as agent_router
 from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
 from .database import check_database_connection, get_session
+from .path_policy import PathPolicyError
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
 
 from .services import (
@@ -115,6 +116,11 @@ def create_workspace(
                 "code": "workspace_path_conflict",
                 "message": "工作区路径已存在。",
             },
+        ) from error
+    except PathPolicyError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=error.as_detail(),
         ) from error
 
 # 查询工作区列表

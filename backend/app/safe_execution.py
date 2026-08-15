@@ -229,6 +229,16 @@ def execute_safe_operation_plan(
     for operation, execution_item_id in operation_items:
         expected_hash = operation.source_precondition.content_hash
         try:
+            _revalidate_file_before_move(
+                adapter,
+                source_path=Path(operation.source_relative_path),
+                target_path=Path(operation.target_relative_path),
+                expected_size_bytes=operation.source_precondition.size_bytes,
+                expected_mtime_ns=operation.source_precondition.mtime_ns,
+                expected_sha256=(
+                    expected_hash.digest if expected_hash is not None else None
+                ),
+            )
             moved_path = mover.move(
                 Path(operation.source_relative_path),
                 Path(operation.target_relative_path),
@@ -251,6 +261,26 @@ def execute_safe_operation_plan(
                     "记录单项失败前执行明细已经变化",
                 ) from error
             _commit_completion(session, "无法保存单项执行失败证据")
+            failed_count += 1
+            continue
+        except SafeExecutionError as error:
+            if error.code != SafeExecutionErrorCode.FILE_CHANGED:
+                raise
+            item_updated = compare_and_set_operation_execution_item_status(
+                session,
+                execution_item_id,
+                "PENDING",
+                next_status="FAILED",
+                error_code=error.code.value,
+                failed_at=current_time,
+            )
+            if not item_updated:
+                session.rollback()
+                raise SafeExecutionError(
+                    SafeExecutionErrorCode.STATE_CHANGED,
+                    "记录单项文件变化前执行明细已经变化",
+                ) from error
+            _commit_completion(session, "无法保存单项文件变化失败证据")
             failed_count += 1
             continue
 
@@ -407,6 +437,14 @@ def retry_failed_operation_execution(
     mover = SafeFileMover(adapter)
     for item in failed_items:
         try:
+            _revalidate_file_before_move(
+                adapter,
+                source_path=Path(item.before_relative_path),
+                target_path=Path(item.after_relative_path),
+                expected_size_bytes=item.before_size_bytes,
+                expected_mtime_ns=item.before_mtime_ns,
+                expected_sha256=item.before_sha256,
+            )
             moved_path = mover.move(
                 Path(item.before_relative_path),
                 Path(item.after_relative_path),
@@ -429,6 +467,25 @@ def retry_failed_operation_execution(
                     "记录重试失败前执行明细已经变化",
                 ) from error
             _commit_completion(session, "无法保存失败项重试失败证据")
+            continue
+        except SafeExecutionError as error:
+            if error.code != SafeExecutionErrorCode.FILE_CHANGED:
+                raise
+            item_updated = compare_and_set_operation_execution_item_status(
+                session,
+                item.id,
+                "PENDING",
+                next_status="FAILED",
+                error_code=error.code.value,
+                failed_at=current_time,
+            )
+            if not item_updated:
+                session.rollback()
+                raise SafeExecutionError(
+                    SafeExecutionErrorCode.STATE_CHANGED,
+                    "记录重试文件变化失败前执行明细已经变化",
+                ) from error
+            _commit_completion(session, "无法保存重试文件变化失败证据")
             continue
 
         after_metadata = _get_required_metadata(
@@ -1211,6 +1268,50 @@ def _interrupted_path_action(
             message,
         )
     return "move" if source_exists else "reconcile"
+
+
+def _revalidate_file_before_move(
+    adapter: FileSystemAdapter,
+    *,
+    source_path: Path,
+    target_path: Path,
+    expected_size_bytes: int,
+    expected_mtime_ns: int,
+    expected_sha256: str | None,
+) -> None:
+    """在真实移动前重新确认源文件证据和目标状态。"""
+
+    current_metadata = _get_required_metadata(
+        adapter,
+        source_path,
+        "执行前源文件不可用",
+    )
+    if (
+        current_metadata.size_bytes != expected_size_bytes
+        or current_metadata.mtime_ns != expected_mtime_ns
+    ):
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.FILE_CHANGED,
+            "执行前源文件与 before 证据不一致",
+        )
+    _verify_optional_hash(adapter, source_path, expected_sha256)
+
+    try:
+        if not adapter.is_directory(target_path.parent):
+            raise SafeFileMoveError(
+                SafeFileMoveErrorCode.TARGET_DIRECTORY_UNAVAILABLE,
+                "执行前目标目录不存在或不是目录",
+            )
+        if adapter.path_exists(target_path):
+            raise SafeFileMoveError(
+                SafeFileMoveErrorCode.TARGET_CONFLICT,
+                "执行前目标路径已经被占用",
+            )
+    except OSError as error:
+        raise SafeFileMoveError(
+            SafeFileMoveErrorCode.TARGET_DIRECTORY_UNAVAILABLE,
+            "执行前目标目录不可用",
+        ) from error
 
 
 def _validate_recovery_file(

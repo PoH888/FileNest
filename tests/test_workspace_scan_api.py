@@ -186,6 +186,7 @@ def test_unavailable_workspace_does_not_delete_existing_index(
 ) -> None:
     client, engine = scan_client
     missing_root = tmp_path / "missing-workspace"
+    missing_root.mkdir()
     create_response = client.post(
         "/api/v1/workspaces",
         json={
@@ -194,6 +195,7 @@ def test_unavailable_workspace_does_not_delete_existing_index(
         },
     )
     workspace_id = create_response.json()["id"]
+    missing_root.rmdir()
 
     with Session(engine) as session:
         session.add(
