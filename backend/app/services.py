@@ -9,23 +9,39 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+import json
 import os
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .filesystem_adapter import FileSystemAdapter
-from .models import ApprovalAuditEvent, ApprovalRequest, FileEntry, Workspace
+from .models import (
+    ApprovalAuditEvent,
+    ApprovalRequest,
+    FileEntry,
+    OperationItemRecord,
+    OperationPlanRecord,
+    Workspace,
+)
 from .operation_preview import (
     OperationPreviewItem,
     OperationPreviewRequest,
     OperationPreviewResponse,
     rank_preview_candidates,
 )
-from .operation_plan import OperationPlan
+from .operation_plan import (
+    ContentHash,
+    FilePrecondition,
+    OperationPlan,
+    OperationPlanItem,
+    OperationReason,
+    OperationRisk,
+)
 from .path_policy import (
     PathPolicyError,
     normalize_workspace_root,
@@ -37,15 +53,20 @@ from .repositories import (
     add_workspace,
     ApprovalAction,
     ApprovalStatus,
+    compare_and_set_operation_plan_status,
     compare_and_set_approval_request,
     count_file_entries,
     delete_file_entry,
     FileEntrySortField,
     find_file_entries,
+    find_operation_plan_history,
+    find_operation_plan_items,
     find_workspaces,
     get_file_entry_by_id,
     get_approval_request_by_workflow_id,
+    get_operation_plan_by_id,
     get_workspace_by_id,
+    OperationPlanStatus,
     SortOrder,
 )
 from .workspace_scanner import ScannedFile, scan_workspace_files
@@ -93,6 +114,10 @@ class OperationPlanExpiredError(Exception):
 
 class OperationPlanSourceChangedError(Exception):
     """计划生成后源文件已经消失或内容状态发生变化。"""
+
+
+class OperationPlanPersistenceError(RuntimeError):
+    """持久化计划无法安全还原为已验证的业务契约。"""
 
 
 class ApprovalTransitionErrorCode(StrEnum):
@@ -167,6 +192,123 @@ _FILE_SORT_FIELDS: dict[str, FileEntrySortField] = {
 OPERATION_PLAN_MAX_AGE = timedelta(minutes=15)
 
 
+def _restore_operation_plan_item(item: OperationItemRecord) -> OperationPlanItem:
+    """将一条持久化明细重新验证为业务契约。"""
+
+    raw_risks = json.loads(item.risks_json)
+    if not isinstance(raw_risks, list):
+        raise ValueError("risks_json must contain a list")
+
+    content_hash = None
+    if (
+        item.source_hash_algorithm is not None
+        or item.source_sha256 is not None
+    ):
+        if (
+            item.source_hash_algorithm is None
+            or item.source_sha256 is None
+        ):
+            raise ValueError("source hash fields must be provided together")
+        content_hash = ContentHash(
+            algorithm=item.source_hash_algorithm,
+            digest=item.source_sha256,
+        )
+
+    return OperationPlanItem(
+        operation_type=item.operation_type,
+        source_file_id=item.source_file_id,
+        source_relative_path=item.source_relative_path,
+        target_relative_path=item.target_relative_path,
+        source_precondition=FilePrecondition(
+            size_bytes=item.source_size_bytes,
+            mtime_ns=item.source_mtime_ns,
+            content_hash=content_hash,
+        ),
+        reason=OperationReason(
+            kind=item.reason_kind,
+            description=item.reason_description,
+            match_score=item.reason_match_score,
+        ),
+        risks=tuple(
+            OperationRisk.model_validate(raw_risk)
+            for raw_risk in raw_risks
+        ),
+    )
+
+
+def _restore_operation_plan(record: OperationPlanRecord) -> OperationPlan:
+    """将一条持久化计划及其明细重新验证为业务契约。"""
+
+    created_at = record.created_at
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    else:
+        created_at = created_at.astimezone(timezone.utc)
+
+    return OperationPlan(
+        schema_version=record.schema_version,
+        plan_id=UUID(record.plan_id),
+        workspace_id=record.workspace_id,
+        created_at=created_at,
+        operations=tuple(
+            _restore_operation_plan_item(item)
+            for item in sorted(record.items, key=lambda current: current.sequence_no)
+        ),
+    )
+
+
+def get_operation_plan(
+    session: Session,
+    plan_id: UUID | str,
+    *,
+    workflow_id: UUID | str | None = None,
+) -> OperationPlan | None:
+    """从业务库读取并严格还原完整的操作计划契约。"""
+
+    record = get_operation_plan_by_id(session, str(plan_id))
+    if record is None or (
+        workflow_id is not None and record.workflow_id != str(workflow_id)
+    ):
+        return None
+
+    try:
+        return _restore_operation_plan(record)
+    except (TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        raise OperationPlanPersistenceError(
+            f"操作计划 {record.plan_id} 无法安全还原"
+        ) from error
+
+
+def list_operation_plan_items(
+    session: Session,
+    plan_id: UUID | str,
+) -> list[OperationPlanItem]:
+    """读取并严格还原一个计划的全部操作明细。"""
+
+    items = find_operation_plan_items(session, str(plan_id))
+    try:
+        return [_restore_operation_plan_item(item) for item in items]
+    except (TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        raise OperationPlanPersistenceError(
+            f"操作计划 {plan_id} 的明细无法安全还原"
+        ) from error
+
+
+def list_operation_plan_history(
+    session: Session,
+    workflow_id: UUID | str,
+) -> list[OperationPlan]:
+    """读取并严格还原一个工作流关联的全部计划版本。"""
+
+    records = find_operation_plan_history(session, str(workflow_id))
+    try:
+        return [_restore_operation_plan(record) for record in records]
+    except (TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        raise OperationPlanPersistenceError(
+            f"工作流 {workflow_id} 的操作计划历史无法安全还原"
+        ) from error
+
+
 def require_approved_operation_plan(
     session: Session,
     workflow_id: UUID,
@@ -192,6 +334,41 @@ def require_approved_operation_plan(
         raise OperationPlanApprovalError(
             OperationPlanApprovalErrorCode.PLAN_MISMATCH,
             "已批准计划与当前操作计划不一致",
+        )
+
+    persisted_record = get_operation_plan_by_id(
+        session,
+        approval.plan_id,
+    )
+    if persisted_record is None:
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.PLAN_MISMATCH,
+            "已批准的业务操作计划不存在",
+        )
+    session.expire(persisted_record)
+    if (
+        persisted_record.workflow_id != str(workflow_id)
+        or persisted_record.status != "APPROVED"
+    ):
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.PLAN_MISMATCH,
+            "已批准的业务操作计划状态或归属不一致",
+        )
+    try:
+        persisted_plan = get_operation_plan(
+            session,
+            approval.plan_id,
+            workflow_id=workflow_id,
+        )
+    except OperationPlanPersistenceError as error:
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.PLAN_MISMATCH,
+            "已批准的业务操作计划无法还原",
+        ) from error
+    if persisted_plan is None or persisted_plan != plan:
+        raise OperationPlanApprovalError(
+            OperationPlanApprovalErrorCode.PLAN_MISMATCH,
+            "业务库中的操作计划与当前操作计划不一致",
         )
 
     return approval
@@ -329,6 +506,24 @@ def _transition_approval_request(
                 "审批状态在提交前已经变化",
             )
 
+        if next_plan_id == expected_plan_id:
+            _sync_operation_plan_status(
+                session,
+                expected_plan_key,
+                next_status,
+            )
+        else:
+            _sync_operation_plan_status(
+                session,
+                expected_plan_key,
+                "SUPERSEDED",
+            )
+            _sync_operation_plan_status(
+                session,
+                str(next_plan_id),
+                "WAITING_APPROVAL",
+            )
+
         add_approval_audit_event(
             session,
             ApprovalAuditEvent(
@@ -352,6 +547,30 @@ def _transition_approval_request(
         raise
 
     return approval
+
+
+def _sync_operation_plan_status(
+    session: Session,
+    plan_id: str,
+    next_status: OperationPlanStatus,
+) -> None:
+    """在存在独立业务记录时同步审批产生的计划状态。"""
+
+    record = get_operation_plan_by_id(session, plan_id)
+    if record is None:
+        # 兼容迁移前仅有 ApprovalRequest 的历史记录；新建流程始终会有 Plan。
+        return
+    if not compare_and_set_operation_plan_status(
+        session,
+        plan_id,
+        "WAITING_APPROVAL",
+        next_status=next_status,
+    ):
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.STATE_CHANGED,
+            "操作计划状态在提交前已经变化",
+        )
+    session.expire(record, ["status"])
 
 
 def _is_repeated_approval(

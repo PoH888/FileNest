@@ -17,6 +17,7 @@ from backend.app.operation_plan import (
     OperationPlanItem,
     OperationReason,
 )
+from backend.app.organization_planning import build_operation_plan_record
 from backend.app.safe_execution import (
     SafeExecutionRequest,
     validate_safe_execution_request,
@@ -184,6 +185,13 @@ def test_matching_approval_validates_current_state_without_writing_disk(
                     ),
                 ]
             )
+            session.commit()
+            persisted_plan = build_operation_plan_record(
+                plan,
+                workflow_id=WORKFLOW_ID,
+            )
+            persisted_plan.status = "APPROVED"
+            session.add(persisted_plan)
             session.commit()
             _add_approval(session, status="APPROVED")
 

@@ -25,6 +25,7 @@ from backend.app.operation_plan import (
     OperationPlanItem,
     OperationReason,
 )
+from backend.app.organization_planning import build_operation_plan_record
 from backend.app.repositories import (
     find_operation_execution_items,
     get_file_entry_by_id,
@@ -123,6 +124,18 @@ def _approved_request(
                 )
             )
 
+        plan = OperationPlan(
+            plan_id=PLAN_ID,
+            workspace_id=3,
+            created_at=NOW,
+            operations=operations,
+        )
+        persisted_plan = build_operation_plan_record(
+            plan,
+            workflow_id=WORKFLOW_ID,
+        )
+        persisted_plan.status = "APPROVED"
+        session.add(persisted_plan)
         session.add(
             ApprovalRequest(
                 workflow_id=str(WORKFLOW_ID),
@@ -132,12 +145,6 @@ def _approved_request(
         )
         session.commit()
 
-    plan = OperationPlan(
-        plan_id=PLAN_ID,
-        workspace_id=3,
-        created_at=NOW,
-        operations=operations,
-    )
     return (
         engine,
         workspace_root,

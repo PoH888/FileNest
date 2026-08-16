@@ -21,6 +21,7 @@ from backend.app.operation_plan import (
     OperationReason,
 )
 from backend.app.operation_preview import OperationPreviewRequest
+from backend.app.organization_planning import build_operation_plan_record
 from backend.app.repositories import (
     find_operation_execution_items,
     get_file_entry_by_id,
@@ -33,7 +34,7 @@ from backend.app.safe_execution import (
     undo_safe_operation_execution,
 )
 from backend.app.services import (
-    FileEntryNotFoundError,
+    OperationPlanApprovalError,
     OperationPlanSourceChangedError,
     approve_operation_plan,
     edit_operation_plan,
@@ -141,6 +142,12 @@ def _build_waiting_scenario(tmp_path: Path) -> _WaitingScenario:
                     ),
                 ),
             ),
+        )
+        session.add(
+            build_operation_plan_record(
+                plan,
+                workflow_id=WORKFLOW_ID,
+            )
         )
         session.add(
             ApprovalRequest(
@@ -255,6 +262,12 @@ def test_query_plan_approve_execute_and_undo_real_file_chain(
                         ),
                     ),
                 ),
+            )
+            session.add(
+                build_operation_plan_record(
+                    plan,
+                    workflow_id=WORKFLOW_ID,
+                )
             )
             approval = ApprovalRequest(
                 workflow_id=str(WORKFLOW_ID),
@@ -381,7 +394,7 @@ def test_approved_cross_workspace_plan_cannot_execute(
                 cross_workspace_plan.plan_id,
             )
 
-            with pytest.raises(FileEntryNotFoundError):
+            with pytest.raises(OperationPlanApprovalError):
                 execute_safe_operation_plan(
                     session,
                     SafeExecutionRequest(
@@ -608,6 +621,14 @@ def test_batch_partial_failure_compensates_only_completed_move(
                 created_at=scenario.plan_created_at,
                 operations=tuple(operations),
             )
+            session.add(
+                build_operation_plan_record(
+                    batch_plan,
+                    workflow_id=WORKFLOW_ID,
+                    parent_plan_id=PLAN_ID,
+                )
+            )
+            session.flush()
             edited = edit_operation_plan(
                 session,
                 WORKFLOW_ID,

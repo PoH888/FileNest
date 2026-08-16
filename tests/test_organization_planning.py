@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 
 from backend.app.approval_recovery import recover_waiting_approval_tasks
 from backend.app.database import Base
-from backend.app.models import ApprovalRequest, FileEntry, Workspace
+from backend.app.models import (
+    ApprovalRequest,
+    FileEntry,
+    OperationPlanRecord,
+    Workspace,
+)
 from backend.app.organization_planning import (
     CreateApprovalWorkflowRequest,
     EditOrganizationPlanRequest,
@@ -109,12 +114,24 @@ def test_create_waiting_workflow_persists_safe_plan_without_disk_mutation(
             )
 
         approval = session.scalar(select(ApprovalRequest))
+        plan_record = session.get(OperationPlanRecord, str(PLAN_ID))
         operation = created.workflow.operation_plan.operations[0]
         assert approval is not None
+        assert plan_record is not None
         assert approval.id == created.approval_id
         assert approval.workflow_id == str(WORKFLOW_ID)
         assert approval.plan_id == str(PLAN_ID)
         assert approval.status == "WAITING_APPROVAL"
+        assert plan_record.workflow_id == str(WORKFLOW_ID)
+        assert plan_record.workspace_id == workspace_id
+        assert plan_record.status == "WAITING_APPROVAL"
+        assert len(plan_record.items) == 1
+        assert plan_record.items[0].source_file_id == file_id
+        assert plan_record.items[0].source_sha256 == (
+            operation.source_precondition.content_hash.digest
+            if operation.source_precondition.content_hash is not None
+            else None
+        )
         assert created.workflow.status == "waiting"
         assert created.workflow.wait_reason_code == "human_approval_required"
         assert operation.source_file_id == file_id
@@ -172,6 +189,7 @@ def test_checkpoint_failure_rolls_back_approval_without_disk_mutation(
             )
 
         assert session.scalar(select(ApprovalRequest)) is None
+        assert session.scalar(select(OperationPlanRecord)) is None
         assert _disk_snapshot(workspace_root) == before
 
 

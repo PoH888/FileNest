@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+from uuid import UUID
 
 import pytest
 from alembic import command
@@ -11,15 +12,26 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import Base
 from backend.app.models import (
+    ApprovalRequest,
     OperationItemRecord,
     OperationPlanRecord,
     Workspace,
+)
+from backend.app.services import (
+    OperationPlanApprovalError,
+    OperationPlanApprovalErrorCode,
+    OperationPlanPersistenceError,
+    get_operation_plan,
+    list_operation_plan_history,
+    list_operation_plan_items,
+    require_approved_operation_plan,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_CONFIG_PATH = PROJECT_ROOT / "backend" / "alembic.ini"
 PLAN_ID = "a5d0c4af-142e-47d7-bb6d-2b7f8bb9cf20"
+HISTORY_PLAN_ID = "b6e1d5bf-253f-58e8-cc7e-3c8d9cc0d131"
 WORKFLOW_ID = "8c321c8d-2904-46f2-a29a-7d77f6e4b0b8"
 
 
@@ -62,7 +74,9 @@ def _plan() -> OperationPlanRecord:
     )
 
 
-def test_plan_and_items_survive_session_restart(engine: Engine) -> None:
+def test_plan_and_items_survive_session_restart_without_checkpoint(
+    engine: Engine,
+) -> None:
     with Session(engine) as session:
         workspace = Workspace(
             name="持久化测试工作区",
@@ -100,6 +114,135 @@ def test_plan_and_items_survive_session_restart(engine: Engine) -> None:
         assert restored.items[0].source_sha256 == "a" * 64
         assert restored.items[0].reason_match_score == 95
         assert restored.items[0].status == "PENDING"
+
+        restored_contract = get_operation_plan(restarted_session, PLAN_ID)
+        assert restored_contract is not None
+        assert restored_contract.plan_id == UUID(PLAN_ID)
+        assert restored_contract.workspace_id == workspace_id
+        assert restored_contract.operations[0].target_relative_path == (
+            "reports/report.txt"
+        )
+        assert restored_contract.operations[0].source_precondition.content_hash is not None
+
+
+def test_corrupt_persisted_plan_fails_closed(engine: Engine) -> None:
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="损坏数据测试工作区",
+            root_path="C:/filenest-operation-plan-corrupt",
+        )
+        session.add(workspace)
+        session.flush()
+
+        plan = _plan()
+        plan.workspace_id = workspace.id
+        plan.status = "APPROVED"
+        session.add(plan)
+        session.add(
+            ApprovalRequest(
+                workflow_id=WORKFLOW_ID,
+                plan_id=PLAN_ID,
+                status="APPROVED",
+            )
+        )
+        session.commit()
+
+        valid_contract = get_operation_plan(session, PLAN_ID)
+        assert valid_contract is not None
+        persisted = session.get(OperationPlanRecord, PLAN_ID)
+        assert persisted is not None
+        persisted.items[0].risks_json = '{"unexpected":"object"}'
+        session.commit()
+
+    with Session(engine) as restarted_session:
+        with pytest.raises(OperationPlanPersistenceError):
+            get_operation_plan(restarted_session, PLAN_ID)
+        with pytest.raises(OperationPlanApprovalError) as error:
+            require_approved_operation_plan(
+                restarted_session,
+                UUID(WORKFLOW_ID),
+                valid_contract,
+            )
+        assert error.value.code == OperationPlanApprovalErrorCode.PLAN_MISMATCH
+
+
+def test_approved_guard_rejects_missing_business_plan(engine: Engine) -> None:
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="审批守卫测试工作区",
+            root_path="C:/filenest-operation-plan-guard",
+        )
+        session.add(workspace)
+        session.flush()
+
+        plan = _plan()
+        plan.workspace_id = workspace.id
+        plan.status = "APPROVED"
+        session.add(plan)
+        session.add(
+            ApprovalRequest(
+                workflow_id=WORKFLOW_ID,
+                plan_id=PLAN_ID,
+                status="APPROVED",
+            )
+        )
+        session.commit()
+
+        valid_contract = get_operation_plan(session, PLAN_ID)
+        assert valid_contract is not None
+        session.delete(session.get(OperationPlanRecord, PLAN_ID))
+        session.commit()
+
+        with pytest.raises(OperationPlanApprovalError) as error:
+            require_approved_operation_plan(
+                session,
+                UUID(WORKFLOW_ID),
+                valid_contract,
+            )
+
+    assert error.value.code == OperationPlanApprovalErrorCode.PLAN_MISMATCH
+
+
+def test_service_lists_items_and_history_after_session_restart(
+    engine: Engine,
+) -> None:
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="计划历史测试工作区",
+            root_path="C:/filenest-operation-plan-history",
+        )
+        session.add(workspace)
+        session.flush()
+
+        first_plan = _plan()
+        first_plan.workspace_id = workspace.id
+        second_plan = _plan()
+        second_plan.plan_id = HISTORY_PLAN_ID
+        second_plan.workspace_id = workspace.id
+        second_plan.parent_plan_id = PLAN_ID
+        second_plan.created_at = datetime(
+            2026,
+            9,
+            2,
+            10,
+            5,
+            tzinfo=timezone.utc,
+        )
+        session.add_all([first_plan, second_plan])
+        session.commit()
+
+    with Session(engine) as restarted_session:
+        items = list_operation_plan_items(restarted_session, PLAN_ID)
+        history = list_operation_plan_history(restarted_session, WORKFLOW_ID)
+
+    assert [item.target_relative_path for item in items] == [
+        "reports/report.txt"
+    ]
+    assert [plan.plan_id for plan in history] == [
+        UUID(PLAN_ID),
+        UUID(HISTORY_PLAN_ID),
+    ]
+    assert history[1].operations[0].source_relative_path == "inbox/report.txt"
 
 
 def test_plan_schema_has_relationship_indexes_and_constraints(

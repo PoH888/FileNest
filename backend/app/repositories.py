@@ -20,6 +20,8 @@ from .models import (
     FileEntry,
     OperationExecution,
     OperationExecutionItem,
+    OperationItemRecord,
+    OperationPlanRecord,
     Workspace,
 )
 
@@ -46,6 +48,12 @@ OperationExecutionItemStatus = Literal[
     "UNDOING",
     "UNDONE",
     "FAILED",
+]
+OperationPlanStatus = Literal[
+    "WAITING_APPROVAL",
+    "APPROVED",
+    "REJECTED",
+    "SUPERSEDED",
 ]
 
 _FILE_ENTRY_SORT_COLUMNS = {
@@ -330,6 +338,79 @@ def add_approval_request(
     """将待审批业务状态加入当前事务，提交时机由 Service 决定。"""
 
     session.add(approval_request)
+
+
+def add_operation_plan(
+    session: Session,
+    operation_plan: OperationPlanRecord,
+) -> None:
+    """将完整操作计划及其明细加入当前事务，提交时机由 Service 决定。"""
+
+    session.add(operation_plan)
+
+
+def get_operation_plan_by_id(
+    session: Session,
+    plan_id: str,
+) -> OperationPlanRecord | None:
+    """按 plan_id 读取独立持久化的完整计划记录。"""
+
+    return session.get(OperationPlanRecord, plan_id)
+
+
+def find_operation_plan_items(
+    session: Session,
+    plan_id: str,
+) -> list[OperationItemRecord]:
+    """按计划顺序读取独立持久化的所有操作明细。"""
+
+    statement = (
+        select(OperationItemRecord)
+        .where(OperationItemRecord.plan_id == plan_id)
+        .order_by(OperationItemRecord.sequence_no.asc())
+    )
+    return list(session.scalars(statement).all())
+
+
+def find_operation_plan_history(
+    session: Session,
+    workflow_id: str,
+) -> list[OperationPlanRecord]:
+    """按创建时间稳定读取一个工作流关联的全部计划版本。"""
+
+    statement = (
+        select(OperationPlanRecord)
+        .where(OperationPlanRecord.workflow_id == workflow_id)
+        .order_by(
+            OperationPlanRecord.created_at.asc(),
+            OperationPlanRecord.plan_id.asc(),
+        )
+    )
+    return list(session.scalars(statement).all())
+
+
+def compare_and_set_operation_plan_status(
+    session: Session,
+    plan_id: str,
+    expected_status: OperationPlanStatus,
+    *,
+    next_status: OperationPlanStatus,
+) -> bool:
+    """仅在计划仍处于预期状态时原子更新其当前业务状态。"""
+
+    statement = (
+        update(OperationPlanRecord)
+        .where(
+            OperationPlanRecord.plan_id == plan_id,
+            OperationPlanRecord.status == expected_status,
+        )
+        .values(status=next_status)
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
 
 
 def find_waiting_approval_requests(

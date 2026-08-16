@@ -44,7 +44,9 @@ from .services import (
     OperationPlanTargetConflictError,
     OperationPlanTargetUnavailableError,
     OperationPreviewPathUnavailableError,
+    OperationPlanPersistenceError,
     WorkspaceNotFoundError,
+    get_operation_plan,
 )
 from .workflow import WorkflowState, WorkflowStatus, WorkflowTransitionError
 from .workflow_graph import (
@@ -176,9 +178,26 @@ def _workflow_response(
             },
         ) from error
 
+    try:
+        operation_plan = get_operation_plan(
+            session,
+            approval.plan_id,
+            workflow_id=workflow_id,
+        )
+    except OperationPlanPersistenceError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_state_invalid",
+                "message": "业务操作计划当前不可用。",
+            },
+        ) from error
+
     if (
         workflow.workflow_id != workflow_id
         or str(workflow.operation_plan.plan_id) != approval.plan_id
+        or operation_plan is None
+        or operation_plan.plan_id != workflow.operation_plan.plan_id
         or approval.status not in {
             "WAITING_APPROVAL",
             "APPROVED",
@@ -198,7 +217,7 @@ def _workflow_response(
         status=workflow.status,
         revision=workflow.revision,
         wait_reason_code=workflow.wait_reason_code,
-        operation_plan=workflow.operation_plan,
+        operation_plan=operation_plan,
         approval_status=approval.status,
     )
 

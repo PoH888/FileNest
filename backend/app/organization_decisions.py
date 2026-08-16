@@ -11,11 +11,16 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .operation_plan import OperationPlan
-from .repositories import get_approval_request_by_workflow_id
 from .organization_planning import (
     EditOrganizationPlanRequest,
+    build_operation_plan_record,
     build_organization_plan,
     merge_edit_request,
+)
+from .repositories import (
+    add_operation_plan,
+    get_approval_request_by_workflow_id,
+    get_operation_plan_by_id,
 )
 from .services import (
     approve_operation_plan,
@@ -190,12 +195,25 @@ def apply_organization_plan_edit(
             now=now,
             plan_id_factory=plan_id_factory,
         )
-        _checkpoint_replacement(
-            graph,
-            workflow,
-            replacement_plan,
-        )
         replacement_plan_id = replacement_plan.plan_id
+        try:
+            add_operation_plan(
+                session,
+                build_operation_plan_record(
+                    replacement_plan,
+                    workflow_id=workflow_id,
+                    parent_plan_id=workflow.operation_plan.plan_id,
+                ),
+            )
+            session.flush()
+            _checkpoint_replacement(
+                graph,
+                workflow,
+                replacement_plan,
+            )
+        except Exception:
+            session.rollback()
+            raise
     else:
         # graph 已经写入替代计划但审批提交失败时，沿用 checkpoint 中的完整计划。
         if approval.plan_id != str(expected_plan_id):
@@ -208,6 +226,20 @@ def apply_organization_plan_edit(
             request,
         )
         replacement_plan_id = workflow.operation_plan.plan_id
+        if get_operation_plan_by_id(session, str(replacement_plan_id)) is None:
+            try:
+                add_operation_plan(
+                    session,
+                    build_operation_plan_record(
+                        workflow.operation_plan,
+                        workflow_id=workflow_id,
+                        parent_plan_id=expected_plan_id,
+                    ),
+                )
+                session.flush()
+            except Exception:
+                session.rollback()
+                raise
 
     edit_operation_plan(
         session,

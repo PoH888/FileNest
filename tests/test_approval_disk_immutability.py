@@ -8,13 +8,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend.app.database import Base
-from backend.app.models import ApprovalRequest
+from backend.app.models import ApprovalRequest, Workspace
 from backend.app.operation_plan import (
     FilePrecondition,
     OperationPlan,
     OperationPlanItem,
     OperationReason,
 )
+from backend.app.organization_planning import build_operation_plan_record
 from backend.app.services import (
     OperationPlanApprovalError,
     OperationPlanApprovalErrorCode,
@@ -198,6 +199,21 @@ def test_matching_approval_only_authorizes_without_writing_disk(
 
     try:
         with Session(engine) as session:
+            session.add(
+                Workspace(
+                    id=3,
+                    name="审批守卫测试工作区",
+                    root_path=str(workspace_root),
+                )
+            )
+            session.flush()
+            persisted_plan = build_operation_plan_record(
+                plan,
+                workflow_id=WORKFLOW_ID,
+            )
+            persisted_plan.status = "APPROVED"
+            session.add(persisted_plan)
+            session.flush()
             _add_approval(session, status="APPROVED")
             before = _snapshot_workspace(workspace_root)
 

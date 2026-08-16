@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.database import Base, get_session
 from backend.app.main import app
-from backend.app.models import FileEntry, Workspace
-from backend.app.services import validate_operation_plan
+from backend.app.models import FileEntry, OperationPlanRecord, Workspace
+from backend.app.services import get_operation_plan, validate_operation_plan
 from backend.app.workflow_graph import open_checkpointed_workflow_graph
 from backend.app.workflow_runtime import get_workflow_graph
 
@@ -116,6 +116,124 @@ def test_create_and_get_organization_workflow(
 
     assert get_response.status_code == 200
     assert get_response.json() == created
+
+
+def test_get_workflow_reads_complete_plan_from_business_database(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "business-plan-source-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+
+    with session_factory() as session:
+        persisted = session.get(
+            OperationPlanRecord,
+            created["operation_plan"]["plan_id"],
+        )
+        assert persisted is not None
+        persisted.items[0].target_relative_path = (
+            "reports/quarterly/from-business-db.txt"
+        )
+        session.commit()
+
+    response = client.get(f"/api/v1/workflows/{created['workflow_id']}")
+
+    assert response.status_code == 200
+    assert response.json()["operation_plan"]["operations"][0][
+        "target_relative_path"
+    ] == "reports/quarterly/from-business-db.txt"
+
+
+def test_get_workflow_rejects_missing_business_plan(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "missing-business-plan-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+
+    with session_factory() as session:
+        persisted = session.get(
+            OperationPlanRecord,
+            created["operation_plan"]["plan_id"],
+        )
+        assert persisted is not None
+        session.delete(persisted)
+        session.commit()
+
+    response = client.get(f"/api/v1/workflows/{created['workflow_id']}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "workflow_state_conflict"
+
+
+def test_business_plan_survives_deleted_checkpoint(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "checkpoint-loss-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+
+    checkpoint_path = tmp_path / "workflow-checkpoints.sqlite"
+    assert checkpoint_path.is_file()
+    checkpoint_path.unlink()
+
+    with session_factory() as session:
+        restored = get_operation_plan(
+            session,
+            created["operation_plan"]["plan_id"],
+            workflow_id=created["workflow_id"],
+        )
+
+    assert restored is not None
+    assert restored.plan_id == UUID(created["operation_plan"]["plan_id"])
+    assert restored.operations[0].target_relative_path == (
+        "reports/quarterly/quarterly-report.txt"
+    )
 
 
 def test_get_unknown_organization_workflow_returns_safe_404(

@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import json
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from .filesystem_adapter import FileSystemAdapter
-from .models import ApprovalRequest
+from .models import ApprovalRequest, OperationItemRecord, OperationPlanRecord
 from .operation_plan import (
     ContentHash,
     FilePrecondition,
@@ -19,7 +20,7 @@ from .operation_plan import (
     OperationReason,
 )
 from .operation_preview import OperationPreviewRequest
-from .repositories import add_approval_request
+from .repositories import add_approval_request, add_operation_plan
 from .services import (
     OperationPreviewPathUnavailableError,
     generate_operation_preview,
@@ -101,6 +102,64 @@ class CreatedApprovalWorkflow(BaseModel):
 
     approval_id: int = Field(ge=1)
     workflow: WorkflowState
+
+
+def build_operation_plan_record(
+    plan: OperationPlan,
+    *,
+    workflow_id: UUID,
+    parent_plan_id: UUID | None = None,
+) -> OperationPlanRecord:
+    """将已验证的计划契约转换为可在业务库中保存的完整记录。"""
+
+    return OperationPlanRecord(
+        plan_id=str(plan.plan_id),
+        schema_version=plan.schema_version,
+        workspace_id=plan.workspace_id,
+        workflow_id=str(workflow_id),
+        operation_type=plan.operations[0].operation_type,
+        metadata_json=json.dumps(
+            {"contract_schema_version": plan.schema_version},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        status="WAITING_APPROVAL",
+        parent_plan_id=(
+            str(parent_plan_id) if parent_plan_id is not None else None
+        ),
+        created_at=plan.created_at,
+        items=[
+            OperationItemRecord(
+                sequence_no=sequence_no,
+                operation_type=operation.operation_type,
+                source_file_id=operation.source_file_id,
+                source_relative_path=operation.source_relative_path,
+                target_relative_path=operation.target_relative_path,
+                source_size_bytes=operation.source_precondition.size_bytes,
+                source_mtime_ns=operation.source_precondition.mtime_ns,
+                source_hash_algorithm=(
+                    operation.source_precondition.content_hash.algorithm
+                    if operation.source_precondition.content_hash is not None
+                    else None
+                ),
+                source_sha256=(
+                    operation.source_precondition.content_hash.digest
+                    if operation.source_precondition.content_hash is not None
+                    else None
+                ),
+                reason_kind=operation.reason.kind,
+                reason_description=operation.reason.description,
+                reason_match_score=operation.reason.match_score,
+                risks_json=json.dumps(
+                    [risk.model_dump(mode="json") for risk in operation.risks],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                status="PENDING",
+            )
+            for sequence_no, operation in enumerate(plan.operations, start=1)
+        ],
+    )
 
 
 def merge_edit_request(
@@ -264,10 +323,17 @@ def create_waiting_approval_workflow(
         workflow_id=str(workflow_id),
         plan_id=str(plan.plan_id),
     )
+    plan_record = build_operation_plan_record(
+        plan,
+        workflow_id=workflow_id,
+    )
 
     try:
+        # 先把完整业务计划写入主库；checkpoint 只是工作流状态投影。
+        add_operation_plan(session, plan_record)
+        session.flush()
         add_approval_request(session, approval)
-        # 先 flush 捕获数据库约束错误，但在 checkpoint 成功前不提交审批。
+        # 在 checkpoint 成功前不提交审批和计划事务。
         session.flush()
         waiting_workflow = run_checkpointed_workflow_event(
             graph,

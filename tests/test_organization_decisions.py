@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session
 
 import backend.app.organization_decisions as decisions_module
 from backend.app.database import Base
-from backend.app.models import ApprovalRequest, FileEntry, Workspace
+from backend.app.models import (
+    ApprovalRequest,
+    FileEntry,
+    OperationPlanRecord,
+    Workspace,
+)
 from backend.app.organization_decisions import apply_organization_decision
 from backend.app.organization_planning import (
     CreateApprovalWorkflowRequest,
@@ -97,6 +102,7 @@ def test_decision_synchronizes_approval_and_checkpoint(
     with Session(engine) as session, open_checkpointed_workflow_graph(
         tmp_path / "workflow-checkpoints.sqlite"
     ) as graph:
+        session.expire_on_commit = False
         _create_waiting_workflow(session, graph, tmp_path / "workspace")
 
         result = apply_organization_decision(
@@ -113,6 +119,12 @@ def test_decision_synchronizes_approval_and_checkpoint(
         assert result.approval_status == approval_status
         assert result.workflow.status == workflow_status
         assert result.workflow.error_code == error_code
+        plan_record = session.get(
+            OperationPlanRecord,
+            str(PLAN_ID),
+        )
+        assert plan_record is not None
+        assert plan_record.status == approval_status
 
 
 def test_decision_retry_repairs_checkpoint_after_first_write_failure(
@@ -198,6 +210,15 @@ def test_edit_rebuilds_plan_and_keeps_approval_waiting(
             == "archive/quarterly-report.txt"
         )
         assert approval.plan_id == str(result.workflow.operation_plan.plan_id)
+        original_plan = session.get(OperationPlanRecord, str(PLAN_ID))
+        replacement_plan = session.get(
+            OperationPlanRecord,
+            approval.plan_id,
+        )
+        assert original_plan is not None
+        assert replacement_plan is not None
+        assert original_plan.status == "SUPERSEDED"
+        assert replacement_plan.status == "WAITING_APPROVAL"
 
 
 def test_edit_retries_after_approval_commit_failure(
