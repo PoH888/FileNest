@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.database import Base, get_session
 from backend.app.main import app
-from backend.app.models import FileEntry, OperationPlanRecord, Workspace
+from backend.app.models import (
+    ApprovalRequest,
+    FileEntry,
+    OperationPlanRecord,
+    OperationStatusRecord,
+    Workspace,
+)
 from backend.app.services import get_operation_plan, validate_operation_plan
 from backend.app.workflow_graph import open_checkpointed_workflow_graph
 from backend.app.workflow_runtime import get_workflow_graph
@@ -331,6 +337,65 @@ def test_decision_api_rejects_stale_plan_id(
     ).json()
     assert unchanged["status"] == "waiting"
     assert unchanged["approval_status"] == "WAITING_APPROVAL"
+
+
+def test_cancel_organization_workflow_persists_unified_cancelled_state(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "cancel-api-workspace",
+    )
+    source_path = tmp_path / "cancel-api-workspace" / "inbox" / "quarterly-report.txt"
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+
+    response = client.post(
+        f"/api/v1/workflows/{created['workflow_id']}/decisions",
+        json={
+            "action": "cancel",
+            "expected_plan_id": created["operation_plan"]["plan_id"],
+        },
+    )
+
+    assert response.status_code == 200
+    cancelled = response.json()
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["approval_status"] == "CANCELLED"
+    assert cancelled["operation"]["overall_status"] == "CANCELLED"
+    assert source_path.exists()
+
+    with session_factory() as session:
+        plan = session.get(
+            OperationPlanRecord,
+            created["operation_plan"]["plan_id"],
+        )
+        approval = session.get(
+            ApprovalRequest,
+            cancelled["operation"]["approval_id"],
+        )
+        operation_status = session.get(
+            OperationStatusRecord,
+            created["workflow_id"],
+        )
+        assert plan is not None and plan.status == "CANCELLED"
+        assert approval is not None and approval.status == "CANCELLED"
+        assert (
+            operation_status is not None
+            and operation_status.overall_status == "CANCELLED"
+        )
 
 
 def test_edit_organization_workflow_via_api(

@@ -24,6 +24,7 @@ from .repositories import (
 )
 from .services import (
     approve_operation_plan,
+    cancel_operation_plan,
     edit_operation_plan,
     reject_operation_plan,
 )
@@ -34,7 +35,7 @@ from .workflow_graph import (
 )
 
 
-OrganizationDecisionAction = Literal["approve", "reject"]
+OrganizationDecisionAction = Literal["approve", "reject", "cancel"]
 
 
 class OrganizationDecisionErrorCode(StrEnum):
@@ -62,7 +63,7 @@ class OrganizationDecisionError(RuntimeError):
 class AppliedOrganizationDecision:
     """审批记录和 checkpoint 均已接受同一人工决定。"""
 
-    approval_status: Literal["APPROVED", "REJECTED"]
+    approval_status: Literal["APPROVED", "REJECTED", "CANCELLED"]
     workflow: WorkflowState
 
 
@@ -81,7 +82,7 @@ def apply_organization_decision(
     expected_plan_id: UUID,
     action: OrganizationDecisionAction,
 ) -> AppliedOrganizationDecision:
-    """安全应用批准或拒绝，并允许 checkpoint 失败后重试。"""
+    """安全应用批准、拒绝或取消，并允许 checkpoint 失败后重试。"""
 
     workflow = _load_waiting_or_applied_workflow(
         graph,
@@ -101,15 +102,18 @@ def apply_organization_decision(
             "页面所见计划已经变化",
         )
 
-    expected_status: Literal["APPROVED", "REJECTED"] = (
-        "APPROVED" if action == "approve" else "REJECTED"
-    )
+    if action == "approve":
+        expected_status: Literal["APPROVED", "REJECTED", "CANCELLED"] = "APPROVED"
+    elif action == "reject":
+        expected_status = "REJECTED"
+    else:
+        expected_status = "CANCELLED"
     if approval.status == "WAITING_APPROVAL":
-        transition = (
-            approve_operation_plan
-            if action == "approve"
-            else reject_operation_plan
-        )
+        transition = {
+            "approve": approve_operation_plan,
+            "reject": reject_operation_plan,
+            "cancel": cancel_operation_plan,
+        }[action]
         approval = transition(session, workflow_id, expected_plan_id)
     elif approval.status != expected_status:
         raise OrganizationDecisionError(
@@ -126,11 +130,11 @@ def apply_organization_decision(
     event = WorkflowEvent(
         workflow_id=workflow_id,
         sequence_no=workflow.revision + 1,
-        kind=(
-            "resume_requested"
-            if action == "approve"
-            else "workflow_failed"
-        ),
+        kind={
+            "approve": "resume_requested",
+            "reject": "workflow_failed",
+            "cancel": "workflow_cancelled",
+        }[action],
         error_code="human_rejected" if action == "reject" else None,
     )
     updated_workflow = run_checkpointed_workflow_event(graph, event)
@@ -364,4 +368,6 @@ def _decision_already_checkpointed(
 ) -> bool:
     if action == "approve":
         return workflow.status == "ready" and workflow.wait_reason_code is None
-    return workflow.status == "failed" and workflow.error_code == "human_rejected"
+    if action == "reject":
+        return workflow.status == "failed" and workflow.error_code == "human_rejected"
+    return workflow.status == "cancelled" and workflow.error_code is None

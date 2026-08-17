@@ -54,6 +54,7 @@ class SafeExecutionErrorCode(StrEnum):
     FILE_CHANGED = "safe_execution_file_changed"
     UNDO_TARGET_CONFLICT = "safe_execution_undo_target_conflict"
     HISTORY_WRITE_FAILED = "safe_execution_history_write_failed"
+    UNSUPPORTED_OPERATION_TYPE = "safe_execution_operation_type_unsupported"
 
 
 class SafeExecutionError(RuntimeError):
@@ -116,6 +117,23 @@ _RECOVERABLE_ITEM_FAILURE_CODES = frozenset(
 )
 
 
+def _ensure_supported_operation_plan(plan: OperationPlan) -> None:
+    """在文件副作用边界前拒绝尚未实现执行器的操作类型。"""
+
+    unsupported_types = sorted(
+        {
+            operation.operation_type
+            for operation in plan.operations
+            if operation.operation_type != "move"
+        }
+    )
+    if unsupported_types:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.UNSUPPORTED_OPERATION_TYPE,
+            "当前安全执行器不支持该操作类型",
+        )
+
+
 def validate_safe_execution_request(
     session: Session,
     request: SafeExecutionRequest,
@@ -130,6 +148,7 @@ def validate_safe_execution_request(
         request.workflow_id,
         request.plan,
     )
+    _ensure_supported_operation_plan(request.plan)
     validate_operation_plan(session, request.plan, now=now)
 
 
@@ -147,6 +166,7 @@ def execute_safe_operation_plan(
         request.workflow_id,
         request.plan,
     )
+    _ensure_supported_operation_plan(request.plan)
     existing_result = _get_idempotent_execution_result(session, request)
     if existing_result is not None:
         return existing_result
@@ -1286,6 +1306,8 @@ def _revalidate_file_before_move(
         source_path,
         "执行前源文件不可用",
     )
+
+
     if (
         current_metadata.size_bytes != expected_size_bytes
         or current_metadata.mtime_ns != expected_mtime_ns

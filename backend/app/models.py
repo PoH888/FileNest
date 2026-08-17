@@ -24,6 +24,7 @@ from .embedding_client import (
     InvalidEmbeddingVectorError,
     validate_embedding_vector,
 )
+from .operation_status import OperationStatus
 
 class Workspace(Base): # 继承 FileNest 的 ORM 基类
     """告诉 SQLAlchemy：
@@ -398,11 +399,11 @@ class OperationPlanRecord(Base):
             name="ck_operation_plans_schema_version",
         ),
         CheckConstraint(
-            "operation_type IN ('move')",
+            "operation_type IN ('move', 'quarantine')",
             name="ck_operation_plans_operation_type",
         ),
         CheckConstraint(
-            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'SUPERSEDED')",
+            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED', 'SUPERSEDED')",
             name="ck_operation_plans_status",
         ),
         CheckConstraint(
@@ -477,7 +478,7 @@ class OperationItemRecord(Base):
             name="ck_operation_items_sequence_positive",
         ),
         CheckConstraint(
-            "operation_type IN ('move')",
+            "operation_type IN ('move', 'quarantine')",
             name="ck_operation_items_operation_type",
         ),
         CheckConstraint(
@@ -581,7 +582,7 @@ class ApprovalRequest(Base):
             name="uq_approval_requests_workflow_id",
         ),
         CheckConstraint(
-            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            "status IN ('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED')",
             name="ck_approval_requests_status",
         ),
     )
@@ -608,17 +609,17 @@ class ApprovalAuditEvent(Base):
     __tablename__ = "approval_audit_events"
     __table_args__ = (
         CheckConstraint(
-            "action IN ('approve', 'edit', 'reject')",
+            "action IN ('approve', 'edit', 'reject', 'cancel')",
             name="ck_approval_audit_events_action",
         ),
         CheckConstraint(
             "previous_status IN "
-            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED')",
             name="ck_approval_audit_events_previous_status",
         ),
         CheckConstraint(
             "next_status IN "
-            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED')",
+            "('WAITING_APPROVAL', 'APPROVED', 'REJECTED', 'CANCELLED')",
             name="ck_approval_audit_events_next_status",
         ),
     )
@@ -813,6 +814,64 @@ class OperationExecutionItem(Base):
     undone_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+
+class OperationStatusRecord(Base):
+    """独立持久化的 Operation 当前总体状态与关联标识。"""
+
+    __tablename__ = "operation_statuses"
+    __table_args__ = (
+        CheckConstraint(
+            "overall_status IN "
+            "('PROPOSED', 'WAITING_APPROVAL', 'APPROVED', 'REJECTED', "
+            "'CANCELLED', 'EXECUTING', 'PARTIAL_FAILED', 'COMPLETED', "
+            "'UNDOING', 'UNDONE', 'COMPENSATED', 'FAILED')",
+            name="ck_operation_statuses_overall_status",
+        ),
+        CheckConstraint(
+            "revision >= 0",
+            name="ck_operation_statuses_revision_non_negative",
+        ),
+    )
+
+    workflow_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("operation_plans.plan_id"),
+        nullable=False,
+        index=True,
+    )
+    approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approval_requests.id"),
+        nullable=True,
+        index=True,
+    )
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("operation_executions.id"),
+        nullable=True,
+        index=True,
+    )
+    overall_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=OperationStatus.PROPOSED.value,
+        server_default=OperationStatus.PROPOSED.value,
+    )
+    revision: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
     )
 
 

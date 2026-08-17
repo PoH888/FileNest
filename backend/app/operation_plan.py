@@ -92,7 +92,7 @@ class OperationPlanItem(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    operation_type: Literal["move"] = "move"
+    operation_type: Literal["move", "quarantine"] = "move"
     source_file_id: int = Field(ge=1)
     source_relative_path: str
     target_relative_path: str

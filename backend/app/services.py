@@ -55,6 +55,8 @@ from .repositories import (
     ApprovalStatus,
     compare_and_set_operation_plan_status,
     compare_and_set_approval_request,
+    compare_and_set_operation_status,
+    compare_and_set_operation_status_links,
     count_file_entries,
     delete_file_entry,
     FileEntrySortField,
@@ -65,10 +67,12 @@ from .repositories import (
     get_file_entry_by_id,
     get_approval_request_by_workflow_id,
     get_operation_plan_by_id,
+    get_operation_status_by_workflow_id,
     get_workspace_by_id,
     OperationPlanStatus,
     SortOrder,
 )
+from .operation_status import OperationStatus
 from .workspace_scanner import ScannedFile, scan_workspace_files
 
 
@@ -432,6 +436,23 @@ def reject_operation_plan(
     )
 
 
+def cancel_operation_plan(
+    session: Session,
+    workflow_id: UUID,
+    expected_plan_id: UUID,
+) -> ApprovalRequest:
+    """取消仍处于等待状态且内容未变化的计划。"""
+
+    return _transition_approval_request(
+        session,
+        workflow_id,
+        expected_plan_id,
+        action="cancel",
+        next_status="CANCELLED",
+        next_plan_id=expected_plan_id,
+    )
+
+
 def _transition_approval_request(
     session: Session,
     workflow_id: UUID,
@@ -523,6 +544,14 @@ def _transition_approval_request(
                 str(next_plan_id),
                 "WAITING_APPROVAL",
             )
+        _sync_operation_status(
+            session,
+            workflow_key,
+            expected_status=OperationStatus.WAITING_APPROVAL,
+            next_status=OperationStatus(next_status),
+            plan_id=str(next_plan_id),
+            approval_id=approval.id,
+        )
 
         add_approval_audit_event(
             session,
@@ -573,19 +602,75 @@ def _sync_operation_plan_status(
     session.expire(record, ["status"])
 
 
+def _sync_operation_status(
+    session: Session,
+    workflow_id: str,
+    *,
+    expected_status: OperationStatus,
+    next_status: OperationStatus,
+    plan_id: str,
+    approval_id: int,
+) -> None:
+    """把审批业务结果同步到独立 Operation 当前状态；兼容历史缺失记录。"""
+
+    record = get_operation_status_by_workflow_id(session, workflow_id)
+    if record is None:
+        return
+
+    # CAS 更新绕过当前 ORM 实例；先刷新，避免复用旧 revision 覆盖并发事实。
+    session.expire(record)
+    session.refresh(record)
+    if record.overall_status != expected_status.value:
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.STATE_CHANGED,
+            "Operation 状态在提交前已经变化",
+        )
+
+    if next_status == expected_status:
+        updated = compare_and_set_operation_status_links(
+            session,
+            workflow_id,
+            expected_status,
+            expected_revision=record.revision,
+            plan_id=plan_id,
+            approval_id=approval_id,
+        )
+    else:
+        updated = compare_and_set_operation_status(
+            session,
+            workflow_id,
+            expected_status,
+            expected_revision=record.revision,
+            next_status=next_status,
+            plan_id=plan_id,
+            approval_id=approval_id,
+        )
+    if not updated:
+        raise ApprovalTransitionError(
+            ApprovalTransitionErrorCode.STATE_CHANGED,
+            "Operation 状态在提交前已经变化",
+        )
+    session.expire(record)
+
+
 def _is_repeated_approval(
     approval: ApprovalRequest,
     *,
     action: ApprovalAction,
     expected_plan_id: str,
 ) -> bool:
-    """只把同一计划的重复批准视为幂等成功。"""
+    """只把同一计划的重复批准或取消视为幂等成功。"""
 
     return (
-        action == "approve"
-        and approval.status == "APPROVED"
-        and approval.plan_id == expected_plan_id
-    )
+        (
+            action == "approve"
+            and approval.status == "APPROVED"
+        )
+        or (
+            action == "cancel"
+            and approval.status == "CANCELLED"
+        )
+    ) and approval.plan_id == expected_plan_id
 
 
 def create_workspace(

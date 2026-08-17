@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from .filesystem_adapter import FileSystemAdapter
-from .models import ApprovalRequest, OperationItemRecord, OperationPlanRecord
+from .models import (
+    ApprovalRequest,
+    OperationItemRecord,
+    OperationPlanRecord,
+    OperationStatusRecord,
+)
 from .operation_plan import (
     ContentHash,
     FilePrecondition,
@@ -20,7 +25,13 @@ from .operation_plan import (
     OperationReason,
 )
 from .operation_preview import OperationPreviewRequest
-from .repositories import add_approval_request, add_operation_plan
+from .operation_status import OperationStatus
+from .repositories import (
+    add_approval_request,
+    add_operation_plan,
+    add_operation_status,
+    compare_and_set_operation_status,
+)
 from .services import (
     OperationPreviewPathUnavailableError,
     generate_operation_preview,
@@ -308,6 +319,23 @@ def create_waiting_approval_workflow(
         plan_id_factory=plan_id_factory,
     )
 
+    return create_waiting_approval_workflow_for_plan(
+        session,
+        graph,
+        plan,
+        workflow_id_factory=workflow_id_factory,
+    )
+
+
+def create_waiting_approval_workflow_for_plan(
+    session: Session,
+    graph: CompiledStateGraph,
+    plan: OperationPlan,
+    *,
+    workflow_id_factory: UuidFactory = uuid4,
+) -> CreatedApprovalWorkflow:
+    """把已完成业务校验的计划安全提交为待审批工作流。"""
+
     workflow_id = workflow_id_factory()
     initial_workflow = WorkflowState(
         workflow_id=workflow_id,
@@ -335,6 +363,14 @@ def create_waiting_approval_workflow(
         add_approval_request(session, approval)
         # 在 checkpoint 成功前不提交审批和计划事务。
         session.flush()
+        operation_status = OperationStatusRecord(
+            workflow_id=str(workflow_id),
+            plan_id=str(plan.plan_id),
+            approval_id=approval.id,
+            overall_status=OperationStatus.PROPOSED.value,
+        )
+        add_operation_status(session, operation_status)
+        session.flush()
         waiting_workflow = run_checkpointed_workflow_event(
             graph,
             pause_event,
@@ -349,6 +385,19 @@ def create_waiting_approval_workflow(
             raise RuntimeError(
                 "checkpoint did not persist the expected approval state"
             )
+        if not compare_and_set_operation_status(
+            session,
+            str(workflow_id),
+            OperationStatus.PROPOSED,
+            expected_revision=0,
+            next_status=OperationStatus.WAITING_APPROVAL,
+            plan_id=str(plan.plan_id),
+            approval_id=approval.id,
+        ):
+            raise RuntimeError(
+                "operation status did not enter the expected approval state"
+            )
+        session.expire(operation_status)
         approval_id = approval.id
         session.commit()
     except Exception:

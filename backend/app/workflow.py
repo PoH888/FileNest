@@ -9,13 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .operation_plan import OperationPlan
 
 
-WorkflowStatus = Literal["ready", "waiting", "completed", "failed"]
+WorkflowStatus = Literal["ready", "waiting", "completed", "failed", "cancelled"]
 WorkflowEventKind = Literal[
     "pause_requested",
     "resume_requested",
     "plan_replaced",
     "workflow_completed",
     "workflow_failed",
+    "workflow_cancelled",
 ]
 
 
@@ -158,6 +159,8 @@ def _next_status(
         return "completed", None, None
     if state.status in {"ready", "waiting"} and event.kind == "workflow_failed":
         return "failed", None, event.error_code
+    if state.status == "waiting" and event.kind == "workflow_cancelled":
+        return "cancelled", None, None
 
     raise WorkflowTransitionError(
         WorkflowTransitionErrorCode.INVALID_TRANSITION,

@@ -42,6 +42,34 @@ class QuarantinedFile:
     quarantine_path: Path
 
 
+def build_quarantine_relative_path(
+    *,
+    workspace_id: int,
+    plan_id: UUID,
+    source_file_id: int,
+    file_name: str,
+) -> Path:
+    """生成隔离区内稳定且不依赖工作区绝对路径的目标位置。"""
+
+    if workspace_id < 1 or source_file_id < 1 or plan_id.int == 0:
+        raise QuarantineError(
+            QuarantineErrorCode.INVALID_IDENTIFIER,
+            "隔离路径所需的业务标识无效",
+        )
+    if not file_name or Path(file_name).name != file_name:
+        raise QuarantineError(
+            QuarantineErrorCode.INVALID_IDENTIFIER,
+            "隔离路径所需的文件名无效",
+        )
+
+    return (
+        Path(f"workspace-{workspace_id}")
+        / str(plan_id)
+        / str(source_file_id)
+        / file_name
+    )
+
+
 class QuarantineManager:
     """在授权工作区与独立应用隔离区之间移动文件。"""
 
@@ -99,11 +127,11 @@ class QuarantineManager:
                 "待隔离的源路径不是普通文件",
             )
 
-        quarantine_relative_path = (
-            Path(f"workspace-{workspace_id}")
-            / str(plan_id)
-            / str(source_file_id)
-            / authorized_source.name
+        quarantine_relative_path = build_quarantine_relative_path(
+            workspace_id=workspace_id,
+            plan_id=plan_id,
+            source_file_id=source_file_id,
+            file_name=authorized_source.name,
         )
         expected_target = self._quarantine_adapter.authorized_path(
             quarantine_relative_path

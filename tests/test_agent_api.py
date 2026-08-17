@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.agent_api import (
@@ -28,6 +28,7 @@ from backend.app.models import (
     ChunkRecord,
     DocumentRecord,
     FileEntry,
+    OperationPlanRecord,
     Workspace,
 )
 from backend.app.tool_contracts import ToolResult
@@ -76,6 +77,35 @@ def _seed_workspace(
         session.add(file_entry)
         session.commit()
         return workspace.id, file_entry.id
+
+
+def _seed_disk_workspace(
+    session_factory: sessionmaker[Session],
+    workspace_root: Path,
+    *,
+    name: str,
+    relative_path: str,
+    contents: bytes,
+) -> tuple[int, int, Path]:
+    source_path = workspace_root / Path(relative_path)
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(contents)
+    with session_factory() as session:
+        workspace = Workspace(name=name, root_path=str(workspace_root))
+        session.add(workspace)
+        session.flush()
+        metadata = source_path.stat()
+        file_entry = FileEntry(
+            workspace_id=workspace.id,
+            relative_path=source_path.relative_to(workspace_root).as_posix(),
+            name=source_path.name,
+            extension=source_path.suffix,
+            size_bytes=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+        )
+        session.add(file_entry)
+        session.commit()
+        return workspace.id, file_entry.id, source_path
 
 
 def _seed_knowledge_document(
@@ -182,6 +212,15 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
         ),
     }
     assert model_client.calls[0].messages[-1].content == "查找季度报告"
+    system_prompt = model_client.calls[0].messages[0].content
+    assert system_prompt is not None
+    assert "理解用户的整理意图" in system_prompt
+    assert "search_files" in system_prompt
+    assert "propose_move" in system_prompt
+    assert "propose_rename" in system_prompt
+    assert "propose_quarantine" in system_prompt
+    assert "不得审批" in system_prompt
+    assert "不得执行" in system_prompt
     with session_factory() as session:
         persisted_run = session.get(AgentRun, 1)
         assert persisted_run is not None
@@ -281,6 +320,120 @@ def test_agent_run_api_refuses_knowledge_answer_without_evidence(
     assert "根据常识可以直接回答。" not in response.text
 
 
+def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_root = tmp_path / "natural-language-workspace"
+    workspace_id, file_id, source_path = _seed_disk_workspace(
+        session_factory,
+        workspace_root,
+        name="自然语言整理工作区",
+        relative_path="downloads/calculus-course.pdf",
+        contents=b"course pdf",
+    )
+    target_directory = workspace_root / "subjects" / "mathematics"
+    target_directory.mkdir(parents=True)
+    original_contents = source_path.read_bytes()
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_search_courses",
+                name="search_files",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "keyword": "课程 PDF",
+                },
+            ),
+            _tool_call_response(
+                call_id="call_propose_course_move",
+                name="propose_move",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "source_file_id": file_id,
+                    "destination": "subjects/mathematics",
+                },
+            ),
+            _final_response("已提出按科目整理课程 PDF 的待审批计划。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "把下载目录里的课程 PDF 按科目整理",
+        },
+    )
+
+    proposal_message = model_client.calls[2].messages[-1]
+    proposal_result = ToolResult.model_validate_json(proposal_message.content)
+    assert response.status_code == 200
+    assert proposal_result.ok is True
+    assert proposal_result.data is not None
+    plan_id = proposal_result.data["plan_id"]
+    with session_factory() as session:
+        plan = session.get(OperationPlanRecord, plan_id)
+        assert plan is not None
+        assert plan.status == "WAITING_APPROVAL"
+        assert plan.workspace_id == workspace_id
+        assert plan.items[0].source_file_id == file_id
+        assert plan.items[0].target_relative_path == (
+            "subjects/mathematics/calculus-course.pdf"
+        )
+    assert source_path.exists()
+    assert source_path.read_bytes() == original_contents
+    assert not (target_directory / source_path.name).exists()
+
+
+def test_agent_run_api_does_not_create_move_proposal_without_search_results(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _, source_path = _seed_disk_workspace(
+        session_factory,
+        tmp_path / "empty-search-workspace",
+        name="无匹配整理工作区",
+        relative_path="downloads/physics-course.pdf",
+        contents=b"course pdf",
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_search_missing",
+                name="search_files",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "keyword": "不存在的科目",
+                },
+            ),
+            _final_response("没有找到匹配文件，无法提出安全计划。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "把下载目录里不存在的科目课程整理到对应目录",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["final_answer"] == "没有足够的文档证据，无法回答该问题。"
+    with session_factory() as session:
+        assert session.scalar(select(OperationPlanRecord)) is None
+    assert source_path.exists()
+
+
 def test_agent_run_api_rejects_missing_workspace_before_model_call(
     agent_client: tuple[TestClient, sessionmaker[Session]],
 ) -> None:
@@ -350,6 +503,47 @@ def test_agent_run_api_rejects_model_access_to_another_workspace(
     assert tool_result.error is not None
     assert tool_result.error.code == "invalid_arguments"
     assert response.json()["sources"] == []
+
+
+def test_agent_run_api_rejects_approval_tool_request(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="拒绝审批请求",
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_approve",
+                name="approve",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "plan_id": 1,
+                },
+            ),
+            _final_response("审批工具不可用。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "批准这个整理计划",
+        },
+    )
+
+    returned_tool_message = model_client.calls[1].messages[-1]
+    tool_result = ToolResult.model_validate_json(returned_tool_message.content)
+    assert response.status_code == 200
+    assert tool_result.ok is False
+    assert tool_result.error is not None
+    assert tool_result.error.code == "unknown_tool"
 
 
 def test_agent_run_events_stream_persisted_statuses_with_ordered_ids(

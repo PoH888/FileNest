@@ -22,8 +22,11 @@ from .models import (
     OperationExecutionItem,
     OperationItemRecord,
     OperationPlanRecord,
+    OperationStatusRecord,
     Workspace,
 )
+from .operation_projection import OperationProjection
+from .operation_status import OperationStatus, transition_operation_status
 
 FileEntrySortField = Literal[
     "relative_path",
@@ -32,8 +35,13 @@ FileEntrySortField = Literal[
     "mtime_ns",
 ]
 SortOrder = Literal["asc", "desc"]
-ApprovalStatus = Literal["WAITING_APPROVAL", "APPROVED", "REJECTED"]
-ApprovalAction = Literal["approve", "edit", "reject"]
+ApprovalStatus = Literal[
+    "WAITING_APPROVAL",
+    "APPROVED",
+    "REJECTED",
+    "CANCELLED",
+]
+ApprovalAction = Literal["approve", "edit", "reject", "cancel"]
 OperationExecutionStatus = Literal[
     "EXECUTING",
     "PARTIALLY_COMPLETED",
@@ -53,6 +61,7 @@ OperationPlanStatus = Literal[
     "WAITING_APPROVAL",
     "APPROVED",
     "REJECTED",
+    "CANCELLED",
     "SUPERSEDED",
 ]
 
@@ -405,6 +414,148 @@ def compare_and_set_operation_plan_status(
             OperationPlanRecord.status == expected_status,
         )
         .values(status=next_status)
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
+
+
+def add_operation_status(
+    session: Session,
+    operation_status: OperationStatusRecord,
+) -> None:
+    """将独立 Operation 当前状态加入当前事务。"""
+
+    session.add(operation_status)
+
+
+def get_operation_status_by_workflow_id(
+    session: Session,
+    workflow_id: str,
+) -> OperationStatusRecord | None:
+    """按工作流标识读取独立持久化的 Operation 当前状态。"""
+
+    statement = select(OperationStatusRecord).where(
+        OperationStatusRecord.workflow_id == workflow_id,
+    )
+    return session.scalar(statement)
+
+
+def get_operation_projection_by_workflow_id(
+    session: Session,
+    workflow_id: str,
+) -> OperationProjection | None:
+    """读取可供查询接口使用的统一 Operation 投影。"""
+
+    record = get_operation_status_by_workflow_id(session, workflow_id)
+    if record is None:
+        return None
+
+    return OperationProjection(
+        workflow_id=record.workflow_id,
+        plan_id=record.plan_id,
+        approval_id=record.approval_id,
+        execution_id=record.execution_id,
+        overall_status=record.overall_status,
+        revision=record.revision,
+    )
+
+
+def compare_and_set_operation_status(
+    session: Session,
+    workflow_id: str,
+    expected_status: OperationStatus | str,
+    *,
+    expected_revision: int,
+    next_status: OperationStatus | str,
+    plan_id: str | None = None,
+    approval_id: int | None = None,
+    execution_id: int | None = None,
+) -> bool:
+    """按统一状态图和 revision 原子更新 Operation 当前状态。"""
+
+    if expected_revision < 0:
+        raise ValueError("expected_revision must not be negative")
+    for field_name, value in (
+        ("approval_id", approval_id),
+        ("execution_id", execution_id),
+    ):
+        if value is not None and value < 1:
+            raise ValueError(f"{field_name} must be positive")
+
+    current = OperationStatus(expected_status)
+    next_value = transition_operation_status(current, next_status)
+    values: dict[str, object] = {
+        "overall_status": next_value.value,
+        "revision": expected_revision + 1,
+        "updated_at": func.current_timestamp(),
+    }
+    if plan_id is not None:
+        values["plan_id"] = plan_id
+    if approval_id is not None:
+        values["approval_id"] = approval_id
+    if execution_id is not None:
+        values["execution_id"] = execution_id
+
+    statement = (
+        update(OperationStatusRecord)
+        .where(
+            OperationStatusRecord.workflow_id == workflow_id,
+            OperationStatusRecord.overall_status == current.value,
+            OperationStatusRecord.revision == expected_revision,
+        )
+        .values(**values)
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
+
+
+def compare_and_set_operation_status_links(
+    session: Session,
+    workflow_id: str,
+    expected_status: OperationStatus | str,
+    *,
+    expected_revision: int,
+    plan_id: str | None = None,
+    approval_id: int | None = None,
+    execution_id: int | None = None,
+) -> bool:
+    """在不改变状态时原子更新 Operation 关联标识并递增 revision。"""
+
+    if expected_revision < 0:
+        raise ValueError("expected_revision must not be negative")
+    for field_name, value in (
+        ("approval_id", approval_id),
+        ("execution_id", execution_id),
+    ):
+        if value is not None and value < 1:
+            raise ValueError(f"{field_name} must be positive")
+
+    current = OperationStatus(expected_status)
+    values: dict[str, object] = {
+        "revision": expected_revision + 1,
+        "updated_at": func.current_timestamp(),
+    }
+    if plan_id is not None:
+        values["plan_id"] = plan_id
+    if approval_id is not None:
+        values["approval_id"] = approval_id
+    if execution_id is not None:
+        values["execution_id"] = execution_id
+
+    statement = (
+        update(OperationStatusRecord)
+        .where(
+            OperationStatusRecord.workflow_id == workflow_id,
+            OperationStatusRecord.overall_status == current.value,
+            OperationStatusRecord.revision == expected_revision,
+        )
+        .values(**values)
     )
     result = session.execute(
         statement,

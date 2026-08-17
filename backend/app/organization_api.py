@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .database import get_session
 from .operation_plan import OperationPlan
+from .operation_projection import OperationProjection
 from .organization_decisions import (
     OrganizationDecisionError,
     OrganizationDecisionErrorCode,
@@ -23,7 +24,10 @@ from .organization_planning import (
     create_waiting_approval_workflow,
 )
 from .path_policy import PathPolicyError
-from .repositories import get_approval_request_by_workflow_id
+from .repositories import (
+    get_approval_request_by_workflow_id,
+    get_operation_projection_by_workflow_id,
+)
 from .safe_execution import (
     SafeExecutionError,
     SafeExecutionErrorCode,
@@ -48,6 +52,10 @@ from .services import (
     WorkspaceNotFoundError,
     get_operation_plan,
 )
+from .operation_status import (
+    map_approval_status_to_operation_status,
+    map_workflow_status_to_operation_status,
+)
 from .workflow import WorkflowState, WorkflowStatus, WorkflowTransitionError
 from .workflow_graph import (
     WorkflowCheckpointError,
@@ -57,7 +65,12 @@ from .workflow_runtime import get_workflow_graph
 
 
 router = APIRouter(prefix="/api/v1")
-ApprovalStatus = Literal["WAITING_APPROVAL", "APPROVED", "REJECTED"]
+ApprovalStatus = Literal[
+    "WAITING_APPROVAL",
+    "APPROVED",
+    "REJECTED",
+    "CANCELLED",
+]
 
 
 class OrganizationWorkflowResponse(BaseModel):
@@ -71,6 +84,7 @@ class OrganizationWorkflowResponse(BaseModel):
     wait_reason_code: str | None
     operation_plan: OperationPlan
     approval_status: ApprovalStatus
+    operation: OperationProjection
 
 
 class OrganizationDecisionRequest(BaseModel):
@@ -78,7 +92,7 @@ class OrganizationDecisionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    action: Literal["approve", "edit", "reject"]
+    action: Literal["approve", "edit", "reject", "cancel"]
     expected_plan_id: UUID
     changes: tuple[OrganizationTargetSelection, ...] | None = Field(
         default=None,
@@ -193,6 +207,27 @@ def _workflow_response(
             },
         ) from error
 
+    operation = get_operation_projection_by_workflow_id(
+        session,
+        str(workflow_id),
+    )
+    try:
+        expected_approval_status = map_approval_status_to_operation_status(
+            approval.status,
+        )
+        expected_workflow_status = map_workflow_status_to_operation_status(
+            workflow.status,
+            error_code=workflow.error_code,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_state_conflict",
+                "message": "工作流状态当前不一致。",
+            },
+        ) from error
+
     if (
         workflow.workflow_id != workflow_id
         or str(workflow.operation_plan.plan_id) != approval.plan_id
@@ -202,7 +237,14 @@ def _workflow_response(
             "WAITING_APPROVAL",
             "APPROVED",
             "REJECTED",
+            "CANCELLED",
         }
+        or operation is None
+        or operation.workflow_id != workflow_id
+        or operation.plan_id != workflow.operation_plan.plan_id
+        or operation.approval_id != approval.id
+        or operation.overall_status != expected_approval_status
+        or operation.overall_status != expected_workflow_status
     ):
         raise HTTPException(
             status_code=409,
@@ -219,6 +261,7 @@ def _workflow_response(
         wait_reason_code=workflow.wait_reason_code,
         operation_plan=operation_plan,
         approval_status=approval.status,
+        operation=operation,
     )
 
 
@@ -432,7 +475,7 @@ def decide_organization_workflow(
     session: Session = Depends(get_session),
     graph: CompiledStateGraph = Depends(get_workflow_graph),
 ) -> OrganizationWorkflowResponse:
-    """通过既有协调器批准、编辑或拒绝页面当前所见计划。"""
+    """通过既有协调器批准、编辑、拒绝或取消页面当前所见计划。"""
 
     try:
         if request.action == "edit":
