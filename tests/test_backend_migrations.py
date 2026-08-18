@@ -85,7 +85,15 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "finished_at",
             "model_turns",
             "error_code",
+            "workspace_id",
+            "request_text",
+            "context_json",
         ]
+        assert all(
+            column["nullable"]
+            for column in schema.get_columns("agent_runs")
+            if column["name"] in {"workspace_id", "request_text", "context_json"}
+        )
         assert {
             constraint["name"]
             for constraint in schema.get_check_constraints("agent_runs")
@@ -93,6 +101,13 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "ck_agent_runs_status",
             "ck_agent_runs_model_turns_non_negative",
         }
+        agent_run_foreign_keys = schema.get_foreign_keys("agent_runs")
+        assert len(agent_run_foreign_keys) == 1
+        assert agent_run_foreign_keys[0]["constrained_columns"] == [
+            "workspace_id"
+        ]
+        assert agent_run_foreign_keys[0]["referred_table"] == "workspaces"
+        assert agent_run_foreign_keys[0]["referred_columns"] == ["id"]
 
         assert "agent_tool_calls" in schema.get_table_names()
         assert [

@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from pathlib import Path
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -132,7 +133,22 @@ def _run_move_proposal(
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    deadline = monotonic() + 5
+    while True:
+        state_response = client.get(f"/api/v1/agent-runs/{run_id}")
+        assert state_response.status_code == 200
+        if state_response.json()["status"] not in {
+            "pending",
+            "running",
+            "waiting_approval",
+        }:
+            break
+        if monotonic() >= deadline:
+            pytest.fail("Agent Run did not reach a terminal state")
+        sleep(0.01)
+
     search_result = ToolResult.model_validate_json(
         model_client.calls[1].messages[-1].content
     )

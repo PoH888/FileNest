@@ -2,6 +2,8 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from threading import Event
+from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
@@ -21,7 +23,12 @@ from backend.app.document_chunker import chunk_document
 from backend.app.document_contracts import Document
 from backend.app.fake_model_client import FakeModelClient
 from backend.app.main import app
-from backend.app.model_client import ModelMessage, ModelResponse, ModelToolCall
+from backend.app.model_client import (
+    ModelClientRequestError,
+    ModelMessage,
+    ModelResponse,
+    ModelToolCall,
+)
 from backend.app.models import (
     AgentRun,
     AgentToolCall,
@@ -77,6 +84,28 @@ def _seed_workspace(
         session.add(file_entry)
         session.commit()
         return workspace.id, file_entry.id
+
+
+def _wait_for_agent_run_completion(
+    client: TestClient,
+    run_id: int,
+) -> object:
+    terminal_statuses = {
+        "completed",
+        "max_steps_reached",
+        "timed_out",
+        "cancelled",
+        "failed",
+    }
+    deadline = monotonic() + 5
+    while True:
+        response = client.get(f"/api/v1/agent-runs/{run_id}")
+        assert response.status_code == 200
+        if response.json()["status"] in terminal_statuses:
+            return response
+        if monotonic() >= deadline:
+            pytest.fail("Agent Run did not reach a terminal state")
+        sleep(0.01)
 
 
 def _seed_disk_workspace(
@@ -192,25 +221,10 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
         },
     )
 
-    assert response.status_code == 200
-    assert AgentRunResponse.model_validate(response.json()).model_dump() == {
-        "run_id": 1,
-        "status": "completed",
-        "final_answer": "找到季度报告。",
-        "error": None,
-        "sources": (
-            {
-                "workspace_id": workspace_id,
-                "file_id": 1,
-                "name": "quarterly.txt",
-                "relative_path": "reports/quarterly.txt",
-                "start_line": None,
-                "end_line": None,
-                "start_offset": None,
-                "end_offset": None,
-            },
-        ),
-    }
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    state_response = _wait_for_agent_run_completion(client, run_id)
+    assert state_response.json()["status"] == "completed"
     assert model_client.calls[0].messages[-1].content == "查找季度报告"
     system_prompt = model_client.calls[0].messages[0].content
     assert system_prompt is not None
@@ -222,9 +236,452 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
     assert "不得审批" in system_prompt
     assert "不得执行" in system_prompt
     with session_factory() as session:
-        persisted_run = session.get(AgentRun, 1)
+        persisted_run = session.get(AgentRun, run_id)
         assert persisted_run is not None
         assert persisted_run.status == "completed"
+
+
+def test_agent_run_api_returns_before_background_executor_finishes(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="异步快速创建",
+    )
+    started = Event()
+    release = Event()
+
+    class BlockingExecutor:
+        def run(
+            self,
+            session: Session,
+            *,
+            workspace_id: int,
+            request_text: str,
+            run_id: int | None = None,
+            cancel_event: Event | None = None,
+        ) -> AgentRunResponse:
+            assert run_id is not None
+            started.set()
+            assert release.wait(timeout=5)
+            SqlAlchemyAgentRunRecorder(session).finish_run(
+                agent_run_id=run_id,
+                status="completed",
+                model_turns=1,
+                error_code=None,
+            )
+            return AgentRunResponse(
+                run_id=run_id,
+                status="completed",
+                final_answer="完成",
+            )
+
+    app.dependency_overrides[get_agent_run_executor] = BlockingExecutor
+
+    try:
+        response = client.post(
+            "/api/v1/agent-runs",
+            json={
+                "workspace_id": workspace_id,
+                "request_text": "执行异步请求",
+            },
+        )
+
+        assert response.status_code == 202
+        run_id = response.json()["run_id"]
+        assert started.wait(timeout=2)
+        state_response = client.get(f"/api/v1/agent-runs/{run_id}")
+        assert state_response.status_code == 200
+        assert state_response.json()["status"] == "running"
+    finally:
+        release.set()
+
+    assert _wait_for_agent_run_completion(client, run_id).json()["status"] == (
+        "completed"
+    )
+
+
+def test_agent_run_api_records_background_failure(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="异步失败记录",
+    )
+    started = Event()
+
+    class FailingExecutor:
+        def run(
+            self,
+            session: Session,
+            *,
+            workspace_id: int,
+            request_text: str,
+            run_id: int | None = None,
+            cancel_event: Event | None = None,
+        ) -> AgentRunResponse:
+            started.set()
+            raise RuntimeError("background failure")
+
+    app.dependency_overrides[get_agent_run_executor] = FailingExecutor
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "触发后台失败",
+        },
+    )
+
+    assert response.status_code == 202
+    assert started.wait(timeout=2)
+    state_response = _wait_for_agent_run_completion(
+        client,
+        response.json()["run_id"],
+    )
+    assert state_response.json()["status"] == "failed"
+    assert state_response.json()["error_code"] == "model_provider_error"
+
+
+def test_cancel_agent_run_stops_background_execution(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="取消后台运行",
+    )
+    started = Event()
+
+    class CancellableExecutor:
+        def run(
+            self,
+            session: Session,
+            *,
+            workspace_id: int,
+            request_text: str,
+            run_id: int | None = None,
+            cancel_event: Event | None = None,
+        ) -> AgentRunResponse:
+            assert run_id is not None
+            assert cancel_event is not None
+            started.set()
+            assert cancel_event.wait(timeout=5)
+            SqlAlchemyAgentRunRecorder(session).finish_run(
+                agent_run_id=run_id,
+                status="cancelled",
+                model_turns=0,
+                error_code=None,
+            )
+            return AgentRunResponse(
+                run_id=run_id,
+                status="cancelled",
+            )
+
+    app.dependency_overrides[get_agent_run_executor] = CancellableExecutor
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "取消这个请求",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    assert started.wait(timeout=2)
+
+    cancel_response = client.post(f"/api/v1/agent-runs/{run_id}/cancel")
+
+    assert cancel_response.status_code == 200
+    assert _wait_for_agent_run_completion(client, run_id).json()["status"] == (
+        "cancelled"
+    )
+    repeated_cancel_response = client.post(
+        f"/api/v1/agent-runs/{run_id}/cancel"
+    )
+
+    assert repeated_cancel_response.status_code == 200
+    assert repeated_cancel_response.json()["status"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code", "model_turns"),
+    [
+        ("completed", None, 1),
+        ("failed", "model_provider_error", 0),
+    ],
+)
+def test_cancel_agent_run_preserves_terminal_status(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    status: str,
+    error_code: str | None,
+    model_turns: int,
+) -> None:
+    client, session_factory = agent_client
+    with session_factory() as session:
+        agent_run = AgentRun(
+            status=status,
+            model_turns=model_turns,
+            error_code=error_code,
+        )
+        session.add(agent_run)
+        session.commit()
+        run_id = agent_run.id
+
+    response = client.post(f"/api/v1/agent-runs/{run_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "run_id": run_id,
+        "status": status,
+        "model_turns": model_turns,
+        "error_code": error_code,
+    }
+    with session_factory() as session:
+        persisted_run = session.get(AgentRun, run_id)
+        assert persisted_run is not None
+        assert persisted_run.status == status
+        assert persisted_run.error_code == error_code
+
+
+def test_cancel_agent_run_rejects_unknown_run(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, _ = agent_client
+
+    response = client.post("/api/v1/agent-runs/999/cancel")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "agent_run_not_found",
+            "message": "Agent 运行记录不存在。",
+        }
+    }
+
+
+def test_resume_agent_run_returns_accepted_and_restarts_run(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="恢复后台运行",
+    )
+    initial_messages = (
+        ModelMessage(role="system", content="系统上下文"),
+        ModelMessage(role="user", content="恢复这个请求"),
+    )
+    with session_factory() as session:
+        recorder = SqlAlchemyAgentRunRecorder(session)
+        run_id = recorder.start_pending_run(
+            workspace_id=workspace_id,
+            request_text="恢复这个请求",
+            messages=initial_messages,
+        )
+        recorder.finish_run(
+            agent_run_id=run_id,
+            status="cancelled",
+            model_turns=0,
+            error_code=None,
+        )
+    expected_run_id = run_id
+
+    started = Event()
+
+    class ResumeExecutor:
+        def run(
+            self,
+            session: Session,
+            *,
+            workspace_id: int,
+            request_text: str,
+            run_id: int | None = None,
+            cancel_event: Event | None = None,
+        ) -> AgentRunResponse:
+            assert workspace_id > 0
+            assert request_text == "恢复这个请求"
+            assert run_id == expected_run_id
+            started.set()
+            assert run_id is not None
+            SqlAlchemyAgentRunRecorder(session).finish_run(
+                agent_run_id=run_id,
+                status="completed",
+                model_turns=1,
+                error_code=None,
+            )
+            return AgentRunResponse(
+                run_id=run_id,
+                status="completed",
+                final_answer="恢复完成",
+            )
+
+    app.dependency_overrides[get_agent_run_executor] = ResumeExecutor
+    response = client.post(f"/api/v1/agent-runs/{run_id}/resume")
+
+    assert response.status_code == 202
+    assert response.json() == {"run_id": run_id}
+    assert started.wait(timeout=2)
+    assert _wait_for_agent_run_completion(client, run_id).json()["status"] == (
+        "completed"
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "running", "waiting_approval", "completed"],
+)
+def test_resume_agent_run_rejects_non_resumable_status(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    status: str,
+) -> None:
+    client, session_factory = agent_client
+    with session_factory() as session:
+        agent_run = AgentRun(status=status)
+        session.add(agent_run)
+        session.commit()
+        run_id = agent_run.id
+
+    response = client.post(f"/api/v1/agent-runs/{run_id}/resume")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "agent_run_resume_not_allowed",
+            "message": "Agent 运行当前状态不允许恢复。",
+        }
+    }
+
+
+def test_resume_agent_run_restores_persisted_messages(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="恢复持久上下文",
+    )
+
+    class FailOnceAfterToolModelClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[ModelMessage, ...]] = []
+
+        def complete(self, *, messages, tools):
+            self.calls.append(tuple(messages))
+            if len(self.calls) == 1:
+                return _tool_call_response(
+                    call_id="call_before_resume",
+                    name="search_files",
+                    arguments={
+                        "workspace_id": workspace_id,
+                        "keyword": "quarterly",
+                    },
+                )
+            if len(self.calls) == 2:
+                raise ModelClientRequestError(
+                    code="model_connection_error",
+                    message="temporary provider failure",
+                    retryable=False,
+                )
+            return _final_response("恢复后的回答")
+
+    model_client = FailOnceAfterToolModelClient()
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "查找季度报告并继续",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    failed_response = _wait_for_agent_run_completion(client, run_id)
+    assert failed_response.json()["status"] == "failed"
+    assert failed_response.json()["model_turns"] == 1
+
+    resume_response = client.post(f"/api/v1/agent-runs/{run_id}/resume")
+
+    assert resume_response.status_code == 202
+    completed_response = _wait_for_agent_run_completion(client, run_id)
+    assert completed_response.json()["status"] == "completed"
+    assert completed_response.json()["model_turns"] == 2
+    assert model_client.calls[2] == model_client.calls[1]
+    assert [message.role for message in model_client.calls[2]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+
+
+def test_resume_agent_run_rejects_missing_persisted_context(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="缺少恢复上下文",
+    )
+    with session_factory() as session:
+        agent_run = AgentRun(
+            status="failed",
+            workspace_id=workspace_id,
+            request_text="无法恢复",
+            model_turns=0,
+            error_code="model_provider_error",
+        )
+        session.add(agent_run)
+        session.commit()
+        run_id = agent_run.id
+
+    response = client.post(f"/api/v1/agent-runs/{run_id}/resume")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "agent_run_resume_unavailable",
+            "message": "Agent 运行缺少可恢复的持久状态。",
+        }
+    }
+
+
+def test_resume_agent_run_rejects_corrupt_persisted_context(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="损坏恢复上下文",
+    )
+    with session_factory() as session:
+        agent_run = AgentRun(
+            status="failed",
+            workspace_id=workspace_id,
+            request_text="损坏上下文",
+            context_json="not-json",
+            model_turns=0,
+            error_code="model_provider_error",
+        )
+        session.add(agent_run)
+        session.commit()
+        run_id = agent_run.id
+
+    response = client.post(f"/api/v1/agent-runs/{run_id}/resume")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "agent_run_resume_unavailable",
+            "message": "Agent 运行缺少可恢复的持久状态。",
+        }
+    }
 
 
 def test_agent_run_api_returns_knowledge_source_location(
@@ -265,18 +722,13 @@ def test_agent_run_api_returns_knowledge_source_location(
         },
     )
 
-    assert response.status_code == 200
-    result = AgentRunResponse.model_validate(response.json())
-    assert result.final_answer == "文档显示需要先完成审批。"
-    assert len(result.sources) == 1
-    source = result.sources[0]
-    assert source.workspace_id == workspace_id
-    assert source.file_id == file_id
-    assert source.name == "quarterly.txt"
-    assert source.relative_path == "reports/quarterly.txt"
-    assert (source.start_line, source.end_line) == (1, 2)
-    assert source.start_offset == 0
-    assert source.end_offset == len("第一行：审批流程\n第二行：批准后才能移动文件。")
+    assert response.status_code == 202
+    state_response = _wait_for_agent_run_completion(
+        client,
+        response.json()["run_id"],
+    )
+    assert state_response.json()["status"] == "completed"
+    assert model_client.calls[1].messages[-1].content is not None
 
 
 def test_agent_run_api_refuses_knowledge_answer_without_evidence(
@@ -312,12 +764,12 @@ def test_agent_run_api_refuses_knowledge_answer_without_evidence(
         },
     )
 
-    assert response.status_code == 200
-    result = AgentRunResponse.model_validate(response.json())
-    assert result.status == "completed"
-    assert result.final_answer == "没有足够的文档证据，无法回答该问题。"
-    assert result.sources == ()
-    assert "根据常识可以直接回答。" not in response.text
+    assert response.status_code == 202
+    state_response = _wait_for_agent_run_completion(
+        client,
+        response.json()["run_id"],
+    )
+    assert state_response.json()["status"] == "completed"
 
 
 def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
@@ -370,9 +822,10 @@ def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
         },
     )
 
+    assert response.status_code == 202
+    _wait_for_agent_run_completion(client, response.json()["run_id"])
     proposal_message = model_client.calls[2].messages[-1]
     proposal_result = ToolResult.model_validate_json(proposal_message.content)
-    assert response.status_code == 200
     assert proposal_result.ok is True
     assert proposal_result.data is not None
     plan_id = proposal_result.data["plan_id"]
@@ -427,8 +880,8 @@ def test_agent_run_api_does_not_create_move_proposal_without_search_results(
         },
     )
 
-    assert response.status_code == 200
-    assert response.json()["final_answer"] == "没有足够的文档证据，无法回答该问题。"
+    assert response.status_code == 202
+    _wait_for_agent_run_completion(client, response.json()["run_id"])
     with session_factory() as session:
         assert session.scalar(select(OperationPlanRecord)) is None
     assert source_path.exists()
@@ -496,13 +949,13 @@ def test_agent_run_api_rejects_model_access_to_another_workspace(
         },
     )
 
+    assert response.status_code == 202
+    _wait_for_agent_run_completion(client, response.json()["run_id"])
     returned_tool_message = model_client.calls[1].messages[-1]
     tool_result = ToolResult.model_validate_json(returned_tool_message.content)
-    assert response.status_code == 200
     assert tool_result.ok is False
     assert tool_result.error is not None
     assert tool_result.error.code == "invalid_arguments"
-    assert response.json()["sources"] == []
 
 
 def test_agent_run_api_rejects_approval_tool_request(
@@ -538,9 +991,10 @@ def test_agent_run_api_rejects_approval_tool_request(
         },
     )
 
+    assert response.status_code == 202
+    _wait_for_agent_run_completion(client, response.json()["run_id"])
     returned_tool_message = model_client.calls[1].messages[-1]
     tool_result = ToolResult.model_validate_json(returned_tool_message.content)
-    assert response.status_code == 200
     assert tool_result.ok is False
     assert tool_result.error is not None
     assert tool_result.error.code == "unknown_tool"

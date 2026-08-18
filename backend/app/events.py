@@ -7,14 +7,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .agent_loop import AgentRunStatus
+from .agent_loop import AGENT_RUN_ACTIVE_STATUSES, AgentRunLifecycleStatus
 from .agent_observability import RecordedToolStatus
 from .models import AgentRun, AgentToolCall
 from .repositories import ApprovalAction, ApprovalStatus
 from .workflow import WorkflowStatus
 
 
-AgentRunEventStatus: TypeAlias = Literal["running"] | AgentRunStatus
+AgentRunEventStatus: TypeAlias = AgentRunLifecycleStatus
 AgentToolCallEventStatus: TypeAlias = Literal["requested"] | RecordedToolStatus
 
 
@@ -116,11 +116,16 @@ def build_agent_run_event_stream(
     def append(data: BusinessEvent) -> None:
         events.append(SseEvent(event_id=len(events) + 1, data=data))
 
+    initial_status = (
+        agent_run.status
+        if agent_run.status in AGENT_RUN_ACTIVE_STATUSES
+        else "running"
+    )
     append(
         AgentRunStatusChangedEvent(
             occurred_at=_storage_timestamp(agent_run.started_at),
             run_id=agent_run.id,
-            status="running",
+            status=initial_status,
         )
     )
     for tool_call in sorted(tool_calls, key=lambda item: item.sequence_no):
@@ -147,7 +152,7 @@ def build_agent_run_event_stream(
                 )
             )
 
-    if agent_run.status != "running":
+    if agent_run.status not in AGENT_RUN_ACTIVE_STATUSES:
         append(
             AgentRunStatusChangedEvent(
                 occurred_at=_storage_timestamp(

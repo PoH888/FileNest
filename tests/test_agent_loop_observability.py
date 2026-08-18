@@ -66,7 +66,7 @@ def _final_response(content: str = "查询完成。") -> ModelResponse:
     )
 
 
-def test_agent_loop_persists_safe_trace_without_model_or_tool_payloads(
+def test_agent_loop_persists_resume_context_without_tool_payload_rows(
     tmp_path: Path,
 ) -> None:
     engine = create_engine(
@@ -130,11 +130,8 @@ def test_agent_loop_persists_safe_trace_without_model_or_tool_payloads(
                     select(AgentToolCall).order_by(AgentToolCall.sequence_no)
                 )
             )
-            persisted_rows = repr(
-                session.execute(text("SELECT * FROM agent_runs")).all()
-                + session.execute(
-                    text("SELECT * FROM agent_tool_calls")
-                ).all()
+            persisted_tool_rows = repr(
+                session.execute(text("SELECT * FROM agent_tool_calls")).all()
             )
 
             assert result.status == "completed"
@@ -151,14 +148,16 @@ def test_agent_loop_persists_safe_trace_without_model_or_tool_payloads(
                 for call_id in raw_call_ids
             ]
             assert handler_calls == [sensitive_keyword, sensitive_keyword]
+            assert saved_run.context_json is not None
+            assert sensitive_prompt in saved_run.context_json
+            assert sensitive_assistant_text in saved_run.context_json
             for sensitive_value in [
-                sensitive_prompt,
                 sensitive_assistant_text,
                 sensitive_keyword,
                 sensitive_result,
                 *raw_call_ids,
             ]:
-                assert sensitive_value not in persisted_rows
+                assert sensitive_value not in persisted_tool_rows
     finally:
         engine.dispose()
 

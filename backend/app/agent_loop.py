@@ -40,6 +40,14 @@ AgentRunStatus = Literal[
     "cancelled",
     "failed",
 ]
+AgentRunLifecycleStatus = Literal[
+    "pending",
+    "running",
+    "waiting_approval",
+] | AgentRunStatus
+AGENT_RUN_ACTIVE_STATUSES = frozenset(
+    {"pending", "running", "waiting_approval"}
+)
 AgentBoundaryStatus = Literal["timed_out", "cancelled"]
 MAX_MODEL_RETRIES = 5
 
@@ -118,6 +126,8 @@ class AgentLoop:
         self,
         messages: Sequence[ModelMessage],
         *,
+        initial_model_turns: int = 0,
+        initial_tool_sequence_no: int = 0,
         max_steps: int = 8,
         timeout_seconds: float = 60.0,
         cancel_event: Event | None = None,
@@ -128,6 +138,10 @@ class AgentLoop:
 
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
+        if initial_model_turns < 0:
+            raise ValueError("initial_model_turns must be non-negative")
+        if initial_tool_sequence_no < 0:
+            raise ValueError("initial_tool_sequence_no must be non-negative")
         if not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
         if not 0 <= max_model_retries <= MAX_MODEL_RETRIES:
@@ -149,8 +163,14 @@ class AgentLoop:
             else None
         )
         current_messages = tuple(messages)
-        tool_sequence_no = 0
-        for model_turns in range(1, max_steps + 1):
+        self._checkpoint_run(
+            agent_run_id=agent_run_id,
+            messages=current_messages,
+            model_turns=initial_model_turns,
+        )
+        tool_sequence_no = initial_tool_sequence_no
+        for additional_turn in range(1, max_steps + 1):
+            model_turns = initial_model_turns + additional_turn
             turn_or_result = self._request_model_turn_with_retries(
                 current_messages,
                 completed_model_turns=model_turns - 1,
@@ -167,6 +187,11 @@ class AgentLoop:
 
             turn = turn_or_result
             current_messages = turn.messages
+            self._checkpoint_run(
+                agent_run_id=agent_run_id,
+                messages=current_messages,
+                model_turns=model_turns,
+            )
 
             boundary_status = self._boundary_status(
                 deadline=deadline,
@@ -193,7 +218,7 @@ class AgentLoop:
                     agent_run_id=agent_run_id,
                 )
 
-            if model_turns == max_steps:
+            if additional_turn == max_steps:
                 return self._finish_recorded_run(
                     AgentRunResult(
                         status="max_steps_reached",
@@ -242,6 +267,11 @@ class AgentLoop:
                     current_messages,
                     tool_call,
                 )
+                self._checkpoint_run(
+                    agent_run_id=agent_run_id,
+                    messages=current_messages,
+                    model_turns=model_turns,
+                )
                 if (
                     self._recorder is not None
                     and agent_run_id is not None
@@ -269,6 +299,25 @@ class AgentLoop:
                     )
 
         raise RuntimeError("Agent Loop reached an unreachable state")
+
+    def _checkpoint_run(
+        self,
+        *,
+        agent_run_id: int | None,
+        messages: Sequence[ModelMessage],
+        model_turns: int,
+    ) -> None:
+        """只对支持恢复的记录器保存消息，兼容旧的最小记录器。"""
+
+        if self._recorder is None or agent_run_id is None:
+            return
+        checkpoint = getattr(self._recorder, "checkpoint_run", None)
+        if checkpoint is not None:
+            checkpoint(
+                agent_run_id=agent_run_id,
+                messages=messages,
+                model_turns=model_turns,
+            )
 
     def _finish_recorded_run(
         self,

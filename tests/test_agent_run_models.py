@@ -82,6 +82,37 @@ def test_agent_run_and_tool_calls_persist_safe_lifecycle_metadata(
         engine.dispose()
 
 
+def test_agent_run_accepts_async_lifecycle_statuses(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, "async-agent-run-statuses.db")
+    statuses = [
+        "pending",
+        "running",
+        "waiting_approval",
+        "completed",
+        "max_steps_reached",
+        "timed_out",
+        "cancelled",
+        "failed",
+    ]
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine) as session:
+            session.add_all(AgentRun(status=status) for status in statuses)
+            session.commit()
+
+            saved_statuses = [
+                agent_run.status
+                for agent_run in session.query(AgentRun)
+                .order_by(AgentRun.id)
+                .all()
+            ]
+
+        assert saved_statuses == statuses
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("duplicate_sequence", "duplicate_model_call_id"),
     [(True, False), (False, True)],
@@ -154,7 +185,7 @@ def test_agent_run_rejects_invalid_lifecycle_values(
         engine.dispose()
 
 
-def test_observability_tables_have_no_raw_prompt_or_payload_columns(
+def test_agent_runs_store_resume_context_without_tool_payload_columns(
     tmp_path: Path,
 ) -> None:
     engine = _engine(tmp_path, "safe-observability-schema.db")
@@ -172,6 +203,9 @@ def test_observability_tables_have_no_raw_prompt_or_payload_columns(
 
         assert run_columns == {
             "id",
+            "workspace_id",
+            "request_text",
+            "context_json",
             "status",
             "started_at",
             "finished_at",

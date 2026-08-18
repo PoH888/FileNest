@@ -1,13 +1,17 @@
-"""Agent 运行轨迹的最小安全持久化边界。"""
+"""Agent 运行轨迹与可恢复上下文的最小持久化边界。"""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from hashlib import sha256
+import json
 from typing import Literal, Protocol, runtime_checkable
 
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from .model_client import ModelMessage
 from .models import AgentRun, AgentToolCall
 from .repositories import (
     add_agent_run,
@@ -54,7 +58,7 @@ class AgentObservabilityError(RuntimeError):
 
 @runtime_checkable
 class AgentRunRecorder(Protocol):
-    """Agent Loop 可调用且不接收消息或工具载荷的记录契约。"""
+    """Agent Loop 可调用的生命周期与已验证上下文记录契约。"""
 
     def start_run(self) -> int:
         """创建运行记录并返回程序侧主键。"""
@@ -97,9 +101,20 @@ class AgentRunRecorder(Protocol):
 
         ...
 
+    def checkpoint_run(
+        self,
+        *,
+        agent_run_id: int,
+        messages: Sequence[ModelMessage],
+        model_turns: int,
+    ) -> None:
+        """保存可供后续 Resume 使用的已验证消息上下文。"""
+
+        ...
+
 
 class SqlAlchemyAgentRunRecorder:
-    """使用独立提交保存可在进程中断后检查的 Agent 生命周期。"""
+    """使用独立提交保存生命周期和可恢复的 Agent 消息上下文。"""
 
     def __init__(
         self,
@@ -114,6 +129,69 @@ class SqlAlchemyAgentRunRecorder:
         agent_run = AgentRun(started_at=self._now())
         add_agent_run(self._session, agent_run)
         self._commit()
+        return agent_run.id
+
+    def start_pending_run(
+        self,
+        *,
+        workspace_id: int | None = None,
+        request_text: str | None = None,
+        messages: Sequence[ModelMessage] | None = None,
+    ) -> int:
+        """持久化排队状态，供 HTTP 请求返回前取得稳定的 run_id。"""
+
+        agent_run = AgentRun(
+            status="pending",
+            started_at=self._now(),
+            workspace_id=workspace_id,
+            request_text=request_text,
+            context_json=(
+                _serialize_messages(messages) if messages is not None else None
+            ),
+        )
+        add_agent_run(self._session, agent_run)
+        self._commit()
+        return agent_run.id
+
+    def queue_resume(
+        self,
+        agent_run_id: int,
+        *,
+        allowed_statuses: Sequence[str],
+    ) -> bool:
+        """以一次条件更新把可恢复运行重新放入排队状态。"""
+
+        if not allowed_statuses:
+            raise ValueError("allowed_statuses must not be empty")
+        result = self._session.execute(
+            update(AgentRun)
+            .where(
+                AgentRun.id == agent_run_id,
+                AgentRun.status.in_(allowed_statuses),
+            )
+            .values(
+                status="pending",
+                finished_at=None,
+                error_code=None,
+            )
+        )
+        if result.rowcount != 1:
+            self._session.rollback()
+            return False
+        self._commit()
+        return True
+
+    def start_existing_run(self, agent_run_id: int) -> int:
+        """把已排队运行原子地推进到执行中，并允许重复领取。"""
+
+        agent_run = get_agent_run_by_id(self._session, agent_run_id)
+        if agent_run is None:
+            raise AgentObservabilityError("Agent 运行记录不存在")
+        if agent_run.status == "pending":
+            agent_run.status = "running"
+            self._commit()
+        elif agent_run.status != "running":
+            raise AgentObservabilityError("Agent 运行记录已结束")
         return agent_run.id
 
     def start_tool_call(
@@ -184,6 +262,47 @@ class SqlAlchemyAgentRunRecorder:
         agent_run.error_code = error_code
         self._commit()
 
+    def checkpoint_run(
+        self,
+        *,
+        agent_run_id: int,
+        messages: Sequence[ModelMessage],
+        model_turns: int,
+    ) -> None:
+        """独立提交已完成消息，保证中断后能从最近上下文继续。"""
+
+        if model_turns < 0:
+            raise ValueError("model_turns must be non-negative")
+        agent_run = get_agent_run_by_id(self._session, agent_run_id)
+        if agent_run is None:
+            raise AgentObservabilityError("Agent 运行记录不存在")
+        agent_run.context_json = _serialize_messages(messages)
+        agent_run.model_turns = model_turns
+        self._commit()
+
+    def load_context(
+        self,
+        agent_run_id: int,
+    ) -> tuple[tuple[ModelMessage, ...], int]:
+        """读取并重新校验持久化上下文，拒绝损坏或空上下文。"""
+
+        agent_run = get_agent_run_by_id(self._session, agent_run_id)
+        if agent_run is None:
+            raise AgentObservabilityError("Agent 运行记录不存在")
+        if not agent_run.context_json:
+            raise AgentObservabilityError("Agent 运行缺少可恢复的持久状态")
+        try:
+            messages = TypeAdapter(
+                tuple[ModelMessage, ...]
+            ).validate_json(agent_run.context_json)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise AgentObservabilityError(
+                "Agent 运行的持久状态不可恢复"
+            ) from error
+        if not messages:
+            raise AgentObservabilityError("Agent 运行缺少可恢复的消息上下文")
+        return messages, agent_run.model_turns
+
     def _now(self) -> datetime:
         value = self._clock()
         if value.tzinfo is None or value.utcoffset() is None:
@@ -220,3 +339,11 @@ def _validate_terminal_error(
         raise ValueError("successful record must not contain an error code")
     if error_code is not None and error_code not in allowed_error_codes:
         raise ValueError("record contains an unsupported error code")
+
+
+def _serialize_messages(messages: Sequence[ModelMessage]) -> str:
+    return json.dumps(
+        [message.model_dump(mode="json") for message in messages],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

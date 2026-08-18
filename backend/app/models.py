@@ -299,12 +299,13 @@ class ChunkEmbeddingRecord(Base):
 
 
 class AgentRun(Base):
-    """一次 Agent Loop 运行的持久化生命周期。"""
+    """一次 Agent Loop 运行的持久化生命周期与恢复上下文。"""
 
     __tablename__ = "agent_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('running', 'completed', 'max_steps_reached', "
+            "status IN ('pending', 'running', 'waiting_approval', "
+            "'completed', 'max_steps_reached', "
             "'timed_out', 'cancelled', 'failed')",
             name="ck_agent_runs_status",
         ),
@@ -315,6 +316,18 @@ class AgentRun(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=True,
+    )
+    request_text: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    context_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(
         String,
         nullable=False,
