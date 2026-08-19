@@ -685,6 +685,278 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
         downgraded_engine.dispose()
 
 
+def test_agent_session_migration_creates_and_downgrades_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "agent-session-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"] for column in schema.get_columns("agent_sessions")
+        ] == [
+            "id",
+            "workspace_id",
+            "metadata_json",
+            "created_at",
+            "updated_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_sessions")
+        } == {"ck_agent_sessions_metadata_non_empty"}
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "l11a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        assert "agent_sessions" not in inspect(
+            downgraded_engine
+        ).get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_agent_step_migration_creates_and_downgrades_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "agent-step-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"] for column in schema.get_columns("agent_steps")
+        ] == [
+            "id",
+            "agent_session_id",
+            "step_index",
+            "step_type",
+            "input",
+            "output_summary",
+            "status",
+            "started_at",
+            "completed_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_steps")
+        } == {
+            "ck_agent_steps_index_non_negative",
+            "ck_agent_steps_type_non_empty",
+            "ck_agent_steps_status_non_empty",
+        }
+        assert {
+            constraint["name"]
+            for constraint in schema.get_unique_constraints("agent_steps")
+        } == {"uq_agent_steps_session_index"}
+        foreign_keys = schema.get_foreign_keys("agent_steps")
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["constrained_columns"] == [
+            "agent_session_id"
+        ]
+        assert foreign_keys[0]["referred_table"] == "agent_sessions"
+        assert foreign_keys[0]["referred_columns"] == ["id"]
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "m12a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        assert "agent_steps" not in inspect(
+            downgraded_engine
+        ).get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_agent_message_migration_creates_and_downgrades_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "agent-message-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"] for column in schema.get_columns("agent_messages")
+        ] == [
+            "id",
+            "agent_step_id",
+            "sequence_no",
+            "message_type",
+            "payload_json",
+            "created_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_messages")
+        } == {
+            "ck_agent_messages_sequence_non_negative",
+            "ck_agent_messages_type",
+            "ck_agent_messages_payload_non_empty",
+        }
+        assert {
+            constraint["name"]
+            for constraint in schema.get_unique_constraints("agent_messages")
+        } == {"uq_agent_messages_step_sequence"}
+        foreign_keys = schema.get_foreign_keys("agent_messages")
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["constrained_columns"] == ["agent_step_id"]
+        assert foreign_keys[0]["referred_table"] == "agent_steps"
+        assert foreign_keys[0]["referred_columns"] == ["id"]
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "n12a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        assert "agent_messages" not in inspect(
+            downgraded_engine
+        ).get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_agent_model_run_migration_creates_and_downgrades_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "agent-model-run-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"]
+            for column in schema.get_columns("agent_model_runs")
+        ] == [
+            "id",
+            "agent_step_id",
+            "model",
+            "prompt_version",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "latency_ms",
+            "created_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_model_runs")
+        } == {
+            "ck_agent_model_runs_model_non_empty",
+            "ck_agent_model_runs_prompt_version",
+            "ck_agent_model_runs_input_tokens_non_negative",
+            "ck_agent_model_runs_output_tokens_non_negative",
+            "ck_agent_model_runs_total_tokens_non_negative",
+            "ck_agent_model_runs_token_usage_complete",
+            "ck_agent_model_runs_latency_non_negative",
+        }
+        foreign_keys = schema.get_foreign_keys("agent_model_runs")
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["constrained_columns"] == ["agent_step_id"]
+        assert foreign_keys[0]["referred_table"] == "agent_steps"
+        assert foreign_keys[0]["referred_columns"] == ["id"]
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "o12a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        assert "agent_model_runs" not in inspect(
+            downgraded_engine
+        ).get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
+def test_agent_metric_migration_creates_and_downgrades_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "agent-metrics-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("FILENEST_DATABASE_URL", database_url)
+
+    alembic_config = Config(str(ALEMBIC_CONFIG_PATH))
+    command.upgrade(alembic_config, "head")
+
+    engine = create_engine(database_url)
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"] for column in schema.get_columns("agent_metrics")
+        ] == [
+            "id",
+            "agent_session_id",
+            "agent_step_id",
+            "agent_model_run_id",
+            "metric_name",
+            "value_json",
+            "unit",
+            "created_at",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in schema.get_check_constraints("agent_metrics")
+        } == {
+            "ck_agent_metrics_name_non_empty",
+            "ck_agent_metrics_value_non_empty",
+            "ck_agent_metrics_unit",
+        }
+        foreign_keys = schema.get_foreign_keys("agent_metrics")
+        assert {
+            (foreign_key["constrained_columns"][0], foreign_key["referred_table"])
+            for foreign_key in foreign_keys
+        } == {
+            ("agent_session_id", "agent_sessions"),
+            ("agent_step_id", "agent_steps"),
+            ("agent_model_run_id", "agent_model_runs"),
+        }
+    finally:
+        engine.dispose()
+
+    command.downgrade(alembic_config, "p12a01b2c3d4")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        assert "agent_metrics" not in inspect(
+            downgraded_engine
+        ).get_table_names()
+    finally:
+        downgraded_engine.dispose()
+
+
 def test_execution_attempt_migration_preserves_existing_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

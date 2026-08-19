@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     String,
     Text,
@@ -296,6 +297,232 @@ class ChunkEmbeddingRecord(Base):
                 "持久化向量维度与记录不一致"
             )
         return vector
+
+
+class AgentSession(Base):
+    """Agent 多次运行共享的会话级元数据。"""
+
+    __tablename__ = "agent_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "length(metadata_json) > 0",
+            name="ck_agent_sessions_metadata_non_empty",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id"),
+        nullable=True,
+    )
+    metadata_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+
+class AgentStep(Base):
+    """Agent 会话内一个可追踪步骤的持久化记录。"""
+
+    __tablename__ = "agent_steps"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_session_id",
+            "step_index",
+            name="uq_agent_steps_session_index",
+        ),
+        CheckConstraint(
+            "step_index >= 0",
+            name="ck_agent_steps_index_non_negative",
+        ),
+        CheckConstraint(
+            "length(step_type) > 0 AND step_type = trim(step_type)",
+            name="ck_agent_steps_type_non_empty",
+        ),
+        CheckConstraint(
+            "length(status) > 0 AND status = trim(status)",
+            name="ck_agent_steps_status_non_empty",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_session_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_sessions.id"),
+        nullable=False,
+    )
+    step_index: Mapped[int] = mapped_column(nullable=False)
+    step_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    input: Mapped[str] = mapped_column(Text, nullable=False)
+    output_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class AgentMessage(Base):
+    """Agent 步骤中的中间消息或工具事件完整快照。"""
+
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_step_id",
+            "sequence_no",
+            name="uq_agent_messages_step_sequence",
+        ),
+        CheckConstraint(
+            "sequence_no >= 0",
+            name="ck_agent_messages_sequence_non_negative",
+        ),
+        CheckConstraint(
+            "message_type IN ('user', 'assistant', 'tool_call', 'tool_result')",
+            name="ck_agent_messages_type",
+        ),
+        CheckConstraint(
+            "length(payload_json) > 0",
+            name="ck_agent_messages_payload_non_empty",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_step_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_steps.id"),
+        nullable=False,
+    )
+    sequence_no: Mapped[int] = mapped_column(nullable=False)
+    message_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+
+class AgentModelRun(Base):
+    """一个 Agent 步骤对应的模型调用及其运行信息。"""
+
+    __tablename__ = "agent_model_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "length(model) > 0 AND model = trim(model)",
+            name="ck_agent_model_runs_model_non_empty",
+        ),
+        CheckConstraint(
+            "prompt_version IS NULL OR (length(prompt_version) > 0 "
+            "AND prompt_version = trim(prompt_version))",
+            name="ck_agent_model_runs_prompt_version",
+        ),
+        CheckConstraint(
+            "input_tokens IS NULL OR input_tokens >= 0",
+            name="ck_agent_model_runs_input_tokens_non_negative",
+        ),
+        CheckConstraint(
+            "output_tokens IS NULL OR output_tokens >= 0",
+            name="ck_agent_model_runs_output_tokens_non_negative",
+        ),
+        CheckConstraint(
+            "total_tokens IS NULL OR total_tokens >= 0",
+            name="ck_agent_model_runs_total_tokens_non_negative",
+        ),
+        CheckConstraint(
+            "(input_tokens IS NULL AND output_tokens IS NULL "
+            "AND total_tokens IS NULL) OR "
+            "(input_tokens IS NOT NULL AND output_tokens IS NOT NULL "
+            "AND total_tokens IS NOT NULL)",
+            name="ck_agent_model_runs_token_usage_complete",
+        ),
+        CheckConstraint(
+            "latency_ms >= 0",
+            name="ck_agent_model_runs_latency_non_negative",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_step_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_steps.id"),
+        nullable=False,
+    )
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    prompt_version: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+    input_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+
+class AgentMetric(Base):
+    """供 Agent 分析与评估使用的可扩展指标记录。"""
+
+    __tablename__ = "agent_metrics"
+    __table_args__ = (
+        CheckConstraint(
+            "length(metric_name) > 0 AND metric_name = trim(metric_name)",
+            name="ck_agent_metrics_name_non_empty",
+        ),
+        CheckConstraint(
+            "length(value_json) > 0",
+            name="ck_agent_metrics_value_non_empty",
+        ),
+        CheckConstraint(
+            "unit IS NULL OR (length(unit) > 0 AND unit = trim(unit))",
+            name="ck_agent_metrics_unit",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_session_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_sessions.id"),
+        nullable=False,
+    )
+    agent_step_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_steps.id"),
+        nullable=True,
+    )
+    agent_model_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_model_runs.id"),
+        nullable=True,
+    )
+    metric_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
 
 
 class AgentRun(Base):
