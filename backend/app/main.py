@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -6,12 +7,14 @@ from fastapi import Depends, FastAPI, HTTPException, Query # Depends：告诉 Fa
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .agent_api import router as agent_router
+from .agent_recovery import recover_unfinished_agent_runs
 from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
-from .database import check_database_connection, get_session
+from .database import SessionFactory, check_database_connection, get_session
 from .path_policy import PathPolicyError
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
 
@@ -36,7 +39,25 @@ from .schemas import (
     FileQueryParams,
 )
 
-app = FastAPI(title="FileNest API")
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """服务启动时记录待关注的 AgentRun，具体恢复仍由现有边界触发。"""
+
+    application.state.unfinished_agent_run_ids = ()
+    try:
+        with SessionFactory() as session:
+            application.state.unfinished_agent_run_ids = (
+                recover_unfinished_agent_runs(session)
+            )
+    except SQLAlchemyError:
+        # 旧数据库尚未完成迁移时，保持应用可启动，由健康检查报告存储问题。
+        application.state.unfinished_agent_run_ids = ()
+    yield
+
+
+app = FastAPI(title="FileNest API", lifespan=_lifespan)
 app.include_router(agent_router)
 app.include_router(organization_router)
 _MINIMAL_UI_PATH = Path(__file__).parent / "static" / "index.html"

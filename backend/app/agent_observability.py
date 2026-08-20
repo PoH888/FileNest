@@ -38,6 +38,7 @@ _SAFE_RUN_ERROR_CODES = frozenset(
         "model_server_error",
         "model_request_rejected",
         "model_provider_error",
+        "worker_interrupted",
     }
 )
 _SAFE_TOOL_ERROR_CODES = frozenset(
