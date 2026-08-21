@@ -342,6 +342,10 @@ def test_agent_run_api_records_background_failure(
     )
     assert state_response.json()["status"] == "failed"
     assert state_response.json()["error_code"] == "model_provider_error"
+    events_response = client.get(
+        f"/api/v1/agent-runs/{response.json()['run_id']}/events"
+    )
+    assert "event: agent.error" in events_response.text
 
 
 def test_cancel_agent_run_stops_background_execution(
@@ -398,6 +402,8 @@ def test_cancel_agent_run_stops_background_execution(
     assert _wait_for_agent_run_completion(client, run_id).json()["status"] == (
         "cancelled"
     )
+    events_response = client.get(f"/api/v1/agent-runs/{run_id}/events")
+    assert "event: agent.cancelled" in events_response.text
     repeated_cancel_response = client.post(
         f"/api/v1/agent-runs/{run_id}/cancel"
     )
@@ -527,6 +533,8 @@ def test_resume_agent_run_returns_accepted_and_restarts_run(
     assert _wait_for_agent_run_completion(client, run_id).json()["status"] == (
         "completed"
     )
+    events_response = client.get(f"/api/v1/agent-runs/{run_id}/events")
+    assert "event: agent.resumed" in events_response.text
 
 
 @pytest.mark.parametrize(
@@ -1035,28 +1043,82 @@ def test_agent_run_events_stream_persisted_statuses_with_ordered_ids(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     blocks = [block for block in response.text.split("\n\n") if block]
-    assert len(blocks) == 4
+    assert len(blocks) == 7
     event_lines = [block.splitlines() for block in blocks]
     assert [lines[0] for lines in event_lines] == [
         "id: 1",
         "id: 2",
         "id: 3",
         "id: 4",
+        "id: 5",
+        "id: 6",
+        "id: 7",
     ]
     assert [lines[1] for lines in event_lines] == [
         "event: agent_run.status_changed",
+        "event: agent.started",
         "event: agent_tool_call.status_changed",
+        "event: agent.step.started",
         "event: agent_tool_call.status_changed",
+        "event: agent.step.completed",
         "event: agent_run.status_changed",
     ]
     payloads = [json.loads(lines[2].removeprefix("data: ")) for lines in event_lines]
-    assert [payload["status"] for payload in payloads] == [
+    assert [payload["status"] for payload in payloads if "status" in payload] == [
         "running",
         "requested",
         "succeeded",
+        "succeeded",
         "completed",
     ]
+    assert payloads[1]["kind"] == "agent.started"
+    assert payloads[3]["kind"] == "agent.step.started"
+    assert payloads[5]["kind"] == "agent.step.completed"
     assert payloads[-1]["run_id"] == run_id
+
+
+def test_agent_run_stream_delivers_started_and_step_before_run_finishes(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    _, session_factory = agent_client
+    started_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    with session_factory() as session:
+        recorder = SqlAlchemyAgentRunRecorder(
+            session,
+            clock=lambda: started_at,
+        )
+        run_id = recorder.start_run()
+
+    with session_factory() as stream_session:
+        event_stream = _stream_agent_run_events(stream_session, run_id)
+        try:
+            first_event = next(event_stream)
+            second_event = next(event_stream)
+            assert "event: agent_run.status_changed" in first_event
+            assert "event: agent.started" in second_event
+
+            with session_factory() as session:
+                tool_call_id = SqlAlchemyAgentRunRecorder(
+                    session,
+                    clock=lambda: started_at,
+                ).start_tool_call(
+                    agent_run_id=run_id,
+                    sequence_no=1,
+                    model_call_id="call_realtime",
+                    tool_name="search_files",
+                )
+
+            next(event_stream)
+            step_started_event = next(event_stream)
+            assert "event: agent.step.started" in step_started_event
+            assert f'"step_id":{tool_call_id}' in step_started_event
+            with session_factory() as session:
+                persisted_run = session.get(AgentRun, run_id)
+                assert persisted_run is not None
+                assert persisted_run.status == "running"
+        finally:
+            event_stream.close()
 
 
 def test_agent_run_recovery_fetches_state_and_resumes_after_last_event_id(
@@ -1105,11 +1167,26 @@ def test_agent_run_recovery_fetches_state_and_resumes_after_last_event_id(
     blocks = [block for block in event_response.text.split("\n\n") if block]
     event_lines = [block.splitlines() for block in blocks]
     assert event_response.status_code == 200
-    assert [lines[0] for lines in event_lines] == ["id: 3", "id: 4"]
+    assert [lines[0] for lines in event_lines] == [
+        "id: 3",
+        "id: 4",
+        "id: 5",
+        "id: 6",
+        "id: 7",
+    ]
+    assert [lines[1] for lines in event_lines] == [
+        "event: agent_tool_call.status_changed",
+        "event: agent.step.started",
+        "event: agent_tool_call.status_changed",
+        "event: agent.step.completed",
+        "event: agent_run.status_changed",
+    ]
     payloads = [
         json.loads(lines[2].removeprefix("data: ")) for lines in event_lines
     ]
-    assert [payload["status"] for payload in payloads] == [
+    assert [payload["status"] for payload in payloads if "status" in payload] == [
+        "requested",
+        "succeeded",
         "succeeded",
         "completed",
     ]

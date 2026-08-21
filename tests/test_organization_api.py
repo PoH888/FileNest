@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from functools import partial
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -256,6 +257,11 @@ def test_get_unknown_organization_workflow_returns_safe_404(
             "message": "工作流不存在。",
         }
     }
+
+    events_response = client.get(f"/api/v1/workflows/{WORKFLOW_ID}/events")
+
+    assert events_response.status_code == 404
+    assert events_response.json() == response.json()
 
 
 def test_approve_organization_workflow_via_api(
@@ -549,6 +555,48 @@ def test_execute_and_undo_organization_workflow_via_api(
     assert undone["status"] == "UNDONE"
     assert source_path.read_bytes() == source_content
     assert not target_path.exists()
+
+    events_response = client.get(
+        f"/api/v1/workflows/{created['workflow_id']}/events"
+    )
+
+    assert events_response.status_code == 200
+    assert events_response.headers["content-type"].startswith(
+        "text/event-stream"
+    )
+    blocks = [
+        block for block in events_response.text.split("\n\n") if block
+    ]
+    payloads = [
+        json.loads(block.splitlines()[2].removeprefix("data: "))
+        for block in blocks
+    ]
+    assert [payload["kind"] for payload in payloads] == [
+        "approval.waiting",
+        "approval.approved",
+        "execution.started",
+        "execution.item.completed",
+        "execution.completed",
+        "undo.started",
+        "undo.item.completed",
+        "undo.completed",
+    ]
+
+    replay_response = client.get(
+        f"/api/v1/workflows/{created['workflow_id']}/events",
+        headers={"Last-Event-ID": "2"},
+    )
+    replay_blocks = [
+        block for block in replay_response.text.split("\n\n") if block
+    ]
+    assert [block.splitlines()[0] for block in replay_blocks] == [
+        "id: 3",
+        "id: 4",
+        "id: 5",
+        "id: 6",
+        "id: 7",
+        "id: 8",
+    ]
 
 
 def test_execute_api_rejects_unapproved_workflow_without_disk_change(

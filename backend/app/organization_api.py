@@ -1,14 +1,18 @@
 """最小界面使用的整理计划 HTTP 边界。"""
 
+from collections.abc import Iterator
+from time import sleep
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
 from .database import get_session
+from .events import build_workflow_event_stream
 from .operation_plan import OperationPlan
 from .operation_projection import OperationProjection
 from .organization_decisions import (
@@ -25,7 +29,10 @@ from .organization_planning import (
 )
 from .path_policy import PathPolicyError
 from .repositories import (
+    find_approval_audit_events,
+    find_operation_execution_items,
     get_approval_request_by_workflow_id,
+    get_operation_execution_by_workflow_id,
     get_operation_projection_by_workflow_id,
 )
 from .safe_execution import (
@@ -65,6 +72,7 @@ from .workflow_runtime import get_workflow_graph
 
 
 router = APIRouter(prefix="/api/v1")
+_WORKFLOW_EVENT_POLL_SECONDS = 0.1
 ApprovalStatus = Literal[
     "WAITING_APPROVAL",
     "APPROVED",
@@ -332,6 +340,54 @@ def _operation_plan_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
+def _stream_workflow_events(
+    session: Session,
+    workflow_id: UUID,
+    *,
+    after_event_id: int = 0,
+) -> Iterator[str]:
+    """轮询已提交的审批、执行和撤销事实，保持 SSE 可恢复。"""
+
+    emitted_event_count = after_event_id
+    workflow_key = str(workflow_id)
+    while True:
+        # 每轮结束只读事务，保证长连接能看到其他请求的新提交。
+        session.rollback()
+        approval = get_approval_request_by_workflow_id(session, workflow_key)
+        if approval is None:
+            return
+        audits = find_approval_audit_events(session, approval.id)
+        execution = get_operation_execution_by_workflow_id(
+            session,
+            workflow_key,
+        )
+        execution_items = (
+            find_operation_execution_items(session, execution.id)
+            if execution is not None
+            else ()
+        )
+        events = build_workflow_event_stream(
+            approval,
+            audits,
+            execution,
+            execution_items,
+        )
+        is_terminal = approval.status in {"REJECTED", "CANCELLED"} or (
+            execution is not None
+            and execution.status
+            in {"PARTIALLY_COMPLETED", "FAILED", "UNDONE"}
+        )
+        session.rollback()
+
+        for event in events[emitted_event_count:]:
+            emitted_event_count = event.event_id
+            yield event.encode()
+
+        if is_terminal:
+            return
+        sleep(_WORKFLOW_EVENT_POLL_SECONDS)
+
+
 @router.post(
     "/workflows",
     response_model=OrganizationWorkflowResponse,
@@ -406,6 +462,41 @@ def get_organization_workflow(
     """读取 checkpoint 与审批记录一致的计划快照。"""
 
     return _workflow_response(session, graph, workflow_id)
+
+
+@router.get("/workflows/{workflow_id}/events")
+def stream_organization_workflow_events(
+    workflow_id: UUID,
+    last_event_id: int | None = Header(
+        default=None,
+        alias="Last-Event-ID",
+        ge=1,
+    ),
+    session: Session = Depends(get_session),
+) -> StreamingResponse:
+    """以 SSE 只读传递工作流的审批、执行和撤销事件。"""
+
+    if get_approval_request_by_workflow_id(session, str(workflow_id)) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workflow_not_found",
+                "message": "工作流不存在。",
+            },
+        )
+
+    return StreamingResponse(
+        _stream_workflow_events(
+            session,
+            workflow_id,
+            after_event_id=last_event_id or 0,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post(

@@ -499,6 +499,11 @@ AGENT_RUN_RESUMABLE_STATUSES = frozenset(
 )
 _agent_run_cancel_events: dict[int, Event] = {}
 _agent_run_cancel_events_lock = Lock()
+_agent_run_resumed_ids: set[tuple[int, int]] = set()
+
+
+def _agent_run_event_key(session: Session, run_id: int) -> tuple[int, int]:
+    return (id(session.get_bind()), run_id)
 
 
 def _register_agent_run_cancel_event(run_id: int) -> Event:
@@ -516,6 +521,21 @@ def _get_agent_run_cancel_event(run_id: int) -> Event | None:
 def _remove_agent_run_cancel_event(run_id: int) -> None:
     with _agent_run_cancel_events_lock:
         _agent_run_cancel_events.pop(run_id, None)
+
+
+def _mark_agent_run_resumed(session: Session, run_id: int) -> None:
+    with _agent_run_cancel_events_lock:
+        _agent_run_resumed_ids.add(_agent_run_event_key(session, run_id))
+
+
+def _is_agent_run_resumed(session: Session, run_id: int) -> bool:
+    with _agent_run_cancel_events_lock:
+        return _agent_run_event_key(session, run_id) in _agent_run_resumed_ids
+
+
+def _remove_agent_run_resumed(session: Session, run_id: int) -> None:
+    with _agent_run_cancel_events_lock:
+        _agent_run_resumed_ids.discard(_agent_run_event_key(session, run_id))
 
 
 def _mark_background_agent_run_failed(
@@ -610,6 +630,7 @@ def _stream_agent_run_events(
         session.rollback()
         agent_run = get_agent_run_by_id(session, run_id)
         if agent_run is None:
+            _remove_agent_run_resumed(session, run_id)
             return
         tool_calls = list(
             session.scalars(
@@ -618,7 +639,11 @@ def _stream_agent_run_events(
                 .order_by(AgentToolCall.sequence_no)
             )
         )
-        events = build_agent_run_event_stream(agent_run, tool_calls)
+        events = build_agent_run_event_stream(
+            agent_run,
+            tool_calls,
+            resumed=_is_agent_run_resumed(session, run_id),
+        )
         is_terminal = agent_run.status not in AGENT_RUN_ACTIVE_STATUSES
         session.rollback()
 
@@ -627,6 +652,7 @@ def _stream_agent_run_events(
             yield event.encode()
 
         if is_terminal:
+            _remove_agent_run_resumed(session, run_id)
             return
         sleep(_AGENT_EVENT_POLL_SECONDS)
 
@@ -761,6 +787,7 @@ def resume_agent_run(
             },
         )
 
+    _mark_agent_run_resumed(session, run_id)
     try:
         _schedule_agent_run(
             executor,
@@ -770,6 +797,7 @@ def resume_agent_run(
             request_text=agent_run.request_text,
         )
     except (AgentObservabilityError, RuntimeError) as error:
+        _remove_agent_run_resumed(session, run_id)
         _mark_background_agent_run_failed(session, run_id)
         raise HTTPException(
             status_code=503,
@@ -878,5 +906,8 @@ def stream_agent_run_events(
             after_event_id=last_event_id or 0,
         ),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )

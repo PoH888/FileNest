@@ -153,6 +153,7 @@
     let currentSources = [];
     let currentWorkflow = null;
     let activeRunEventSource = null;
+    let activeWorkflowEventSource = null;
 
     const TERMINAL_RUN_STATUSES = new Set([
       "completed",
@@ -173,6 +174,26 @@
       rejected: "已拒绝",
       failed: "失败",
     });
+    const AGENT_LIFECYCLE_EVENT_TYPES = Object.freeze([
+      "agent.started",
+      "agent.step.started",
+      "agent.step.completed",
+      "agent.cancelled",
+      "agent.resumed",
+      "agent.error",
+    ]);
+    const WORKFLOW_EVENT_TYPES = Object.freeze([
+      "approval.waiting",
+      "approval.approved",
+      "approval.rejected",
+      "execution.started",
+      "execution.item.completed",
+      "execution.item.failed",
+      "execution.completed",
+      "undo.started",
+      "undo.item.completed",
+      "undo.completed",
+    ]);
 
     function showStatus(message, answer = "") {
       resultStatus.textContent = message;
@@ -191,8 +212,16 @@
       }
     }
 
+    function closeWorkflowEventStream() {
+      if (activeWorkflowEventSource !== null) {
+        activeWorkflowEventSource.close();
+        activeWorkflowEventSource = null;
+      }
+    }
+
     function resetRunTimeline() {
       closeRunEventStream();
+      closeWorkflowEventStream();
       timelineList.replaceChildren();
       timelinePanel.hidden = true;
     }
@@ -259,10 +288,41 @@
       return `工具调用 ${sequenceNo}：${toolName}${statusLabel}${errorSuffix}。`;
     }
 
+    function describeAgentLifecycleEvent(payload, eventType) {
+      const runId = String(payload.run_id);
+      if (eventType === "agent.started") {
+        return `运行 #${runId} 已开始。`;
+      }
+      if (eventType === "agent.resumed") {
+        return `运行 #${runId} 已恢复。`;
+      }
+      if (eventType === "agent.step.started") {
+        return `Agent 步骤 ${String(payload.step_index)}：${String(payload.step_type)} 开始。`;
+      }
+      if (eventType === "agent.step.completed") {
+        const statusLabel = TOOL_STATUS_LABELS[payload.status] ?? "状态已更新";
+        const errorSuffix =
+          typeof payload.error_code === "string"
+            ? `（${payload.error_code}）`
+            : "";
+        return `Agent 步骤 ${String(payload.step_index)}：${String(payload.step_type)}${statusLabel}${errorSuffix}。`;
+      }
+      if (eventType === "agent.cancelled") {
+        return `运行 #${runId} 已取消。`;
+      }
+      const errorSuffix =
+        typeof payload.error_code === "string"
+          ? `（${payload.error_code}）`
+          : "";
+      return `运行 #${runId} 出错${errorSuffix}。`;
+    }
+
     function handleRunEvent(runId, eventType, event, eventSource) {
       const payload = parseRunEvent(event);
       if (
         payload === null ||
+        (AGENT_LIFECYCLE_EVENT_TYPES.includes(eventType) &&
+          String(payload.run_id) !== String(runId)) ||
         (eventType === "agent_run.status_changed" &&
           String(payload.run_id) !== String(runId))
       ) {
@@ -274,9 +334,29 @@
         return;
       }
 
+      if (AGENT_LIFECYCLE_EVENT_TYPES.includes(eventType)) {
+        if (eventType === "agent.started" || eventType === "agent.resumed") {
+          resultStatus.textContent = `运行 #${runId} 处理中…`;
+        } else if (eventType === "agent.cancelled") {
+          resultStatus.textContent = `运行 #${runId} 已取消。`;
+        } else if (eventType === "agent.error") {
+          resultStatus.textContent = `运行 #${runId} 失败（${String(payload.error_code)}）。`;
+        }
+        addRunTimelineItem(describeAgentLifecycleEvent(payload, eventType));
+        if (eventType === "agent.cancelled" || eventType === "agent.error") {
+          eventSource.close();
+          if (activeRunEventSource === eventSource) {
+            activeRunEventSource = null;
+          }
+        }
+        return;
+      }
+
       if (eventType === "agent_run.status_changed") {
         updateRunStatus(payload);
-        addRunTimelineItem(describeRunEvent(payload));
+        if (payload.status !== "running") {
+          addRunTimelineItem(describeRunEvent(payload));
+        }
         if (TERMINAL_RUN_STATUSES.has(payload.status)) {
           eventSource.close();
           if (activeRunEventSource === eventSource) {
@@ -287,7 +367,7 @@
       }
 
       if (eventType === "agent_tool_call.status_changed") {
-        addRunTimelineItem(describeToolEvent(payload));
+        return;
       }
     }
 
@@ -366,6 +446,11 @@
           );
         },
       );
+      for (const eventType of AGENT_LIFECYCLE_EVENT_TYPES) {
+        eventSource.addEventListener(eventType, (event) => {
+          handleRunEvent(runId, eventType, event, eventSource);
+        });
+      }
       eventSource.onerror = async () => {
         if (
           recoveryInProgress ||
@@ -377,6 +462,124 @@
         recoveryInProgress = true;
         await recoverRunEventStream(runId, eventSource);
         recoveryInProgress = false;
+      };
+    }
+
+    function describeWorkflowEvent(payload, eventType) {
+      if (eventType === "approval.waiting") {
+        return `计划 ${String(payload.plan_id)} 等待审批。`;
+      }
+      if (eventType === "approval.approved") {
+        return `计划 ${String(payload.plan_id)} 已批准。`;
+      }
+      if (eventType === "approval.rejected") {
+        const resultLabel = payload.action === "cancel" ? "已取消" : "已拒绝";
+        return `计划 ${String(payload.plan_id)} ${resultLabel}。`;
+      }
+      if (eventType === "execution.started") {
+        return "文件执行已开始。";
+      }
+      if (eventType === "execution.item.completed") {
+        return `执行项 ${String(payload.sequence_no)} 已完成。`;
+      }
+      if (eventType === "execution.item.failed") {
+        const errorSuffix =
+          typeof payload.error_code === "string"
+            ? `（${payload.error_code}）`
+            : "";
+        return `执行项 ${String(payload.sequence_no)} 失败${errorSuffix}。`;
+      }
+      if (eventType === "execution.completed") {
+        return `文件执行已结束：${String(payload.status)}。`;
+      }
+      if (eventType === "undo.started") {
+        return "撤销执行已开始。";
+      }
+      if (eventType === "undo.item.completed") {
+        return `撤销项 ${String(payload.sequence_no)} 已完成。`;
+      }
+      return "执行已撤销完成。";
+    }
+
+    function handleWorkflowEvent(
+      workflowId,
+      eventType,
+      event,
+      eventSource,
+    ) {
+      const payload = parseRunEvent(event);
+      if (
+        payload === null ||
+        String(payload.workflow_id) !== String(workflowId)
+      ) {
+        eventSource.close();
+        if (activeWorkflowEventSource === eventSource) {
+          activeWorkflowEventSource = null;
+        }
+        planStatus.textContent = "实时计划状态数据不可用。";
+        return;
+      }
+
+      addRunTimelineItem(describeWorkflowEvent(payload, eventType));
+      if (eventType === "approval.waiting") {
+        planStatus.textContent = "计划等待审批。";
+      } else if (eventType === "approval.approved") {
+        planStatus.textContent = "计划已批准，尚未执行文件操作。";
+        showExecutionAction();
+      } else if (eventType === "approval.rejected") {
+        planStatus.textContent =
+          payload.action === "cancel" ? "计划已取消。" : "计划已拒绝。";
+        currentWorkflow = null;
+        eventSource.close();
+        activeWorkflowEventSource = null;
+        resetPlanActions();
+      } else if (eventType === "execution.started") {
+        planStatus.textContent = "文件执行中…";
+      } else if (eventType === "execution.item.failed") {
+        planStatus.textContent = "部分文件执行失败。";
+      } else if (eventType === "execution.completed") {
+        if (payload.status === "COMPLETED") {
+          planStatus.textContent = "计划已执行，文件已移动，可以撤销。";
+          showUndoAction();
+        } else {
+          planStatus.textContent = `执行结果：${String(payload.status)}。`;
+          eventSource.close();
+          activeWorkflowEventSource = null;
+        }
+      } else if (eventType === "undo.started") {
+        planStatus.textContent = "撤销执行中…";
+      } else if (eventType === "undo.completed") {
+        planStatus.textContent = "执行已撤销，文件已恢复原位置。";
+        currentWorkflow = null;
+        eventSource.close();
+        activeWorkflowEventSource = null;
+        resetPlanActions();
+      }
+    }
+
+    function startWorkflowEventStream(workflowId) {
+      closeWorkflowEventStream();
+      if (typeof EventSource !== "function") {
+        addRunTimelineItem("当前浏览器不支持实时计划状态。");
+        return;
+      }
+
+      const eventSource = new EventSource(
+        `/api/v1/workflows/${encodeURIComponent(workflowId)}/events`,
+      );
+      activeWorkflowEventSource = eventSource;
+      for (const eventType of WORKFLOW_EVENT_TYPES) {
+        eventSource.addEventListener(eventType, (event) => {
+          handleWorkflowEvent(workflowId, eventType, event, eventSource);
+        });
+      }
+      eventSource.onerror = () => {
+        if (
+          activeWorkflowEventSource === eventSource &&
+          eventSource.readyState === EventSource.CLOSED
+        ) {
+          activeWorkflowEventSource = null;
+        }
       };
     }
 
@@ -446,6 +649,7 @@
     }
 
     function showPlanPreview(sources) {
+      closeWorkflowEventStream();
       planTargets.replaceChildren();
       planList.replaceChildren();
       planStatus.textContent = "";
@@ -495,6 +699,7 @@
       planStatus.textContent =
         `计划 ${planId} 已生成，当前等待审批。`;
       showApprovalActions();
+      startWorkflowEventStream(workflowId);
       for (const operation of operations) {
         const item = document.createElement("li");
         item.textContent = `${String(operation.source_relative_path)} → ${String(operation.target_relative_path)}`;
@@ -566,6 +771,7 @@
           return;
         }
 
+        startRunEventStream(payload.run_id, payload);
         resultAnswer.textContent =
           typeof payload.final_answer === "string" ? payload.final_answer : "";
         if (payload.status === "completed") {
@@ -574,7 +780,6 @@
         } else {
           showSources([]);
         }
-        startRunEventStream(payload.run_id, payload);
       } catch {
         showStatus("无法连接 FileNest API，请稍后重试。");
       } finally {
