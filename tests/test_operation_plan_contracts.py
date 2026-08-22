@@ -66,6 +66,12 @@ def test_operation_plan_describes_determined_immutable_operations() -> None:
         plan.workspace_id = 4
 
 
+def test_operation_plan_item_accepts_rename() -> None:
+    operation = _operation(operation_type="rename")
+
+    assert operation.operation_type == "rename"
+
+
 @pytest.mark.parametrize(
     "path",
     ["../outside.txt", "D:/outside.txt", "folder\\file.txt", " file.txt", "."],

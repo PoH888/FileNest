@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from pathlib import Path
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +39,22 @@ def scan_client(tmp_path: Path) -> Iterator[tuple[TestClient, Engine]]:
     test_engine.dispose()
 
 
+def _wait_for_job(
+    client: TestClient,
+    job_id: str,
+    expected_status: str,
+) -> dict[str, object]:
+    deadline = monotonic() + 2
+    while monotonic() < deadline:
+        response = client.get(f"/api/v1/jobs/{job_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] == expected_status:
+            return payload
+        sleep(0.005)
+    pytest.fail(f"job did not reach status {expected_status!r}")
+
+
 def test_scan_workspace_api_indexes_files(
     scan_client: tuple[TestClient, Engine],
     tmp_path: Path,
@@ -63,13 +80,11 @@ def test_scan_workspace_api_indexes_files(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
 
-    assert scan_response.status_code == 200
-    assert scan_response.json() == {
-        "created": 2,
-        "updated": 0,
-        "deleted": 0,
-        "unchanged": 0,
-    }
+    assert scan_response.status_code == 202
+    job_id = scan_response.json()["job_id"]
+    completed = _wait_for_job(client, job_id, "completed")
+    assert completed["job_id"] == job_id
+    assert completed["error_code"] is None
 
     with Session(engine) as session:
         assert [
@@ -105,13 +120,8 @@ def test_repeated_scan_tracks_real_file_changes(
 
     first_response = client.post(scan_url)
 
-    assert first_response.status_code == 200
-    assert first_response.json() == {
-        "created": 3,
-        "updated": 0,
-        "deleted": 0,
-        "unchanged": 0,
-    }
+    assert first_response.status_code == 202
+    _wait_for_job(client, first_response.json()["job_id"], "completed")
 
     with Session(engine) as session:
         initial_entries = {
@@ -123,13 +133,8 @@ def test_repeated_scan_tracks_real_file_changes(
 
     repeated_response = client.post(scan_url)
 
-    assert repeated_response.status_code == 200
-    assert repeated_response.json() == {
-        "created": 0,
-        "updated": 0,
-        "deleted": 0,
-        "unchanged": 3,
-    }
+    assert repeated_response.status_code == 202
+    _wait_for_job(client, repeated_response.json()["job_id"], "completed")
 
     changed_file.write_text("new content is longer", encoding="utf-8")
     new_file = workspace_root / "new.pdf"
@@ -138,13 +143,8 @@ def test_repeated_scan_tracks_real_file_changes(
 
     changed_response = client.post(scan_url)
 
-    assert changed_response.status_code == 200
-    assert changed_response.json() == {
-        "created": 1,
-        "updated": 1,
-        "deleted": 1,
-        "unchanged": 1,
-    }
+    assert changed_response.status_code == 202
+    _wait_for_job(client, changed_response.json()["job_id"], "completed")
 
     with Session(engine) as session:
         final_entries = {
@@ -214,16 +214,28 @@ def test_unavailable_workspace_does_not_delete_existing_index(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
 
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "workspace_scan_unavailable",
-            "message": "工作区目录当前不可扫描。",
-        }
-    }
+    assert response.status_code == 202
+    failed = _wait_for_job(client, response.json()["job_id"], "failed")
+    assert failed["error_code"] == "workspace_scan_unavailable"
 
     with Session(engine) as session:
         assert [
             entry.relative_path
             for entry in find_file_entries(session, workspace_id)
         ] == ["preserved.txt"]
+
+
+def test_job_status_returns_not_found(scan_client: tuple[TestClient, Engine]) -> None:
+    client, _ = scan_client
+
+    response = client.get(
+        "/api/v1/jobs/00000000-0000-0000-0000-000000000000",
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "job_not_found",
+            "message": "Job 不存在。",
+        }
+    }

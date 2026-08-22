@@ -254,7 +254,7 @@ class _WorkspaceScopedToolRegistry(ToolRegistry):
                 build_get_file_metadata_tool(session),
                 build_knowledge_search_tool(session),
                 build_propose_move_tool(session, graph),
-                build_propose_rename_tool(session),
+                build_propose_rename_tool(session, graph),
                 build_propose_quarantine_tool(
                     session,
                     graph,

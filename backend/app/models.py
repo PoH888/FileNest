@@ -639,7 +639,7 @@ class OperationPlanRecord(Base):
             name="ck_operation_plans_schema_version",
         ),
         CheckConstraint(
-            "operation_type IN ('move', 'quarantine')",
+            "operation_type IN ('move', 'quarantine', 'rename')",
             name="ck_operation_plans_operation_type",
         ),
         CheckConstraint(
@@ -718,7 +718,7 @@ class OperationItemRecord(Base):
             name="ck_operation_items_sequence_positive",
         ),
         CheckConstraint(
-            "operation_type IN ('move', 'quarantine')",
+            "operation_type IN ('move', 'quarantine', 'rename')",
             name="ck_operation_items_operation_type",
         ),
         CheckConstraint(
@@ -962,7 +962,7 @@ class OperationExecutionItem(Base):
             name="ck_operation_execution_items_sequence_positive",
         ),
         CheckConstraint(
-            "operation_type IN ('move', 'quarantine')",
+            "operation_type IN ('move', 'quarantine', 'rename')",
             name="ck_operation_execution_items_type",
         ),
         CheckConstraint(

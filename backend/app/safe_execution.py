@@ -124,7 +124,7 @@ def _ensure_supported_operation_plan(plan: OperationPlan) -> None:
         {
             operation.operation_type
             for operation in plan.operations
-            if operation.operation_type != "move"
+            if operation.operation_type not in {"move", "rename"}
         }
     )
     if unsupported_types:
@@ -195,7 +195,7 @@ def execute_safe_operation_plan(
             execution_item = OperationExecutionItem(
                 execution_id=execution.id,
                 sequence_no=sequence_no,
-                operation_type="move",
+                operation_type=operation.operation_type,
                 source_file_id=operation.source_file_id,
                 before_location="workspace",
                 before_relative_path=operation.source_relative_path,
@@ -896,7 +896,7 @@ def undo_safe_operation_execution(
     execution_item = execution_items[0]
     if (
         execution_item.status != "COMPLETED"
-        or execution_item.operation_type != "move"
+        or execution_item.operation_type not in {"move", "rename"}
         or execution_item.before_location != "workspace"
         or execution_item.after_location != "workspace"
         or execution_item.after_size_bytes is None
@@ -1047,7 +1047,7 @@ def _recover_interrupted_execution_items(
         if item.status != "PENDING":
             continue
         if (
-            item.operation_type != "move"
+            item.operation_type not in {"move", "rename"}
             or item.before_location != "workspace"
             or item.after_location != "workspace"
         ):
@@ -1178,7 +1178,7 @@ def _recover_interrupted_undo_items(
         if item.status != "UNDOING":
             continue
         if (
-            item.operation_type != "move"
+            item.operation_type not in {"move", "rename"}
             or item.before_location != "workspace"
             or item.after_location != "workspace"
             or item.after_size_bytes is None
@@ -1363,7 +1363,7 @@ def _validate_failed_item_for_retry(
 ) -> None:
     if (
         execution_item.status != "FAILED"
-        or execution_item.operation_type != "move"
+        or execution_item.operation_type not in {"move", "rename"}
         or execution_item.before_location != "workspace"
         or execution_item.after_location != "workspace"
         or execution_item.error_code is None
@@ -1404,7 +1404,7 @@ def _validate_completed_item_for_compensation(
 ) -> None:
     if (
         execution_item.status != "COMPLETED"
-        or execution_item.operation_type != "move"
+        or execution_item.operation_type not in {"move", "rename"}
         or execution_item.before_location != "workspace"
         or execution_item.after_location != "workspace"
         or execution_item.after_size_bytes is None

@@ -1,17 +1,27 @@
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Annotated
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query # Depends：告诉 FastAPI：执行这个路由前，先调用指定的依赖函数，并把结果交给路由。
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from .agent_api import router as agent_router
 from .agent_recovery import recover_unfinished_agent_runs
+from .document_indexer import (
+    DocumentIndexWorkspaceNotFoundError,
+    index_workspace_documents,
+)
+from .job_runner import JobContext, JobNotFoundError, JobTaskError, SingleProcessJobRunner
+from .job_store import SqlAlchemyJobStore
 from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
 from .database import SessionFactory, check_database_connection, get_session
@@ -46,6 +56,8 @@ async def _lifespan(application: FastAPI):
     """服务启动时记录待关注的 AgentRun，具体恢复仍由现有边界触发。"""
 
     application.state.unfinished_agent_run_ids = ()
+    application.state.job_runtimes = {}
+    application.state.job_runtime_lock = RLock()
     try:
         with SessionFactory() as session:
             application.state.unfinished_agent_run_ids = (
@@ -54,13 +66,101 @@ async def _lifespan(application: FastAPI):
     except SQLAlchemyError:
         # 旧数据库尚未完成迁移时，保持应用可启动，由健康检查报告存储问题。
         application.state.unfinished_agent_run_ids = ()
-    yield
+    try:
+        yield
+    finally:
+        with application.state.job_runtime_lock:
+            runtimes = tuple(application.state.job_runtimes.values())
+            application.state.job_runtimes.clear()
+        for runtime in runtimes:
+            runtime.runner.shutdown()
 
 
 app = FastAPI(title="FileNest API", lifespan=_lifespan)
 app.include_router(agent_router)
 app.include_router(organization_router)
 _MINIMAL_UI_PATH = Path(__file__).parent / "static" / "index.html"
+
+
+@dataclass(frozen=True, slots=True)
+class _JobRuntime:
+    runner: SingleProcessJobRunner
+    session_factory: Callable[[], Session]
+
+
+class JobSubmissionResponse(BaseModel):
+    """后台 Job 提交成功后的最小公开标识。"""
+
+    job_id: UUID
+
+
+class JobStatusResponse(BaseModel):
+    """Job 状态查询的公开投影。"""
+
+    job_id: UUID
+    status: str
+    error_code: str | None = None
+
+
+def _job_runtime_for_session(session: Session) -> _JobRuntime:
+    """为当前数据库绑定复用单进程 Runner，后台任务使用独立 Session。"""
+
+    bind = session.get_bind()
+    with app.state.job_runtime_lock:
+        runtime = app.state.job_runtimes.get(bind)
+        if runtime is None:
+            task_session_factory = sessionmaker(
+                bind=bind,
+                expire_on_commit=False,
+            )
+            runtime = _JobRuntime(
+                runner=SingleProcessJobRunner(
+                    store=SqlAlchemyJobStore(task_session_factory),
+                ),
+                session_factory=task_session_factory,
+            )
+            app.state.job_runtimes[bind] = runtime
+        return runtime
+
+
+def _run_workspace_scan(
+    _context: JobContext,
+    *,
+    session_factory: Callable[[], Session],
+    workspace_id: int,
+) -> None:
+    """在后台 Session 中执行扫描；业务失败转换为稳定 Job 错误码。"""
+
+    with session_factory() as task_session:
+        try:
+            scan_workspace_service(task_session, workspace_id)
+        except WorkspaceNotFoundError as error:
+            raise JobTaskError("workspace_not_found") from error
+        except WorkspaceScanUnavailableError as error:
+            raise JobTaskError("workspace_scan_unavailable") from error
+
+
+def _run_document_index(
+    _context: JobContext,
+    *,
+    session_factory: Callable[[], Session],
+    workspace_id: int,
+) -> None:
+    """在后台 Session 中完成文档解析、分块和持久化。"""
+
+    with session_factory() as task_session:
+        try:
+            index_workspace_documents(task_session, workspace_id)
+        except DocumentIndexWorkspaceNotFoundError as error:
+            raise JobTaskError("workspace_not_found") from error
+        except Exception as error:
+            raise JobTaskError("document_index_failed") from error
+
+
+def _public_job_status(status: str) -> str:
+    """将内部 succeeded 状态转换为 API 约定的 completed。"""
+
+    return "completed" if status == "succeeded" else status
 
 
 @app.get("/", include_in_schema=False)
@@ -280,29 +380,94 @@ def _file_list_item_response(file_entry: FileEntry) -> FileListItemResponse:
 
 @app.post(
     "/api/v1/workspaces/{workspace_id}/scan",
-    response_model=FileIndexSyncResponse,
+    response_model=JobSubmissionResponse,
+    status_code=202,
 )
 def scan_workspace(
     workspace_id: int,
     session: Session = Depends(get_session),
-) -> FileIndexSyncResult:
-    """安全扫描工作区，并将完整结果同步到文件索引。"""
 
-    try:
-        return scan_workspace_service(session, workspace_id)
-    except WorkspaceNotFoundError as error:
+) -> JobSubmissionResponse:
+    """创建后台扫描 Job，并立即返回其标识。"""
+
+    if get_workspace_service(session, workspace_id) is None:
         raise HTTPException(
             status_code=404,
             detail={
                 "code": "workspace_not_found",
                 "message": "工作区不存在。",
             },
-        ) from error
-    except WorkspaceScanUnavailableError as error:
+        )
+
+    runtime = _job_runtime_for_session(session)
+    submitted = runtime.runner.submit(
+        kind="workspace_scan",
+        workspace_id=workspace_id,
+        idempotency_key=f"workspace-scan:{workspace_id}:{uuid4()}",
+        task=lambda context: _run_workspace_scan(
+            context,
+            session_factory=runtime.session_factory,
+            workspace_id=workspace_id,
+        ),
+    )
+    return JobSubmissionResponse(job_id=submitted.job_id)
+
+
+@app.post(
+    "/api/v1/workspaces/{workspace_id}/documents/index",
+    response_model=JobSubmissionResponse,
+    status_code=202,
+)
+def index_documents(
+    workspace_id: int,
+    session: Session = Depends(get_session),
+) -> JobSubmissionResponse:
+    """创建后台文档索引 Job，并立即返回其标识。"""
+
+    if get_workspace_service(session, workspace_id) is None:
         raise HTTPException(
-            status_code=409,
+            status_code=404,
             detail={
-                "code": "workspace_scan_unavailable",
-                "message": "工作区目录当前不可扫描。",
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        )
+
+    runtime = _job_runtime_for_session(session)
+    submitted = runtime.runner.submit(
+        kind="document_index",
+        workspace_id=workspace_id,
+        idempotency_key=f"document-index:{workspace_id}:{uuid4()}",
+        task=lambda context: _run_document_index(
+            context,
+            session_factory=runtime.session_factory,
+            workspace_id=workspace_id,
+        ),
+    )
+    return JobSubmissionResponse(job_id=submitted.job_id)
+
+
+@app.get("/api/v1/jobs/{job_id}", response_model=JobStatusResponse)
+def get_job_status(
+    job_id: UUID,
+    session: Session = Depends(get_session),
+) -> JobStatusResponse:
+    """返回指定 Job 的当前状态。"""
+
+    runtime = _job_runtime_for_session(session)
+    try:
+        state = runtime.runner.get(job_id)
+    except JobNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "job_not_found",
+                "message": "Job 不存在。",
             },
         ) from error
+
+    return JobStatusResponse(
+        job_id=state.job_id,
+        status=_public_job_status(state.status),
+        error_code=state.error_code,
+    )

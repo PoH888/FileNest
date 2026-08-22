@@ -48,6 +48,7 @@ from .services import (
     WorkspaceNotFoundError,
     get_authorized_file_metadata,
     get_workspace,
+    validate_operation_plan,
 )
 from .tool_contracts import Tool, ToolResult
 from .workflow_graph import WorkflowCheckpointError
@@ -110,17 +111,12 @@ class ProposeRenameArguments(BaseModel):
         return value
 
 
-class RenameProposal(BaseModel):
-    """重命名 Proposal 的最小、只读结果。"""
+class ProposeRenameData(BaseModel):
+    """重命名 Proposal 成功后返回的待审批计划标识。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    proposal_id: UUID
-    operation_type: str = "rename"
-    workspace_id: int = Field(ge=1)
-    source_file_id: int = Field(ge=1)
-    source_relative_path: str = Field(min_length=1)
-    target_relative_path: str = Field(min_length=1)
+    plan_id: UUID
 
 
 class ProposeQuarantineArguments(BaseModel):
@@ -227,10 +223,12 @@ def build_propose_move_tool(
 
 def build_propose_rename_tool(
     session: Session,
+    graph: CompiledStateGraph,
     *,
-    proposal_id_factory: Callable[[], UUID] = uuid4,
+    workflow_id_factory: Callable[[], UUID] = uuid4,
+    plan_id_factory: Callable[[], UUID] = uuid4,
 ) -> Tool:
-    """构建只生成重命名 Proposal、不会实际 rename 的 Agent 工具。"""
+    """构建只创建待审批重命名计划、不会写入文件系统的 Agent 工具。"""
 
     def handle(arguments: BaseModel) -> ToolResult:
         options = cast(ProposeRenameArguments, arguments)
@@ -252,7 +250,9 @@ def build_propose_rename_tool(
             adapter = FileSystemAdapter(Path(workspace.root_path))
             source_path = Path(file_entry.relative_path)
             try:
-                if adapter.get_file_metadata(source_path) is None:
+                source_metadata = adapter.get_file_metadata(source_path)
+                source_hash = adapter.get_file_sha256(source_path)
+                if source_metadata is None or source_hash is None:
                     return ToolResult.failure(
                         code="source_unavailable",
                         message="源文件当前不可用",
@@ -280,6 +280,37 @@ def build_propose_rename_tool(
                     code="target_conflict",
                     message="目标文件已存在",
                 )
+
+            created_at = datetime.now(timezone.utc)
+            plan = OperationPlan(
+                plan_id=plan_id_factory(),
+                workspace_id=options.workspace_id,
+                created_at=created_at,
+                operations=(
+                    OperationPlanItem(
+                        operation_type="rename",
+                        source_file_id=file_entry.id,
+                        source_relative_path=file_entry.relative_path,
+                        target_relative_path=target_relative_path,
+                        source_precondition=FilePrecondition(
+                            size_bytes=source_metadata.size_bytes,
+                            mtime_ns=source_metadata.mtime_ns,
+                            content_hash=ContentHash(digest=source_hash),
+                        ),
+                        reason=OperationReason(
+                            kind="manual_selection",
+                            description="Agent 提出的重命名操作",
+                        ),
+                    ),
+                ),
+            )
+            validate_operation_plan(session, plan, now=created_at)
+            created = create_waiting_approval_workflow_for_plan(
+                session,
+                graph,
+                plan,
+                workflow_id_factory=workflow_id_factory,
+            )
         except WorkspaceNotFoundError:
             return ToolResult.failure(
                 code="workspace_not_found",
@@ -300,14 +331,20 @@ def build_propose_rename_tool(
                 code=error.code.value,
                 message=error.message,
             )
+        except _PLAN_VALIDATION_ERRORS:
+            return ToolResult.failure(
+                code="proposal_unavailable",
+                message="当前文件状态无法生成安全重命名计划",
+            )
+        except WorkflowCheckpointError:
+            return ToolResult.failure(
+                code="proposal_unavailable",
+                message="重命名计划当前无法进入待审批状态",
+            )
 
         return ToolResult.success(
-            RenameProposal(
-                proposal_id=proposal_id_factory(),
-                workspace_id=options.workspace_id,
-                source_file_id=file_entry.id,
-                source_relative_path=file_entry.relative_path,
-                target_relative_path=target_relative_path,
+            ProposeRenameData(
+                plan_id=created.workflow.operation_plan.plan_id,
             ).model_dump(mode="json")
         )
 

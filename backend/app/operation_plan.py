@@ -88,11 +88,11 @@ class FilePrecondition(BaseModel):
 
 
 class OperationPlanItem(BaseModel):
-    """一个源文件对应的确定移动操作，不执行任何磁盘写入。"""
+    """一个源文件对应的确定文件操作，不执行任何磁盘写入。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    operation_type: Literal["move", "quarantine"] = "move"
+    operation_type: Literal["move", "quarantine", "rename"] = "move"
     source_file_id: int = Field(ge=1)
     source_relative_path: str
     target_relative_path: str
