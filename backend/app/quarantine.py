@@ -2,12 +2,29 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+import os
 from pathlib import Path
 from uuid import UUID
 
 from core.file_mover import move_file as v1_move_file
 
 from .filesystem_adapter import FileSystemAdapter
+
+
+_QUARANTINE_ROOT_ENV = "FILENEST_QUARANTINE_ROOT"
+
+
+def resolve_quarantine_root() -> Path:
+    """读取隔离根目录配置，并与 Agent Proposal 使用同一默认位置。"""
+
+    configured_path = os.getenv(_QUARANTINE_ROOT_ENV)
+    if configured_path and configured_path.strip():
+        return Path(configured_path.strip())
+
+    # 延迟导入避免 quarantine → workflow_runtime → services 的模块环。
+    from .workflow_runtime import WORKFLOW_CHECKPOINT_PATH
+
+    return WORKFLOW_CHECKPOINT_PATH.with_name("quarantine")
 
 
 class QuarantineErrorCode(StrEnum):
@@ -71,7 +88,7 @@ def build_quarantine_relative_path(
 
 
 class QuarantineManager:
-    """在授权工作区与独立应用隔离区之间移动文件。"""
+    """在授权工作区与独立应用隔离区之间安全移动文件。"""
 
     def __init__(
         self,
@@ -205,3 +222,86 @@ class QuarantineManager:
             original_path=authorized_source,
             quarantine_path=authorized_result,
         )
+
+    def restore(
+        self,
+        quarantine_path: Path,
+        original_path: Path,
+    ) -> Path:
+        """将隔离文件安全恢复到原工作区路径，禁止覆盖现有文件。"""
+
+        authorized_source = self._quarantine_adapter.authorized_path(
+            quarantine_path
+        )
+        try:
+            source_metadata = self._quarantine_adapter.get_file_metadata(
+                authorized_source
+            )
+        except OSError as error:
+            raise QuarantineError(
+                QuarantineErrorCode.SOURCE_UNAVAILABLE,
+                "待恢复的隔离文件当前不可用",
+            ) from error
+        if source_metadata is None:
+            raise QuarantineError(
+                QuarantineErrorCode.SOURCE_UNAVAILABLE,
+                "待恢复的隔离路径不是普通文件",
+            )
+
+        expected_target = self._workspace_adapter.authorized_path(
+            original_path
+        )
+        target_directory = expected_target.parent
+        try:
+            if not self._workspace_adapter.is_directory(target_directory):
+                raise QuarantineError(
+                    QuarantineErrorCode.DIRECTORY_UNAVAILABLE,
+                    "原文件目录当前不可用",
+                )
+            if self._workspace_adapter.path_exists(expected_target):
+                raise QuarantineError(
+                    QuarantineErrorCode.TARGET_CONFLICT,
+                    "原文件路径已经存在，禁止覆盖恢复",
+                )
+        except OSError as error:
+            raise QuarantineError(
+                QuarantineErrorCode.DIRECTORY_UNAVAILABLE,
+                "原文件目录当前不可用",
+            ) from error
+
+        moved_path = v1_move_file(
+            authorized_source,
+            target_directory,
+            collision_strategy="skip",
+            target_name=expected_target.name,
+        )
+        if moved_path is None:
+            if self._workspace_adapter.path_exists(expected_target):
+                raise QuarantineError(
+                    QuarantineErrorCode.TARGET_CONFLICT,
+                    "恢复期间原文件路径被占用",
+                )
+            raise QuarantineError(
+                QuarantineErrorCode.MOVE_FAILED,
+                "隔离文件恢复失败",
+            )
+
+        authorized_result = self._workspace_adapter.authorized_path(
+            moved_path
+        )
+        try:
+            result_metadata = self._workspace_adapter.get_file_metadata(
+                authorized_result
+            )
+        except OSError as error:
+            raise QuarantineError(
+                QuarantineErrorCode.RESULT_MISMATCH,
+                "恢复后的结果文件不可用",
+            ) from error
+        if authorized_result != expected_target or result_metadata is None:
+            raise QuarantineError(
+                QuarantineErrorCode.RESULT_MISMATCH,
+                "恢复操作返回了非预期结果",
+            )
+
+        return authorized_result

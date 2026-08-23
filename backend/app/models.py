@@ -77,7 +77,7 @@ class DocumentRecord(Base):
     __tablename__ = "documents"
     __table_args__ = (
         CheckConstraint(
-            "source_format IN ('markdown', 'text')",
+            "source_format IN ('markdown', 'text', 'pdf', 'docx')",
             name="ck_documents_source_format",
         ),
         UniqueConstraint(
@@ -974,7 +974,7 @@ class OperationExecutionItem(Base):
             name="ck_operation_execution_items_after_location",
         ),
         CheckConstraint(
-            "status IN ('PENDING', 'COMPLETED', 'UNDOING', 'UNDONE', "
+            "status IN ('PENDING', 'EXECUTING', 'COMPLETED', 'UNDOING', 'UNDONE', "
             "'FAILED')",
             name="ck_operation_execution_items_status",
         ),

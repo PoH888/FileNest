@@ -60,6 +60,7 @@ from .services import (
     get_operation_plan,
 )
 from .operation_status import (
+    OperationStatus,
     map_approval_status_to_operation_status,
     map_workflow_status_to_operation_status,
 )
@@ -73,6 +74,17 @@ from .workflow_runtime import get_workflow_graph
 
 router = APIRouter(prefix="/api/v1")
 _WORKFLOW_EVENT_POLL_SECONDS = 0.1
+_POST_APPROVAL_OPERATION_STATUSES = frozenset(
+    {
+        OperationStatus.EXECUTING,
+        OperationStatus.PARTIAL_FAILED,
+        OperationStatus.COMPLETED,
+        OperationStatus.UNDOING,
+        OperationStatus.UNDONE,
+        OperationStatus.COMPENSATED,
+        OperationStatus.FAILED,
+    }
+)
 ApprovalStatus = Literal[
     "WAITING_APPROVAL",
     "APPROVED",
@@ -236,6 +248,20 @@ def _workflow_response(
             },
         ) from error
 
+    operation_state_is_consistent = (
+        operation is not None
+        and (
+            (
+                operation.overall_status == expected_approval_status
+                and operation.overall_status == expected_workflow_status
+            )
+            or (
+                operation.overall_status in _POST_APPROVAL_OPERATION_STATUSES
+                and expected_approval_status == OperationStatus.APPROVED
+                and expected_workflow_status == OperationStatus.APPROVED
+            )
+        )
+    )
     if (
         workflow.workflow_id != workflow_id
         or str(workflow.operation_plan.plan_id) != approval.plan_id
@@ -251,8 +277,7 @@ def _workflow_response(
         or operation.workflow_id != workflow_id
         or operation.plan_id != workflow.operation_plan.plan_id
         or operation.approval_id != approval.id
-        or operation.overall_status != expected_approval_status
-        or operation.overall_status != expected_workflow_status
+        or not operation_state_is_consistent
     ):
         raise HTTPException(
             status_code=409,

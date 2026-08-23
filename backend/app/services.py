@@ -47,6 +47,12 @@ from .path_policy import (
     normalize_workspace_root,
     validate_workspace_root,
 )
+from .quarantine import (
+    QuarantineError,
+    QuarantineManager,
+    build_quarantine_relative_path,
+    resolve_quarantine_root,
+)
 from .repositories import (
     add_file_entry,
     add_approval_audit_event,
@@ -823,6 +829,7 @@ def validate_operation_plan(
     plan: OperationPlan,
     *,
     now: datetime | None = None,
+    quarantine_root: Path | None = None,
 ) -> None:
     """校验计划时间、源文件状态、工作区归属和目标冲突。"""
 
@@ -839,6 +846,7 @@ def validate_operation_plan(
         raise WorkspaceNotFoundError(plan.workspace_id)
 
     adapter = FileSystemAdapter(Path(workspace.root_path))
+    quarantine_adapter: FileSystemAdapter | None = None
     for operation in plan.operations:
         file_entry = get_file_entry_by_id(
             session,
@@ -878,15 +886,44 @@ def validate_operation_plan(
             if current_hash != expected_hash.digest:
                 raise OperationPlanSourceChangedError(operation.source_file_id)
 
-        target_path = Path(operation.target_relative_path)
-        adapter.authorized_path(target_path)
+        target_adapter = adapter
+        if operation.operation_type == "quarantine":
+            if quarantine_adapter is None:
+                quarantine_adapter = FileSystemAdapter(
+                    quarantine_root or resolve_quarantine_root()
+                )
+                try:
+                    QuarantineManager(adapter, quarantine_adapter)
+                except (PathPolicyError, QuarantineError) as error:
+                    raise OperationPlanTargetUnavailableError(
+                        operation.target_relative_path
+                    ) from error
 
-        try:
-            if not adapter.is_directory(target_path.parent):
+            expected_target = build_quarantine_relative_path(
+                workspace_id=plan.workspace_id,
+                plan_id=plan.plan_id,
+                source_file_id=operation.source_file_id,
+                file_name=source_path.name,
+            ).as_posix()
+            if operation.target_relative_path != expected_target:
                 raise OperationPlanTargetUnavailableError(
                     operation.target_relative_path
                 )
-            if adapter.path_exists(target_path):
+            target_adapter = quarantine_adapter
+
+        target_path = Path(operation.target_relative_path)
+        target_adapter.authorized_path(target_path)
+
+        try:
+            # 隔离目录由 QuarantineManager 在真正执行时创建；审批前只检查
+            # 目标是否已被占用，避免把“待创建目录”误判为不可用。
+            if operation.operation_type != "quarantine" and not adapter.is_directory(
+                target_path.parent
+            ):
+                raise OperationPlanTargetUnavailableError(
+                    operation.target_relative_path
+                )
+            if target_adapter.path_exists(target_path):
                 raise OperationPlanTargetConflictError(
                     operation.target_relative_path
                 )

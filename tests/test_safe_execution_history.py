@@ -16,6 +16,7 @@ from backend.app.models import (
     FileEntry,
     OperationExecution,
     OperationExecutionItem,
+    OperationStatusRecord,
     Workspace,
 )
 from backend.app.operation_plan import (
@@ -26,19 +27,25 @@ from backend.app.operation_plan import (
     OperationReason,
 )
 from backend.app.organization_planning import build_operation_plan_record
+from backend.app.operation_status import OperationStatus
 from backend.app.repositories import (
     find_operation_execution_items,
     get_file_entry_by_id,
     get_operation_execution_by_workflow_id,
+    get_operation_status_by_workflow_id,
 )
 from backend.app.safe_execution import (
+    ExecutionRecoveryStrategy,
     SafeExecutionError,
     SafeExecutionErrorCode,
     SafeExecutionRequest,
     compensate_partial_operation_execution,
     execute_safe_operation_plan,
     recover_interrupted_operation_execution,
+    recover_operation_execution,
+    recover_unfinished_operation_executions,
     retry_failed_operation_execution,
+    scan_unfinished_operation_executions,
     undo_safe_operation_execution,
 )
 from backend.app.safe_file_mover import (
@@ -57,6 +64,7 @@ def _approved_request(
     *,
     operation_count: int = 1,
     include_hash: bool = False,
+    include_operation_status: bool = False,
 ) -> tuple[Engine, Path, SafeExecutionRequest]:
     workspace_root = tmp_path / "execution-workspace"
     target_directory = workspace_root / "archive"
@@ -143,6 +151,14 @@ def _approved_request(
                 status="APPROVED",
             )
         )
+        if include_operation_status:
+            session.add(
+                OperationStatusRecord(
+                    workflow_id=str(WORKFLOW_ID),
+                    plan_id=str(PLAN_ID),
+                    overall_status=OperationStatus.APPROVED.value,
+                )
+            )
         session.commit()
 
     return (
@@ -584,6 +600,247 @@ def test_multi_operation_plan_records_all_recoverable_failures(
         engine.dispose()
 
 
+def test_batch_undo_restores_all_completed_items_in_reverse_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        operation_count=2,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+    move_calls: list[tuple[str, str]] = []
+
+    def record_move(
+        mover: object,
+        source_path: Path,
+        target_path: Path,
+    ) -> Path:
+        move_calls.append((source_path.as_posix(), target_path.as_posix()))
+        return original_move(mover, source_path, target_path)
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        record_move,
+    )
+
+    try:
+        with Session(engine) as session:
+            execute_safe_operation_plan(session, request, now=NOW)
+            result = undo_safe_operation_execution(
+                session,
+                WORKFLOW_ID,
+                now=NOW + timedelta(minutes=1),
+            )
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                session,
+                execution.id,
+            )
+            operation_status = get_operation_status_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            file_entries = [
+                get_file_entry_by_id(session, 3, source_file_id)
+                for source_file_id in (7, 8)
+            ]
+
+            assert result.status == "UNDONE"
+            assert [item.status for item in result.items] == [
+                "UNDONE",
+                "UNDONE",
+            ]
+            assert execution.status == "UNDONE"
+            assert [item.status for item in execution_items] == [
+                "UNDONE",
+                "UNDONE",
+            ]
+            assert operation_status.overall_status == OperationStatus.UNDONE.value
+            assert operation_status.execution_id == execution.id
+            assert [entry.relative_path for entry in file_entries] == [
+                "inbox/report-7.txt",
+                "inbox/report-8.txt",
+            ]
+
+        assert move_calls == [
+            ("inbox/report-7.txt", "archive/final-7.md"),
+            ("inbox/report-8.txt", "archive/final-8.md"),
+            ("archive/final-8.md", "inbox/report-8.txt"),
+            ("archive/final-7.md", "inbox/report-7.txt"),
+        ]
+        assert (workspace_root / "inbox" / "report-7.txt").exists()
+        assert (workspace_root / "inbox" / "report-8.txt").exists()
+        assert not (workspace_root / "archive" / "final-7.md").exists()
+        assert not (workspace_root / "archive" / "final-8.md").exists()
+    finally:
+        engine.dispose()
+
+
+def test_batch_undo_partial_failure_restores_completed_items_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        operation_count=3,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+
+    def fail_second_move(
+        mover: object,
+        source_path: Path,
+        target_path: Path,
+    ) -> Path:
+        if source_path.name == "report-8.txt":
+            raise SafeFileMoveError(
+                SafeFileMoveErrorCode.TARGET_CONFLICT,
+                "simulated target conflict",
+            )
+        return original_move(mover, source_path, target_path)
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        fail_second_move,
+    )
+
+    try:
+        with Session(engine) as session:
+            first_result = execute_safe_operation_plan(
+                session,
+                request,
+                now=NOW,
+            )
+            assert first_result.status == "PARTIALLY_COMPLETED"
+            operation_status = get_operation_status_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            assert operation_status.overall_status == (
+                OperationStatus.PARTIAL_FAILED.value
+            )
+
+        monkeypatch.setattr(
+            safe_execution_module.SafeFileMover,
+            "move",
+            original_move,
+        )
+        with Session(engine) as session:
+            result = undo_safe_operation_execution(
+                session,
+                WORKFLOW_ID,
+                now=NOW + timedelta(minutes=1),
+            )
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                session,
+                execution.id,
+            )
+            operation_status = get_operation_status_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+
+            assert result.status == "UNDONE"
+            assert [item.status for item in result.items] == [
+                "UNDONE",
+                "FAILED",
+                "UNDONE",
+            ]
+            assert execution.status == "UNDONE"
+            assert [item.status for item in execution_items] == [
+                "UNDONE",
+                "FAILED",
+                "UNDONE",
+            ]
+            assert operation_status.overall_status == OperationStatus.UNDONE.value
+
+        for source_file_id in (7, 8, 9):
+            assert (
+                workspace_root / "inbox" / f"report-{source_file_id}.txt"
+            ).exists()
+            assert not (
+                workspace_root / "archive" / f"final-{source_file_id}.md"
+            ).exists()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error_code"),
+    [
+        ("changed", SafeExecutionErrorCode.FILE_CHANGED),
+        ("conflict", SafeExecutionErrorCode.UNDO_TARGET_CONFLICT),
+    ],
+    ids=["changed-intermediate-file", "occupied-original-path"],
+)
+def test_batch_undo_preflights_every_item_before_moving_any_file(
+    tmp_path: Path,
+    mutation: str,
+    expected_error_code: SafeExecutionErrorCode,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        operation_count=2,
+    )
+    first_source = workspace_root / "inbox" / "report-7.txt"
+    first_target = workspace_root / "archive" / "final-7.md"
+    second_source = workspace_root / "inbox" / "report-8.txt"
+    second_target = workspace_root / "archive" / "final-8.md"
+
+    try:
+        with Session(engine) as session:
+            execute_safe_operation_plan(session, request, now=NOW)
+
+            if mutation == "changed":
+                second_target.write_text("changed after execution", encoding="utf-8")
+            else:
+                second_source.write_text("new occupant", encoding="utf-8")
+
+            with pytest.raises(SafeExecutionError) as error:
+                undo_safe_operation_execution(
+                    session,
+                    WORKFLOW_ID,
+                    now=NOW + timedelta(minutes=1),
+                )
+
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                session,
+                execution.id,
+            )
+            assert error.value.code is expected_error_code
+            assert execution.status == "COMPLETED"
+            assert [item.status for item in execution_items] == [
+                "COMPLETED",
+                "COMPLETED",
+            ]
+
+        assert not first_source.exists()
+        assert first_target.exists()
+        if mutation == "changed":
+            assert second_target.read_text(encoding="utf-8") == (
+                "changed after execution"
+            )
+        else:
+            assert second_source.read_text(encoding="utf-8") == "new occupant"
+    finally:
+        engine.dispose()
+
+
 def test_retry_failed_items_only_retries_failed_items(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -685,6 +942,7 @@ def test_compensation_restores_only_completed_items(
     engine, workspace_root, request = _approved_request(
         tmp_path,
         operation_count=3,
+        include_operation_status=True,
     )
     original_move = safe_execution_module.SafeFileMover.move
 
@@ -734,6 +992,10 @@ def test_compensation_restores_only_completed_items(
                 get_file_entry_by_id(session, 3, source_file_id)
                 for source_file_id in (7, 8, 9)
             ]
+            operation_status = get_operation_status_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
 
             assert result.status == "UNDONE"
             assert [item.status for item in result.items] == [
@@ -742,6 +1004,9 @@ def test_compensation_restores_only_completed_items(
                 "UNDONE",
             ]
             assert execution.attempt == 1
+            assert operation_status.overall_status == (
+                OperationStatus.COMPENSATED.value
+            )
             assert [entry.relative_path for entry in file_entries] == [
                 "inbox/report-7.txt",
                 "inbox/report-8.txt",
@@ -1133,7 +1398,7 @@ def test_execution_failure_keeps_executing_history_for_recovery(
                 execution.id,
             )[0]
             assert execution.status == "EXECUTING"
-            assert execution_item.status == "PENDING"
+            assert execution_item.status == "EXECUTING"
 
             repeated_result = execute_safe_operation_plan(
                 session,
@@ -1209,7 +1474,7 @@ def test_restart_reconciles_move_completed_before_history_commit(
                 execution.id,
             )[0]
             assert execution.status == "EXECUTING"
-            assert execution_item.status == "PENDING"
+            assert execution_item.status == "EXECUTING"
 
         assert not source_path.exists()
         assert target_path.read_text(encoding="utf-8") == "approved content 7"
@@ -1239,6 +1504,206 @@ def test_restart_reconciles_move_completed_before_history_commit(
             assert recovered_result.status == "COMPLETED"
             assert recovered_result.items[0].status == "COMPLETED"
             assert file_entry.relative_path == "archive/final-7.md"
+    finally:
+        engine.dispose()
+
+
+def test_startup_scan_distinguishes_completed_and_unfinished_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, request = _approved_request(
+        tmp_path,
+        operation_count=2,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+
+    def fail_second_move(
+        mover: object,
+        source_path: Path,
+        target_path: Path,
+    ) -> Path:
+        if source_path.name == "report-8.txt":
+            raise SafeFileMoveError(
+                SafeFileMoveErrorCode.MOVE_FAILED,
+                "simulated process interruption",
+            )
+        return original_move(mover, source_path, target_path)
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        fail_second_move,
+    )
+
+    try:
+        with Session(engine) as session:
+            with pytest.raises(SafeFileMoveError):
+                execute_safe_operation_plan(session, request, now=NOW)
+
+            snapshots = scan_unfinished_operation_executions(session)
+            assert len(snapshots) == 1
+            execution_items = find_operation_execution_items(
+                session,
+                snapshots[0].execution_id,
+            )
+            assert snapshots[0].completed_item_ids == (execution_items[0].id,)
+            assert snapshots[0].unfinished_item_ids == (execution_items[1].id,)
+            assert [item.status for item in execution_items] == [
+                "COMPLETED",
+                "EXECUTING",
+            ]
+    finally:
+        engine.dispose()
+
+
+def test_ambiguous_executing_item_uses_failed_recovery_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+    source_path = workspace_root / "inbox" / "report-7.txt"
+    target_path = workspace_root / "archive" / "final-7.md"
+
+    def interrupt_move(*args: object, **kwargs: object) -> Path:
+        raise SafeFileMoveError(
+            SafeFileMoveErrorCode.MOVE_FAILED,
+            "simulated process interruption",
+        )
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        interrupt_move,
+    )
+
+    try:
+        with Session(engine) as session:
+            with pytest.raises(SafeFileMoveError):
+                execute_safe_operation_plan(session, request, now=NOW)
+
+        monkeypatch.setattr(
+            safe_execution_module.SafeFileMover,
+            "move",
+            original_move,
+        )
+        target_path.write_text("ambiguous result", encoding="utf-8")
+
+        with Session(engine) as restarted_session:
+            result = recover_operation_execution(
+                restarted_session,
+                WORKFLOW_ID,
+                strategy=ExecutionRecoveryStrategy.CONTINUE,
+                now=NOW + timedelta(minutes=1),
+            )
+            execution = get_operation_execution_by_workflow_id(
+                restarted_session,
+                str(WORKFLOW_ID),
+            )
+            execution_item = find_operation_execution_items(
+                restarted_session,
+                execution.id,
+            )[0]
+            operation_status = get_operation_status_by_workflow_id(
+                restarted_session,
+                str(WORKFLOW_ID),
+            )
+
+            assert result.status == "FAILED"
+            assert execution.status == "FAILED"
+            assert execution_item.status == "FAILED"
+            assert execution_item.error_code == (
+                SafeExecutionErrorCode.RECOVERY_UNSAFE.value
+            )
+            assert operation_status.overall_status == OperationStatus.FAILED.value
+
+        assert source_path.exists()
+        assert target_path.exists()
+    finally:
+        engine.dispose()
+
+
+def test_executing_crash_recovery_after_partial_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        operation_count=2,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+    source_path = workspace_root / "inbox" / "report-8.txt"
+    target_path = workspace_root / "archive" / "final-8.md"
+
+    def interrupt_second_move(
+        mover: object,
+        source: Path,
+        target: Path,
+    ) -> Path:
+        moved_path = original_move(mover, source, target)
+        if source.name == "report-8.txt":
+            raise KeyboardInterrupt
+        return moved_path
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        interrupt_second_move,
+    )
+
+    try:
+        with Session(engine) as session:
+            with pytest.raises(KeyboardInterrupt):
+                execute_safe_operation_plan(session, request, now=NOW)
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                session,
+                execution.id,
+            )
+            assert execution.status == "EXECUTING"
+            assert [item.status for item in execution_items] == [
+                "COMPLETED",
+                "EXECUTING",
+            ]
+
+        monkeypatch.setattr(
+            safe_execution_module.SafeFileMover,
+            "move",
+            original_move,
+        )
+        with Session(engine, expire_on_commit=False) as restarted_session:
+            results = recover_unfinished_operation_executions(
+                restarted_session,
+                now=NOW + timedelta(minutes=1),
+            )
+            execution = get_operation_execution_by_workflow_id(
+                restarted_session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                restarted_session,
+                execution.id,
+            )
+
+            assert len(results) == 1
+            assert results[0].status == "COMPLETED"
+            assert execution.status == "COMPLETED"
+            assert [item.status for item in execution_items] == [
+                "COMPLETED",
+                "COMPLETED",
+            ]
+
+        assert not source_path.exists()
+        assert target_path.read_text(encoding="utf-8") == "approved content 8"
     finally:
         engine.dispose()
 
@@ -1311,5 +1776,96 @@ def test_undo_failure_keeps_undoing_history_for_recovery(
 
         assert not target_path.exists()
         assert source_path.read_text(encoding="utf-8") == "approved content 7"
+    finally:
+        engine.dispose()
+
+
+def test_undoing_crash_recovery_resumes_remaining_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, workspace_root, request = _approved_request(
+        tmp_path,
+        operation_count=2,
+        include_operation_status=True,
+    )
+    original_move = safe_execution_module.SafeFileMover.move
+
+    def interrupt_after_first_undo(
+        mover: object,
+        source: Path,
+        target: Path,
+    ) -> Path:
+        moved_path = original_move(mover, source, target)
+        if source.name == "final-7.md":
+            raise KeyboardInterrupt
+        return moved_path
+
+    monkeypatch.setattr(
+        safe_execution_module.SafeFileMover,
+        "move",
+        interrupt_after_first_undo,
+    )
+
+    try:
+        with Session(engine) as session:
+            execute_safe_operation_plan(session, request, now=NOW)
+            with pytest.raises(KeyboardInterrupt):
+                undo_safe_operation_execution(
+                    session,
+                    WORKFLOW_ID,
+                    now=NOW + timedelta(minutes=1),
+                )
+
+            execution = get_operation_execution_by_workflow_id(
+                session,
+                str(WORKFLOW_ID),
+            )
+            execution_items = find_operation_execution_items(
+                session,
+                execution.id,
+            )
+            snapshots = scan_unfinished_operation_executions(session)
+
+            assert execution.status == "UNDOING"
+            assert [item.status for item in execution_items] == [
+                "UNDOING",
+                "UNDONE",
+            ]
+            assert len(snapshots) == 1
+            assert snapshots[0].completed_item_ids == (execution_items[1].id,)
+            assert snapshots[0].unfinished_item_ids == (execution_items[0].id,)
+
+        monkeypatch.setattr(
+            safe_execution_module.SafeFileMover,
+            "move",
+            original_move,
+        )
+        with Session(engine, expire_on_commit=False) as restarted_session:
+            results = recover_unfinished_operation_executions(
+                restarted_session,
+                now=NOW + timedelta(minutes=2),
+            )
+            recovered_execution = get_operation_execution_by_workflow_id(
+                restarted_session,
+                str(WORKFLOW_ID),
+            )
+            recovered_items = find_operation_execution_items(
+                restarted_session,
+                recovered_execution.id,
+            )
+
+            assert len(results) == 1
+            assert results[0].status == "UNDONE"
+            assert recovered_execution.status == "UNDONE"
+            assert [item.status for item in recovered_items] == [
+                "UNDONE",
+                "UNDONE",
+            ]
+
+        assert (workspace_root / "inbox" / "report-7.txt").exists()
+        assert (workspace_root / "inbox" / "report-8.txt").exists()
+        assert not (workspace_root / "archive" / "final-7.md").exists()
+        assert not (workspace_root / "archive" / "final-8.md").exists()
     finally:
         engine.dispose()

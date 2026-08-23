@@ -52,6 +52,7 @@ OperationExecutionStatus = Literal[
 ]
 OperationExecutionItemStatus = Literal[
     "PENDING",
+    "EXECUTING",
     "COMPLETED",
     "UNDOING",
     "UNDONE",
@@ -90,7 +91,8 @@ _OPERATION_EXECUTION_ITEM_TRANSITIONS: dict[
     OperationExecutionItemStatus,
     frozenset[OperationExecutionItemStatus],
 ] = {
-    "PENDING": frozenset({"COMPLETED", "FAILED"}),
+    "PENDING": frozenset({"EXECUTING", "COMPLETED", "FAILED"}),
+    "EXECUTING": frozenset({"COMPLETED", "FAILED"}),
     "COMPLETED": frozenset({"UNDOING"}),
     "UNDOING": frozenset({"UNDONE"}),
     "UNDONE": frozenset(),
@@ -680,6 +682,32 @@ def get_operation_execution_by_plan_id(
         OperationExecution.plan_id == plan_id,
     )
     return session.scalar(statement)
+
+
+def find_unfinished_operation_executions(
+    session: Session,
+) -> list[OperationExecution]:
+    """按稳定主键读取可能因进程中断而未收尾的 Execution。"""
+
+    statement = (
+        select(OperationExecution)
+        .outerjoin(
+            OperationStatusRecord,
+            OperationStatusRecord.workflow_id == OperationExecution.workflow_id,
+        )
+        .where(
+            OperationExecution.status.in_(
+                ("EXECUTING", "UNDOING")
+            ),
+            or_(
+                OperationStatusRecord.workflow_id.is_(None),
+                OperationStatusRecord.overall_status
+                == OperationExecution.status,
+            )
+        )
+        .order_by(OperationExecution.id.asc())
+    )
+    return list(session.scalars(statement).all())
 
 
 def find_operation_execution_items(

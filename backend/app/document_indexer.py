@@ -13,7 +13,9 @@ from .filesystem_adapter import FileSystemAdapter
 from .models import ChunkRecord, DocumentRecord, FileEntry, Workspace
 
 
-_PERSISTED_DOCUMENT_EXTENSIONS = frozenset({".md", ".markdown", ".txt"})
+_PERSISTED_DOCUMENT_EXTENSIONS = frozenset(
+    {".md", ".markdown", ".txt", ".pdf", ".docx"}
+)
 
 
 class DocumentIndexWorkspaceNotFoundError(Exception):

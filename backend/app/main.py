@@ -27,6 +27,10 @@ from .models import FileEntry, Workspace
 from .database import SessionFactory, check_database_connection, get_session
 from .path_policy import PathPolicyError
 # get_session()：负责为每次 HTTP 请求创建和关闭 Session。
+from .safe_execution import (
+    recover_unfinished_operation_executions,
+    scan_unfinished_operation_executions,
+)
 
 from .services import (
     FileEntryNotFoundError,
@@ -53,9 +57,11 @@ from .schemas import (
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """服务启动时记录待关注的 AgentRun，具体恢复仍由现有边界触发。"""
+    """服务启动时记录未完成 AgentRun，并恢复未收尾 Execution。"""
 
     application.state.unfinished_agent_run_ids = ()
+    application.state.unfinished_operation_execution_snapshots = ()
+    application.state.recovered_operation_execution_results = ()
     application.state.job_runtimes = {}
     application.state.job_runtime_lock = RLock()
     try:
@@ -66,6 +72,17 @@ async def _lifespan(application: FastAPI):
     except SQLAlchemyError:
         # 旧数据库尚未完成迁移时，保持应用可启动，由健康检查报告存储问题。
         application.state.unfinished_agent_run_ids = ()
+    try:
+        with SessionFactory() as session:
+            snapshots = scan_unfinished_operation_executions(session)
+            application.state.unfinished_operation_execution_snapshots = snapshots
+            application.state.recovered_operation_execution_results = (
+                recover_unfinished_operation_executions(session)
+            )
+    except SQLAlchemyError:
+        # 旧数据库尚未完成执行状态迁移时，不阻断服务启动。
+        application.state.unfinished_operation_execution_snapshots = ()
+        application.state.recovered_operation_execution_results = ()
     try:
         yield
     finally:

@@ -20,16 +20,27 @@ from .repositories import (
     compare_and_set_operation_execution_item_status,
     compare_and_set_operation_execution_status,
     find_operation_execution_items,
+    get_operation_status_by_workflow_id,
     get_operation_execution_by_plan_id,
     get_operation_execution_by_workflow_id,
     get_workspace_by_id,
+    find_unfinished_operation_executions,
     OperationExecutionStatus,
+    compare_and_set_operation_status,
 )
 from .safe_file_mover import (
     SafeFileMoveError,
     SafeFileMoveErrorCode,
     SafeFileMover,
 )
+from .quarantine import (
+    QuarantineError,
+    QuarantineErrorCode,
+    QuarantineManager,
+    resolve_quarantine_root,
+)
+from .path_policy import PathPolicyError
+from .operation_status import OperationStatus
 from .services import require_approved_operation_plan, validate_operation_plan
 
 
@@ -40,6 +51,7 @@ class SafeExecutionRequest(BaseModel):
 
     workflow_id: UUID
     plan: OperationPlan
+    quarantine_root: Path | None = None
 
 
 class SafeExecutionErrorCode(StrEnum):
@@ -53,8 +65,10 @@ class SafeExecutionErrorCode(StrEnum):
     STATE_CHANGED = "safe_execution_state_changed"
     FILE_CHANGED = "safe_execution_file_changed"
     UNDO_TARGET_CONFLICT = "safe_execution_undo_target_conflict"
+    RECOVERY_UNSAFE = "safe_execution_recovery_unsafe"
     HISTORY_WRITE_FAILED = "safe_execution_history_write_failed"
     UNSUPPORTED_OPERATION_TYPE = "safe_execution_operation_type_unsupported"
+    QUARANTINE_UNAVAILABLE = "safe_execution_quarantine_unavailable"
 
 
 class SafeExecutionError(RuntimeError):
@@ -67,6 +81,19 @@ class SafeExecutionError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.code = code
+
+
+class ExecutionRecoveryStrategy(StrEnum):
+    """EXECUTING 崩溃后的三种处理策略及其边界。"""
+
+    CONTINUE = "continue"
+    """路径状态唯一且 before 证据一致时，继续执行或对账未完成 item。"""
+
+    COMPENSATE = "compensate"
+    """已有部分成功且用户明确选择回滚时，只补偿已完成 item。"""
+
+    FAILED = "failed"
+    """证据缺失、变化、冲突或操作类型不支持时停止自动文件变更。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +135,25 @@ class SafeExecutionResult:
         return self.items[0].after_relative_path
 
 
+@dataclass(frozen=True, slots=True)
+class OperationExecutionRecoverySnapshot:
+    """启动扫描得到的 Execution 与 item 完成情况快照。"""
+
+    execution_id: int
+    workflow_id: str
+    completed_item_ids: tuple[int, ...]
+    unfinished_item_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _UndoContext:
+    """一次恢复动作使用的源、目标位置和可选隔离区管理器。"""
+
+    source_adapter: FileSystemAdapter
+    target_adapter: FileSystemAdapter
+    quarantine_manager: QuarantineManager | None
+
+
 _RECOVERABLE_ITEM_FAILURE_CODES = frozenset(
     {
         SafeFileMoveErrorCode.SOURCE_UNAVAILABLE,
@@ -115,6 +161,50 @@ _RECOVERABLE_ITEM_FAILURE_CODES = frozenset(
         SafeFileMoveErrorCode.TARGET_CONFLICT,
     }
 )
+_RECOVERABLE_QUARANTINE_ERROR_CODES = frozenset(
+    {
+        QuarantineErrorCode.SOURCE_UNAVAILABLE,
+        QuarantineErrorCode.TARGET_CONFLICT,
+        QuarantineErrorCode.DIRECTORY_UNAVAILABLE,
+    }
+)
+
+_EXECUTION_TO_OPERATION_STATUS: dict[str, OperationStatus] = {
+    "EXECUTING": OperationStatus.EXECUTING,
+    "PARTIALLY_COMPLETED": OperationStatus.PARTIAL_FAILED,
+    "COMPLETED": OperationStatus.COMPLETED,
+    "FAILED": OperationStatus.FAILED,
+}
+
+
+def scan_unfinished_operation_executions(
+    session: Session,
+) -> tuple[OperationExecutionRecoverySnapshot, ...]:
+    """启动时发现 EXECUTING 或 UNDOING Execution，并区分 item 状态。"""
+
+    snapshots: list[OperationExecutionRecoverySnapshot] = []
+    for execution in find_unfinished_operation_executions(session):
+        execution_items = find_operation_execution_items(session, execution.id)
+        completed_status = (
+            "UNDONE" if execution.status == "UNDOING" else "COMPLETED"
+        )
+        snapshots.append(
+            OperationExecutionRecoverySnapshot(
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                completed_item_ids=tuple(
+                    item.id
+                    for item in execution_items
+                    if item.status == completed_status
+                ),
+                unfinished_item_ids=tuple(
+                    item.id
+                    for item in execution_items
+                    if item.status != completed_status
+                ),
+            )
+        )
+    return tuple(snapshots)
 
 
 def _ensure_supported_operation_plan(plan: OperationPlan) -> None:
@@ -124,7 +214,7 @@ def _ensure_supported_operation_plan(plan: OperationPlan) -> None:
         {
             operation.operation_type
             for operation in plan.operations
-            if operation.operation_type not in {"move", "rename"}
+            if operation.operation_type not in {"move", "quarantine", "rename"}
         }
     )
     if unsupported_types:
@@ -149,7 +239,15 @@ def validate_safe_execution_request(
         request.plan,
     )
     _ensure_supported_operation_plan(request.plan)
-    validate_operation_plan(session, request.plan, now=now)
+    if request.quarantine_root is None:
+        validate_operation_plan(session, request.plan, now=now)
+    else:
+        validate_operation_plan(
+            session,
+            request.plan,
+            now=now,
+            quarantine_root=request.quarantine_root,
+        )
 
 
 def execute_safe_operation_plan(
@@ -171,13 +269,41 @@ def execute_safe_operation_plan(
     if existing_result is not None:
         return existing_result
 
-    validate_operation_plan(session, request.plan, now=current_time)
+    if request.quarantine_root is None:
+        validate_operation_plan(session, request.plan, now=current_time)
+    else:
+        validate_operation_plan(
+            session,
+            request.plan,
+            now=current_time,
+            quarantine_root=request.quarantine_root,
+        )
     workspace = get_workspace_by_id(session, request.plan.workspace_id)
     if workspace is None:
         raise SafeExecutionError(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行计划对应的工作区不存在",
         )
+    workspace_adapter = FileSystemAdapter(Path(workspace.root_path))
+    quarantine_manager: QuarantineManager | None = None
+    quarantine_adapter: FileSystemAdapter | None = None
+    if any(
+        operation.operation_type == "quarantine"
+        for operation in request.plan.operations
+    ):
+        quarantine_root = request.quarantine_root or resolve_quarantine_root()
+        quarantine_adapter = FileSystemAdapter(quarantine_root)
+        try:
+            quarantine_manager = QuarantineManager(
+                workspace_adapter,
+                quarantine_adapter,
+            )
+        except (PathPolicyError, QuarantineError, ValueError) as error:
+            raise SafeExecutionError(
+                SafeExecutionErrorCode.QUARANTINE_UNAVAILABLE,
+                "隔离区当前不可用",
+            ) from error
+
     execution = OperationExecution(
         workflow_id=str(request.workflow_id),
         plan_id=str(request.plan.plan_id),
@@ -192,12 +318,13 @@ def execute_safe_operation_plan(
             start=1,
         ):
             expected_hash = operation.source_precondition.content_hash
+            before_location, after_location = _operation_locations(operation)
             execution_item = OperationExecutionItem(
                 execution_id=execution.id,
                 sequence_no=sequence_no,
                 operation_type=operation.operation_type,
                 source_file_id=operation.source_file_id,
-                before_location="workspace",
+                before_location=before_location,
                 before_relative_path=operation.source_relative_path,
                 before_size_bytes=operation.source_precondition.size_bytes,
                 before_mtime_ns=operation.source_precondition.mtime_ns,
@@ -206,7 +333,7 @@ def execute_safe_operation_plan(
                     if expected_hash is not None
                     else None
                 ),
-                after_location="workspace",
+                after_location=after_location,
                 after_relative_path=operation.target_relative_path,
                 undo_source_relative_path=operation.target_relative_path,
                 undo_target_relative_path=operation.source_relative_path,
@@ -214,6 +341,14 @@ def execute_safe_operation_plan(
             add_operation_execution_item(session, execution_item)
             execution_items.append(execution_item)
         session.flush()
+        _sync_operation_status(
+            session,
+            request.workflow_id,
+            expected_status=OperationStatus.APPROVED,
+            next_status=OperationStatus.EXECUTING,
+            execution_id=execution.id,
+            message="执行开始前 Operation 状态已经变化",
+        )
         execution_id = execution.id
         operation_items: tuple[
             tuple[OperationPlanItem, int], ...
@@ -242,34 +377,80 @@ def execute_safe_operation_plan(
             "无法保存执行前历史",
         ) from error
 
-    adapter = FileSystemAdapter(Path(workspace.root_path))
-    mover = SafeFileMover(adapter)
+    mover = SafeFileMover(workspace_adapter)
     completed_count = 0
     failed_count = 0
     for operation, execution_item_id in operation_items:
         expected_hash = operation.source_precondition.content_hash
+        item_started = compare_and_set_operation_execution_item_status(
+            session,
+            execution_item_id,
+            "PENDING",
+            next_status="EXECUTING",
+        )
+        if not item_started:
+            session.rollback()
+            raise SafeExecutionError(
+                SafeExecutionErrorCode.STATE_CHANGED,
+                "开始单项执行前执行明细已经变化",
+            )
+        _commit_completion(session, "无法保存单项执行开始状态")
         try:
-            _revalidate_file_before_move(
-                adapter,
-                source_path=Path(operation.source_relative_path),
-                target_path=Path(operation.target_relative_path),
-                expected_size_bytes=operation.source_precondition.size_bytes,
-                expected_mtime_ns=operation.source_precondition.mtime_ns,
-                expected_sha256=(
-                    expected_hash.digest if expected_hash is not None else None
-                ),
+            if operation.operation_type == "quarantine":
+                if quarantine_manager is None or quarantine_adapter is None:
+                    raise SafeExecutionError(
+                        SafeExecutionErrorCode.QUARANTINE_UNAVAILABLE,
+                        "隔离区当前不可用",
+                    )
+                _revalidate_source_before_action(
+                    workspace_adapter,
+                    source_path=Path(operation.source_relative_path),
+                    expected_size_bytes=operation.source_precondition.size_bytes,
+                    expected_mtime_ns=operation.source_precondition.mtime_ns,
+                    expected_sha256=(
+                        expected_hash.digest if expected_hash is not None else None
+                    ),
+                )
+                moved_path = quarantine_manager.quarantine(
+                    Path(operation.source_relative_path),
+                    workspace_id=request.plan.workspace_id,
+                    plan_id=request.plan.plan_id,
+                    source_file_id=operation.source_file_id,
+                ).quarantine_path
+                result_adapter = quarantine_adapter
+            else:
+                _revalidate_file_before_move(
+                    workspace_adapter,
+                    source_path=Path(operation.source_relative_path),
+                    target_path=Path(operation.target_relative_path),
+                    expected_size_bytes=operation.source_precondition.size_bytes,
+                    expected_mtime_ns=operation.source_precondition.mtime_ns,
+                    expected_sha256=(
+                        expected_hash.digest if expected_hash is not None else None
+                    ),
+                )
+                moved_path = mover.move(
+                    Path(operation.source_relative_path),
+                    Path(operation.target_relative_path),
+                )
+                result_adapter = workspace_adapter
+        except (SafeFileMoveError, QuarantineError) as error:
+            recoverable = (
+                error.code in _RECOVERABLE_ITEM_FAILURE_CODES
+                if isinstance(error, SafeFileMoveError)
+                else error.code in _RECOVERABLE_QUARANTINE_ERROR_CODES
             )
-            moved_path = mover.move(
-                Path(operation.source_relative_path),
-                Path(operation.target_relative_path),
-            )
-        except SafeFileMoveError as error:
-            if error.code not in _RECOVERABLE_ITEM_FAILURE_CODES:
+            if not recoverable:
+                if isinstance(error, QuarantineError):
+                    raise SafeExecutionError(
+                        SafeExecutionErrorCode.QUARANTINE_UNAVAILABLE,
+                        "隔离操作当前不可用",
+                    ) from error
                 raise
             item_updated = compare_and_set_operation_execution_item_status(
                 session,
                 execution_item_id,
-                "PENDING",
+                "EXECUTING",
                 next_status="FAILED",
                 error_code=error.code.value,
                 failed_at=current_time,
@@ -289,7 +470,7 @@ def execute_safe_operation_plan(
             item_updated = compare_and_set_operation_execution_item_status(
                 session,
                 execution_item_id,
-                "PENDING",
+                "EXECUTING",
                 next_status="FAILED",
                 error_code=error.code.value,
                 failed_at=current_time,
@@ -305,12 +486,12 @@ def execute_safe_operation_plan(
             continue
 
         after_metadata = _get_required_metadata(
-            adapter,
+            result_adapter,
             moved_path,
             "执行后的目标文件不可用",
         )
         after_hash = _verify_optional_hash(
-            adapter,
+            result_adapter,
             moved_path,
             expected_hash.digest if expected_hash is not None else None,
         )
@@ -318,7 +499,7 @@ def execute_safe_operation_plan(
         item_updated = compare_and_set_operation_execution_item_status(
             session,
             execution_item_id,
-            "PENDING",
+            "EXECUTING",
             next_status="COMPLETED",
             after_size_bytes=after_metadata.size_bytes,
             after_mtime_ns=after_metadata.mtime_ns,
@@ -367,6 +548,14 @@ def execute_safe_operation_plan(
             SafeExecutionErrorCode.STATE_CHANGED,
             "汇总批量结果前执行主记录已经变化",
         )
+    _sync_operation_status(
+        session,
+        request.workflow_id,
+        expected_status=OperationStatus.EXECUTING,
+        next_status=_EXECUTION_TO_OPERATION_STATUS[final_status],
+        execution_id=execution_id,
+        message="汇总批量结果前 Operation 状态已经变化",
+    )
     _commit_completion(session, "无法保存批量执行汇总状态")
     session.refresh(execution)
     persisted_items = find_operation_execution_items(session, execution_id)
@@ -452,10 +641,31 @@ def retry_failed_operation_execution(
             SafeExecutionErrorCode.STATE_CHANGED,
             "重试开始前执行历史已经变化",
         )
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=_EXECUTION_TO_OPERATION_STATUS[previous_status],
+        next_status=OperationStatus.EXECUTING,
+        execution_id=execution.id,
+        message="重试开始前 Operation 状态已经变化",
+    )
     _commit_completion(session, "无法保存失败项重试开始状态")
 
     mover = SafeFileMover(adapter)
     for item in failed_items:
+        item_started = compare_and_set_operation_execution_item_status(
+            session,
+            item.id,
+            "PENDING",
+            next_status="EXECUTING",
+        )
+        if not item_started:
+            session.rollback()
+            raise SafeExecutionError(
+                SafeExecutionErrorCode.STATE_CHANGED,
+                "开始重试单项前执行明细已经变化",
+            )
+        _commit_completion(session, "无法保存单项重试开始状态")
         try:
             _revalidate_file_before_move(
                 adapter,
@@ -475,7 +685,7 @@ def retry_failed_operation_execution(
             item_updated = compare_and_set_operation_execution_item_status(
                 session,
                 item.id,
-                "PENDING",
+                "EXECUTING",
                 next_status="FAILED",
                 error_code=error.code.value,
                 failed_at=current_time,
@@ -494,7 +704,7 @@ def retry_failed_operation_execution(
             item_updated = compare_and_set_operation_execution_item_status(
                 session,
                 item.id,
-                "PENDING",
+                "EXECUTING",
                 next_status="FAILED",
                 error_code=error.code.value,
                 failed_at=current_time,
@@ -521,7 +731,7 @@ def retry_failed_operation_execution(
         item_updated = compare_and_set_operation_execution_item_status(
             session,
             item.id,
-            "PENDING",
+            "EXECUTING",
             next_status="COMPLETED",
             after_size_bytes=after_metadata.size_bytes,
             after_mtime_ns=after_metadata.mtime_ns,
@@ -576,6 +786,14 @@ def retry_failed_operation_execution(
             SafeExecutionErrorCode.STATE_CHANGED,
             "汇总重试结果前执行主记录已经变化",
         )
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=OperationStatus.EXECUTING,
+        next_status=_EXECUTION_TO_OPERATION_STATUS[final_status],
+        execution_id=execution.id,
+        message="汇总重试结果前 Operation 状态已经变化",
+    )
     _commit_completion(session, "无法保存失败项重试汇总状态")
 
     session.refresh(execution)
@@ -596,7 +814,93 @@ def compensate_partial_operation_execution(
     *,
     now: datetime | None = None,
 ) -> SafeExecutionResult:
-    """逆序撤回部分成功执行中已经完成的文件移动。"""
+    """COMPENSATE：用户明确选择时逆序撤回部分成功执行中的已完成项。"""
+
+    return _restore_operation_execution(
+        session,
+        workflow_id,
+        now=now,
+        quarantine_root=None,
+        action="补偿",
+        allowed_statuses=frozenset({"PARTIALLY_COMPLETED"}),
+        final_operation_status=OperationStatus.COMPENSATED,
+    )
+
+
+def recover_operation_execution(
+    session: Session,
+    workflow_id: UUID,
+    *,
+    strategy: ExecutionRecoveryStrategy = ExecutionRecoveryStrategy.CONTINUE,
+    now: datetime | None = None,
+) -> SafeExecutionResult:
+    """按明确策略恢复一条 Execution，避免把恢复选择隐含在调用方。"""
+
+    if strategy is ExecutionRecoveryStrategy.CONTINUE:
+        return recover_interrupted_operation_execution(
+            session,
+            workflow_id,
+            now=now,
+        )
+    if strategy is ExecutionRecoveryStrategy.COMPENSATE:
+        return compensate_partial_operation_execution(
+            session,
+            workflow_id,
+            now=now,
+        )
+
+    execution = get_operation_execution_by_workflow_id(
+        session,
+        str(workflow_id),
+    )
+    if execution is None:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.HISTORY_NOT_FOUND,
+            "找不到需要标记失败的执行历史",
+        )
+    if execution.status != "EXECUTING":
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.INVALID_HISTORY_STATE,
+            "只有 EXECUTING 执行记录可以采用 FAILED 策略",
+        )
+    return _mark_interrupted_execution_failed(
+        session,
+        workflow_id,
+        execution.id,
+        current_time=_aware_current_time(now),
+    )
+
+
+def recover_unfinished_operation_executions(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> tuple[SafeExecutionResult, ...]:
+    """服务启动时按 CONTINUE 策略处理扫描到的未完成 Execution。"""
+
+    snapshots = scan_unfinished_operation_executions(session)
+    return tuple(
+        recover_operation_execution(
+            session,
+            UUID(snapshot.workflow_id),
+            strategy=ExecutionRecoveryStrategy.CONTINUE,
+            now=now,
+        )
+        for snapshot in snapshots
+    )
+
+
+def _restore_operation_execution(
+    session: Session,
+    workflow_id: UUID,
+    *,
+    now: datetime | None,
+    quarantine_root: Path | None,
+    action: str,
+    allowed_statuses: frozenset[str],
+    final_operation_status: OperationStatus,
+) -> SafeExecutionResult:
+    """预检全部可恢复项后，按逆序执行 Undo 或 Compensation。"""
 
     current_time = _aware_current_time(now)
     execution = get_operation_execution_by_workflow_id(
@@ -606,28 +910,32 @@ def compensate_partial_operation_execution(
     if execution is None:
         raise SafeExecutionError(
             SafeExecutionErrorCode.HISTORY_NOT_FOUND,
-            "找不到需要补偿的执行历史",
+            f"找不到需要{action}的执行历史",
         )
-    if execution.status != "PARTIALLY_COMPLETED":
+    if execution.status not in allowed_statuses:
         raise SafeExecutionError(
             SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "只有部分完成的执行记录可以补偿",
+            f"当前执行记录不允许{action}",
         )
 
     execution_items = find_operation_execution_items(session, execution.id)
     completed_items = [
         item for item in execution_items if item.status == "COMPLETED"
     ]
+    failed_items = [item for item in execution_items if item.status == "FAILED"]
     if (
-        not completed_items
-        or any(
-            item.status not in {"COMPLETED", "FAILED"}
-            for item in execution_items
+        not execution_items
+        or not completed_items
+        or any(item.status not in {"COMPLETED", "FAILED"} for item in execution_items)
+        or (execution.status == "COMPLETED" and failed_items)
+        or (
+            execution.status == "PARTIALLY_COMPLETED"
+            and not failed_items
         )
     ):
         raise SafeExecutionError(
             SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "执行明细不满足部分成功补偿条件",
+            f"执行明细不满足{action}条件",
         )
 
     workspace = get_workspace_by_id(session, execution.workspace_id)
@@ -636,18 +944,26 @@ def compensate_partial_operation_execution(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行历史对应的工作区不存在",
         )
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    workspace_adapter = FileSystemAdapter(Path(workspace.root_path))
+    restore_contexts: list[tuple[OperationExecutionItem, _UndoContext]] = []
     for item in completed_items:
-        _validate_completed_item_for_compensation(adapter, item)
+        context = _build_undo_context(
+            workspace_adapter,
+            item,
+            quarantine_root=quarantine_root,
+        )
+        _validate_completed_item_for_restore(context, item, action=action)
+        restore_contexts.append((item, context))
 
+    previous_status = execution.status
     execution_marked = compare_and_set_operation_execution_status(
         session,
         execution.id,
-        "PARTIALLY_COMPLETED",
+        previous_status,
         next_status="UNDOING",
     )
     items_marked = True
-    for item in completed_items:
+    for item, _ in restore_contexts:
         items_marked = (
             compare_and_set_operation_execution_item_status(
                 session,
@@ -661,20 +977,24 @@ def compensate_partial_operation_execution(
         session.rollback()
         raise SafeExecutionError(
             SafeExecutionErrorCode.STATE_CHANGED,
-            "补偿开始前执行历史已经变化",
+            f"{action}开始前执行历史已经变化",
         )
-    _commit_completion(session, "无法保存部分成功补偿开始状态")
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=_EXECUTION_TO_OPERATION_STATUS[previous_status],
+        next_status=OperationStatus.UNDOING,
+        execution_id=execution.id,
+        message=f"{action}开始前 Operation 状态已经变化",
+    )
+    _commit_completion(session, f"无法保存{action}开始状态")
 
-    mover = SafeFileMover(adapter)
-    for item in reversed(completed_items):
-        restored_path = mover.move(
-            Path(item.undo_source_relative_path),
-            Path(item.undo_target_relative_path),
-        )
+    for item, context in reversed(restore_contexts):
+        restored_path = _restore_item_file(context, item, action=action)
         restored_metadata = _get_required_metadata(
-            adapter,
+            context.target_adapter,
             restored_path,
-            "补偿后的原文件不可用",
+            f"{action}后的原文件不可用",
         )
         if (
             restored_metadata.size_bytes != item.before_size_bytes
@@ -682,10 +1002,10 @@ def compensate_partial_operation_execution(
         ):
             raise SafeExecutionError(
                 SafeExecutionErrorCode.FILE_CHANGED,
-                "补偿结果与 before 元数据不一致",
+                f"{action}结果与 before 元数据不一致",
             )
         _verify_optional_hash(
-            adapter,
+            context.target_adapter,
             restored_path,
             item.before_sha256,
         )
@@ -710,11 +1030,11 @@ def compensate_partial_operation_execution(
             session.rollback()
             raise SafeExecutionError(
                 SafeExecutionErrorCode.STATE_CHANGED,
-                "补偿移动完成后执行明细或文件索引已经变化",
+                f"{action}移动完成后执行明细或文件索引已经变化",
             )
         _commit_completion(
             session,
-            "补偿移动完成，但无法提交 undo 与索引状态",
+            f"{action}移动完成，但无法提交 undo 与索引状态",
         )
 
     execution_updated = compare_and_set_operation_execution_status(
@@ -728,9 +1048,17 @@ def compensate_partial_operation_execution(
         session.rollback()
         raise SafeExecutionError(
             SafeExecutionErrorCode.STATE_CHANGED,
-            "汇总补偿结果前执行主记录已经变化",
+            f"汇总{action}结果前执行主记录已经变化",
         )
-    _commit_completion(session, "无法保存部分成功补偿汇总状态")
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=OperationStatus.UNDOING,
+        next_status=final_operation_status,
+        execution_id=execution.id,
+        message=f"汇总{action}结果前 Operation 状态已经变化",
+    )
+    _commit_completion(session, f"无法保存{action}汇总状态")
 
     session.refresh(execution)
     return _build_execution_result(
@@ -771,6 +1099,13 @@ def recover_interrupted_operation_execution(
     execution_items = find_operation_execution_items(session, execution.id)
     workspace = get_workspace_by_id(session, execution.workspace_id)
     if workspace is None:
+        if execution.status == "EXECUTING":
+            return _mark_interrupted_execution_failed(
+                session,
+                workflow_id,
+                execution.id,
+                current_time=current_time,
+            )
         raise SafeExecutionError(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行历史对应的工作区不存在",
@@ -778,13 +1113,33 @@ def recover_interrupted_operation_execution(
     adapter = FileSystemAdapter(Path(workspace.root_path))
 
     if execution.status == "EXECUTING":
-        _recover_interrupted_execution_items(
-            session,
-            execution,
-            execution_items,
-            adapter,
-            current_time,
-        )
+        try:
+            _recover_interrupted_execution_items(
+                session,
+                execution,
+                execution_items,
+                adapter,
+                current_time,
+            )
+        except SafeExecutionError as error:
+            if error.code not in {
+                SafeExecutionErrorCode.INVALID_HISTORY_STATE,
+                SafeExecutionErrorCode.FILE_CHANGED,
+            }:
+                raise
+            return _mark_interrupted_execution_failed(
+                session,
+                workflow_id,
+                execution.id,
+                current_time=current_time,
+            )
+        except SafeFileMoveError:
+            return _mark_interrupted_execution_failed(
+                session,
+                workflow_id,
+                execution.id,
+                current_time=current_time,
+            )
         # 生产 Session 不会在 commit 后自动过期，汇总必须重新读取 CAS 结果。
         session.expire_all()
         persisted_items = find_operation_execution_items(
@@ -811,6 +1166,8 @@ def recover_interrupted_operation_execution(
             next_status=final_status,
             completed_at=current_time,
         )
+        next_operation_status = _EXECUTION_TO_OPERATION_STATUS[final_status]
+        expected_operation_status = OperationStatus.EXECUTING
         completion_message = "无法保存中断执行的恢复汇总状态"
     else:
         _recover_interrupted_undo_items(
@@ -840,6 +1197,12 @@ def recover_interrupted_operation_execution(
             next_status="UNDONE",
             undone_at=current_time,
         )
+        next_operation_status = (
+            OperationStatus.COMPENSATED
+            if any(item.status == "FAILED" for item in persisted_items)
+            else OperationStatus.UNDONE
+        )
+        expected_operation_status = OperationStatus.UNDOING
         completion_message = "无法保存中断撤销的恢复汇总状态"
 
     if not execution_updated:
@@ -848,6 +1211,14 @@ def recover_interrupted_operation_execution(
             SafeExecutionErrorCode.STATE_CHANGED,
             "汇总恢复结果前执行主记录已经变化",
         )
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=expected_operation_status,
+        next_status=next_operation_status,
+        execution_id=execution.id,
+        message="汇总恢复结果前 Operation 状态已经变化",
+    )
     _commit_completion(session, completion_message)
 
     session.expire_all()
@@ -863,166 +1234,112 @@ def recover_interrupted_operation_execution(
     )
 
 
+def _mark_interrupted_execution_failed(
+    session: Session,
+    workflow_id: UUID,
+    execution_id: int,
+    *,
+    current_time: datetime,
+) -> SafeExecutionResult:
+    """FAILED：证据不安全时只收敛状态，不再产生新的文件副作用。"""
+
+    session.rollback()
+    session.expire_all()
+    execution = get_operation_execution_by_workflow_id(
+        session,
+        str(workflow_id),
+    )
+    if execution is None or execution.id != execution_id:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.HISTORY_NOT_FOUND,
+            "找不到需要标记失败的执行历史",
+        )
+    if execution.status != "EXECUTING":
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.STATE_CHANGED,
+            "标记恢复失败前执行主记录已经变化",
+        )
+
+    execution_items = find_operation_execution_items(session, execution.id)
+    for item in execution_items:
+        if item.status not in {"PENDING", "EXECUTING"}:
+            continue
+        item_updated = compare_and_set_operation_execution_item_status(
+            session,
+            item.id,
+            "EXECUTING" if item.status == "EXECUTING" else "PENDING",
+            next_status="FAILED",
+            error_code=SafeExecutionErrorCode.RECOVERY_UNSAFE.value,
+            failed_at=current_time,
+        )
+        if not item_updated:
+            session.rollback()
+            raise SafeExecutionError(
+                SafeExecutionErrorCode.STATE_CHANGED,
+                "标记恢复失败前执行明细已经变化",
+            )
+
+    execution_updated = compare_and_set_operation_execution_status(
+        session,
+        execution.id,
+        "EXECUTING",
+        next_status="FAILED",
+        completed_at=current_time,
+    )
+    if not execution_updated:
+        session.rollback()
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.STATE_CHANGED,
+            "标记恢复失败前执行主记录已经变化",
+        )
+    _sync_operation_status(
+        session,
+        workflow_id,
+        expected_status=OperationStatus.EXECUTING,
+        next_status=OperationStatus.FAILED,
+        execution_id=execution.id,
+        message="标记恢复失败前 Operation 状态已经变化",
+    )
+    _commit_completion(session, "无法保存 EXECUTING 崩溃恢复失败状态")
+
+    session.expire_all()
+    persisted_execution = get_operation_execution_by_workflow_id(
+        session,
+        str(workflow_id),
+    )
+    if persisted_execution is None:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.HISTORY_NOT_FOUND,
+            "保存恢复失败状态后找不到执行历史",
+        )
+    return _build_execution_result(
+        persisted_execution,
+        workflow_id=workflow_id,
+        plan_id=UUID(persisted_execution.plan_id),
+        execution_items=find_operation_execution_items(
+            session,
+            persisted_execution.id,
+        ),
+    )
+
+
 def undo_safe_operation_execution(
     session: Session,
     workflow_id: UUID,
     *,
     now: datetime | None = None,
+    quarantine_root: Path | None = None,
 ) -> SafeExecutionResult:
-    """撤销一条已完成且磁盘状态未变化的单项移动记录。"""
+    """撤销全部已完成项；部分失败时保留失败项并仅撤回成功项。"""
 
-    current_time = _aware_current_time(now)
-    execution = get_operation_execution_by_workflow_id(
+    return _restore_operation_execution(
         session,
-        str(workflow_id),
-    )
-    if execution is None:
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.HISTORY_NOT_FOUND,
-            "找不到需要撤销的执行历史",
-        )
-    if execution.status != "COMPLETED":
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "只有已完成且尚未撤销的执行记录可以撤销",
-        )
-
-    execution_items = find_operation_execution_items(session, execution.id)
-    if len(execution_items) != 1:
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "当前撤销边界只接受一条完整执行明细",
-        )
-    execution_item = execution_items[0]
-    if (
-        execution_item.status != "COMPLETED"
-        or execution_item.operation_type not in {"move", "rename"}
-        or execution_item.before_location != "workspace"
-        or execution_item.after_location != "workspace"
-        or execution_item.after_size_bytes is None
-        or execution_item.after_mtime_ns is None
-    ):
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "执行明细缺少可安全撤销的 after 证据",
-        )
-
-    workspace = get_workspace_by_id(session, execution.workspace_id)
-    if workspace is None:
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
-            "执行历史对应的工作区不存在",
-        )
-    adapter = FileSystemAdapter(Path(workspace.root_path))
-    undo_source = Path(execution_item.undo_source_relative_path)
-    undo_target = Path(execution_item.undo_target_relative_path)
-    current_metadata = _get_required_metadata(
-        adapter,
-        undo_source,
-        "撤销源文件不存在或不是普通文件",
-    )
-    if (
-        current_metadata.size_bytes != execution_item.after_size_bytes
-        or current_metadata.mtime_ns != execution_item.after_mtime_ns
-    ):
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.FILE_CHANGED,
-            "执行后的文件已经变化，拒绝撤销",
-        )
-    _verify_optional_hash(
-        adapter,
-        undo_source,
-        execution_item.after_sha256,
-    )
-    if adapter.path_exists(undo_target):
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.UNDO_TARGET_CONFLICT,
-            "原路径已经被占用，拒绝覆盖撤销",
-        )
-
-    execution_marked = compare_and_set_operation_execution_status(
-        session,
-        execution.id,
-        "COMPLETED",
-        next_status="UNDOING",
-    )
-    item_marked = compare_and_set_operation_execution_item_status(
-        session,
-        execution_item.id,
-        "COMPLETED",
-        next_status="UNDOING",
-    )
-    if not (execution_marked and item_marked):
-        session.rollback()
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.STATE_CHANGED,
-            "撤销开始前执行历史已经变化",
-        )
-    _commit_completion(session, "无法保存撤销开始状态")
-
-    restored_path = SafeFileMover(adapter).move(undo_source, undo_target)
-    restored_metadata = _get_required_metadata(
-        adapter,
-        restored_path,
-        "撤销后的原文件不可用",
-    )
-    if (
-        restored_metadata.size_bytes != execution_item.before_size_bytes
-        or restored_metadata.mtime_ns != execution_item.before_mtime_ns
-    ):
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.FILE_CHANGED,
-            "撤销结果与 before 元数据不一致",
-        )
-    _verify_optional_hash(
-        adapter,
-        restored_path,
-        execution_item.before_sha256,
-    )
-
-    index_updated = compare_and_set_file_entry_location(
-        session,
-        execution.workspace_id,
-        execution_item.source_file_id,
-        execution_item.after_relative_path,
-        next_relative_path=execution_item.before_relative_path,
-        size_bytes=restored_metadata.size_bytes,
-        mtime_ns=restored_metadata.mtime_ns,
-    )
-    item_updated = compare_and_set_operation_execution_item_status(
-        session,
-        execution_item.id,
-        "UNDOING",
-        next_status="UNDONE",
-        undone_at=current_time,
-    )
-    execution_updated = compare_and_set_operation_execution_status(
-        session,
-        execution.id,
-        "UNDOING",
-        next_status="UNDONE",
-        undone_at=current_time,
-    )
-    if not (index_updated and item_updated and execution_updated):
-        session.rollback()
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.STATE_CHANGED,
-            "磁盘撤销完成后执行历史或文件索引已经变化",
-        )
-    _commit_completion(
-        session,
-        "磁盘撤销完成，但无法提交 undo 与索引状态",
-    )
-
-    session.refresh(execution)
-    return _build_execution_result(
-        execution,
-        workflow_id=workflow_id,
-        plan_id=UUID(execution.plan_id),
-        execution_items=find_operation_execution_items(
-            session,
-            execution.id,
-        ),
+        workflow_id,
+        now=now,
+        quarantine_root=quarantine_root,
+        action="撤销",
+        allowed_statuses=frozenset({"COMPLETED", "PARTIALLY_COMPLETED"}),
+        final_operation_status=OperationStatus.UNDONE,
     )
 
 
@@ -1034,7 +1351,7 @@ def _recover_interrupted_execution_items(
     current_time: datetime,
 ) -> None:
     if not execution_items or any(
-        item.status not in {"PENDING", "COMPLETED", "FAILED"}
+        item.status not in {"PENDING", "EXECUTING", "COMPLETED", "FAILED"}
         for item in execution_items
     ):
         raise SafeExecutionError(
@@ -1044,7 +1361,7 @@ def _recover_interrupted_execution_items(
 
     recovery_actions: list[tuple[OperationExecutionItem, str]] = []
     for item in execution_items:
-        if item.status != "PENDING":
+        if item.status not in {"PENDING", "EXECUTING"}:
             continue
         if (
             item.operation_type not in {"move", "rename"}
@@ -1077,6 +1394,24 @@ def _recover_interrupted_execution_items(
 
     mover = SafeFileMover(adapter)
     for item, action in recovery_actions:
+        expected_item_status = (
+            "EXECUTING" if item.status == "EXECUTING" else "PENDING"
+        )
+        if expected_item_status == "PENDING":
+            item_started = compare_and_set_operation_execution_item_status(
+                session,
+                item.id,
+                "PENDING",
+                next_status="EXECUTING",
+            )
+            if not item_started:
+                session.rollback()
+                raise SafeExecutionError(
+                    SafeExecutionErrorCode.STATE_CHANGED,
+                    "开始恢复单项执行前执行明细已经变化",
+                )
+            _commit_completion(session, "无法保存单项恢复开始状态")
+            expected_item_status = "EXECUTING"
         target_path = Path(item.after_relative_path)
         if action == "move":
             try:
@@ -1091,7 +1426,7 @@ def _recover_interrupted_execution_items(
                     compare_and_set_operation_execution_item_status(
                         session,
                         item.id,
-                        "PENDING",
+                        expected_item_status,
                         next_status="FAILED",
                         error_code=error.code.value,
                         failed_at=current_time,
@@ -1129,7 +1464,7 @@ def _recover_interrupted_execution_items(
         item_updated = compare_and_set_operation_execution_item_status(
             session,
             item.id,
-            "PENDING",
+            expected_item_status,
             next_status="COMPLETED",
             after_size_bytes=after_metadata.size_bytes,
             after_mtime_ns=after_metadata.mtime_ns,
@@ -1174,7 +1509,7 @@ def _recover_interrupted_undo_items(
         )
 
     recovery_actions: list[tuple[OperationExecutionItem, str]] = []
-    for item in execution_items:
+    for item in reversed(execution_items):
         if item.status != "UNDOING":
             continue
         if (
@@ -1290,6 +1625,42 @@ def _interrupted_path_action(
     return "move" if source_exists else "reconcile"
 
 
+def _operation_locations(
+    operation: OperationPlanItem,
+) -> tuple[str, str]:
+    """把计划类型映射为执行历史中的物理位置。"""
+
+    if operation.operation_type == "quarantine":
+        return "workspace", "quarantine"
+    return "workspace", "workspace"
+
+
+def _revalidate_source_before_action(
+    adapter: FileSystemAdapter,
+    *,
+    source_path: Path,
+    expected_size_bytes: int,
+    expected_mtime_ns: int,
+    expected_sha256: str | None,
+) -> None:
+    """在跨目录或同目录副作用前重新确认源文件身份。"""
+
+    current_metadata = _get_required_metadata(
+        adapter,
+        source_path,
+        "执行前源文件不可用",
+    )
+    if (
+        current_metadata.size_bytes != expected_size_bytes
+        or current_metadata.mtime_ns != expected_mtime_ns
+    ):
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.FILE_CHANGED,
+            "执行前源文件与 before 证据不一致",
+        )
+    _verify_optional_hash(adapter, source_path, expected_sha256)
+
+
 def _revalidate_file_before_move(
     adapter: FileSystemAdapter,
     *,
@@ -1301,22 +1672,13 @@ def _revalidate_file_before_move(
 ) -> None:
     """在真实移动前重新确认源文件证据和目标状态。"""
 
-    current_metadata = _get_required_metadata(
+    _revalidate_source_before_action(
         adapter,
-        source_path,
-        "执行前源文件不可用",
+        source_path=source_path,
+        expected_size_bytes=expected_size_bytes,
+        expected_mtime_ns=expected_mtime_ns,
+        expected_sha256=expected_sha256,
     )
-
-
-    if (
-        current_metadata.size_bytes != expected_size_bytes
-        or current_metadata.mtime_ns != expected_mtime_ns
-    ):
-        raise SafeExecutionError(
-            SafeExecutionErrorCode.FILE_CHANGED,
-            "执行前源文件与 before 证据不一致",
-        )
-    _verify_optional_hash(adapter, source_path, expected_sha256)
 
     try:
         if not adapter.is_directory(target_path.parent):
@@ -1398,29 +1760,69 @@ def _validate_failed_item_for_retry(
     )
 
 
-def _validate_completed_item_for_compensation(
-    adapter: FileSystemAdapter,
+def _build_undo_context(
+    workspace_adapter: FileSystemAdapter,
     execution_item: OperationExecutionItem,
+    *,
+    quarantine_root: Path | None,
+) -> _UndoContext:
+    if execution_item.operation_type != "quarantine":
+        return _UndoContext(
+            source_adapter=workspace_adapter,
+            target_adapter=workspace_adapter,
+            quarantine_manager=None,
+        )
+
+    quarantine_adapter = FileSystemAdapter(
+        quarantine_root or resolve_quarantine_root()
+    )
+    try:
+        quarantine_manager = QuarantineManager(
+            workspace_adapter,
+            quarantine_adapter,
+        )
+    except (PathPolicyError, QuarantineError, ValueError) as error:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.QUARANTINE_UNAVAILABLE,
+            "隔离区当前不可用",
+        ) from error
+    return _UndoContext(
+        source_adapter=quarantine_adapter,
+        target_adapter=workspace_adapter,
+        quarantine_manager=quarantine_manager,
+    )
+
+
+def _validate_completed_item_for_restore(
+    context: _UndoContext,
+    execution_item: OperationExecutionItem,
+    *,
+    action: str,
 ) -> None:
+    expected_after_location = (
+        "quarantine"
+        if execution_item.operation_type == "quarantine"
+        else "workspace"
+    )
     if (
         execution_item.status != "COMPLETED"
-        or execution_item.operation_type not in {"move", "rename"}
+        or execution_item.operation_type not in {"move", "quarantine", "rename"}
         or execution_item.before_location != "workspace"
-        or execution_item.after_location != "workspace"
+        or execution_item.after_location != expected_after_location
         or execution_item.after_size_bytes is None
         or execution_item.after_mtime_ns is None
     ):
         raise SafeExecutionError(
             SafeExecutionErrorCode.INVALID_HISTORY_STATE,
-            "完成明细缺少可安全补偿的 after 证据",
+            f"完成明细缺少可安全{action}的 after 证据",
         )
 
-    compensation_source = Path(execution_item.undo_source_relative_path)
-    compensation_target = Path(execution_item.undo_target_relative_path)
+    restore_source = Path(execution_item.undo_source_relative_path)
+    restore_target = Path(execution_item.undo_target_relative_path)
     current_metadata = _get_required_metadata(
-        adapter,
-        compensation_source,
-        "补偿源文件不存在或不是普通文件",
+        context.source_adapter,
+        restore_source,
+        f"{action}源文件不存在或不是普通文件",
     )
     if (
         current_metadata.size_bytes != execution_item.after_size_bytes
@@ -1428,18 +1830,88 @@ def _validate_completed_item_for_compensation(
     ):
         raise SafeExecutionError(
             SafeExecutionErrorCode.FILE_CHANGED,
-            "执行后的文件已经变化，拒绝补偿",
+            f"执行后的文件已经变化，拒绝{action}",
         )
     _verify_optional_hash(
-        adapter,
-        compensation_source,
+        context.source_adapter,
+        restore_source,
         execution_item.after_sha256,
     )
-    if adapter.path_exists(compensation_target):
+    if context.target_adapter.path_exists(restore_target):
         raise SafeExecutionError(
             SafeExecutionErrorCode.UNDO_TARGET_CONFLICT,
-            "原路径已经被占用，拒绝覆盖补偿",
+            f"原路径已经被占用，拒绝覆盖{action}",
         )
+
+
+def _restore_item_file(
+    context: _UndoContext,
+    execution_item: OperationExecutionItem,
+    *,
+    action: str,
+) -> Path:
+    restore_source = Path(execution_item.undo_source_relative_path)
+    restore_target = Path(execution_item.undo_target_relative_path)
+    if context.quarantine_manager is None:
+        return SafeFileMover(context.source_adapter).move(
+            restore_source,
+            restore_target,
+        )
+
+    try:
+        return context.quarantine_manager.restore(
+            restore_source,
+            restore_target,
+        )
+    except QuarantineError as error:
+        if error.code == QuarantineErrorCode.TARGET_CONFLICT:
+            raise SafeExecutionError(
+                SafeExecutionErrorCode.UNDO_TARGET_CONFLICT,
+                f"原路径已经被占用，拒绝覆盖{action}",
+            ) from error
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.FILE_CHANGED,
+            f"隔离文件当前无法安全{action}",
+        ) from error
+
+
+def _sync_operation_status(
+    session: Session,
+    workflow_id: UUID,
+    *,
+    expected_status: OperationStatus,
+    next_status: OperationStatus,
+    execution_id: int | None,
+    message: str,
+) -> None:
+    """在存在统一 Operation 投影时同步执行或恢复阶段。"""
+
+    record = get_operation_status_by_workflow_id(session, str(workflow_id))
+    if record is None:
+        return
+
+    session.expire(record)
+    session.refresh(record)
+    if record.overall_status != expected_status.value:
+        session.rollback()
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.STATE_CHANGED,
+            message,
+        )
+    if not compare_and_set_operation_status(
+        session,
+        str(workflow_id),
+        expected_status,
+        expected_revision=record.revision,
+        next_status=next_status,
+        execution_id=execution_id,
+    ):
+        session.rollback()
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.STATE_CHANGED,
+            message,
+        )
+    session.expire(record)
 
 
 def _get_idempotent_execution_result(

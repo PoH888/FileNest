@@ -72,6 +72,18 @@ def test_operation_plan_item_accepts_rename() -> None:
     assert operation.operation_type == "rename"
 
 
+def test_operation_plan_item_accepts_quarantine() -> None:
+    operation = _operation(
+        operation_type="quarantine",
+        target_relative_path=(
+            "workspace-3/2d053752-d3c4-45cb-b696-bd043e78ed92/7/"
+            "quarterly-report.pdf"
+        ),
+    )
+
+    assert operation.operation_type == "quarantine"
+
+
 @pytest.mark.parametrize(
     "path",
     ["../outside.txt", "D:/outside.txt", "folder\\file.txt", " file.txt", "."],

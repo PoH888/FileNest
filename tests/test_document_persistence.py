@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.document_chunker import chunk_document
-from backend.app.document_contracts import Document
+from backend.app.document_contracts import Document, DocumentPage
 from backend.app.models import (
     ChunkRecord,
     ChunkEmbeddingRecord,
@@ -122,6 +122,99 @@ def test_document_and_chunks_persist_traceability_metadata(
                 and chunk.source_relative_path == "notes/project.md"
                 for chunk in restored_chunks
             )
+    finally:
+        engine.dispose()
+
+
+def test_pdf_document_format_is_accepted_by_persisted_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _upgrade_database(tmp_path, monkeypatch)
+    try:
+        with Session(engine) as session:
+            workspace = Workspace(
+                name="PDF 文档格式持久化测试",
+                root_path=str(tmp_path / "workspace"),
+            )
+            session.add(workspace)
+            session.flush()
+
+            file_entry = FileEntry(
+                workspace_id=workspace.id,
+                relative_path="reports/summary.pdf",
+                name="summary.pdf",
+                extension=".pdf",
+                size_bytes=8,
+                mtime_ns=1_800_000_000_000_000_000,
+            )
+            session.add(file_entry)
+            session.flush()
+
+            document = Document(
+                document_id=DOCUMENT_ID,
+                workspace_id=workspace.id,
+                file_entry_id=file_entry.id,
+                source_relative_path=file_entry.relative_path,
+                source_format="pdf",
+                normalized_text="PDF text",
+                pages=(DocumentPage(page_number=1, start_offset=0, end_offset=8),),
+                source_version="f" * 64,
+                source_updated_at=SOURCE_UPDATED_AT,
+            )
+            session.add(DocumentRecord.from_contract(document))
+            session.commit()
+
+            restored = session.get(DocumentRecord, str(DOCUMENT_ID))
+
+        assert restored is not None
+        assert restored.source_format == "pdf"
+    finally:
+        engine.dispose()
+
+
+def test_docx_document_format_is_accepted_by_persisted_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _upgrade_database(tmp_path, monkeypatch)
+    try:
+        with Session(engine) as session:
+            workspace = Workspace(
+                name="DOCX 文档格式持久化测试",
+                root_path=str(tmp_path / "workspace"),
+            )
+            session.add(workspace)
+            session.flush()
+
+            file_entry = FileEntry(
+                workspace_id=workspace.id,
+                relative_path="reports/summary.docx",
+                name="summary.docx",
+                extension=".docx",
+                size_bytes=8,
+                mtime_ns=1_800_000_000_000_000_000,
+            )
+            session.add(file_entry)
+            session.flush()
+
+            document = Document(
+                document_id=DOCUMENT_ID,
+                workspace_id=workspace.id,
+                file_entry_id=file_entry.id,
+                source_relative_path=file_entry.relative_path,
+                source_format="docx",
+                normalized_text="DOCX text",
+                source_version="a" * 64,
+                source_updated_at=SOURCE_UPDATED_AT,
+            )
+            session.add(DocumentRecord.from_contract(document))
+            session.commit()
+
+            restored = session.get(DocumentRecord, str(DOCUMENT_ID))
+
+        assert restored is not None
+        assert restored.source_format == "docx"
     finally:
         engine.dispose()
 
