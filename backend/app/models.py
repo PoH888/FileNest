@@ -19,7 +19,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 # Mapped 用来标记：这个类属性不是普通属性，而是需要映射到数据库字段的 ORM 属性。
 
 from .database import Base
-from .document_contracts import Chunk, Document
+from .document_contracts import (
+    Chunk,
+    Document,
+    DocumentPage,
+    DocumentPosition,
+)
 from .embedding_client import (
     EmbeddingVector,
     InvalidEmbeddingVectorError,
@@ -72,13 +77,22 @@ class FileEntry(Base):
 
 
 class DocumentRecord(Base):
-    """规范化文档的文件追踪、版本和更新时间持久化记录。"""
+    """规范化文档及其 ingestion 状态的持久化记录。"""
 
     __tablename__ = "documents"
     __table_args__ = (
         CheckConstraint(
             "source_format IN ('markdown', 'text', 'pdf', 'docx')",
             name="ck_documents_source_format",
+        ),
+        CheckConstraint(
+            "ingest_status IN ('pending', 'parsing', 'indexed', 'failed')",
+            name="ck_documents_ingest_status",
+        ),
+        CheckConstraint(
+            "(ingest_status = 'failed' AND ingest_error IS NOT NULL) "
+            "OR (ingest_status <> 'failed' AND ingest_error IS NULL)",
+            name="ck_documents_ingest_error",
         ),
         UniqueConstraint(
             "file_entry_id",
@@ -102,33 +116,244 @@ class DocumentRecord(Base):
         String,
         nullable=False,
     )
+    ingest_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
     source_format: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
     )
     normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
-    source_version: Mapped[str] = mapped_column(
+    source_version: Mapped[str | None] = mapped_column(
         String(64),
-        nullable=False,
+        nullable=True,
     )
-    source_updated_at: Mapped[datetime] = mapped_column(
+    source_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        nullable=False,
+        nullable=True,
+    )
+    ingest_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    pages: Mapped[list["DocumentPageRecord"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="DocumentPageRecord.page_number",
+    )
+    source_positions: Mapped[list["DocumentPositionRecord"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="DocumentPositionRecord.position_index",
+    )
+    chunks: Mapped[list["ChunkRecord"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="ChunkRecord.chunk_index",
     )
 
     @classmethod
     def from_contract(cls, document: Document) -> "DocumentRecord":
         """将已验证的 Document 转换为待提交的 ORM 记录。"""
 
-        return cls(
+        record = cls(
             document_id=str(document.document_id),
             workspace_id=document.workspace_id,
             file_entry_id=document.file_entry_id,
             source_relative_path=document.source_relative_path,
+            ingest_status="indexed",
             source_format=document.source_format,
             normalized_text=document.normalized_text,
             source_version=document.source_version,
             source_updated_at=document.source_updated_at,
+        )
+        record.pages = [
+            DocumentPageRecord.from_contract(
+                document_id=str(document.document_id),
+                page=page,
+            )
+            for page in document.pages
+        ]
+        record.source_positions = [
+            DocumentPositionRecord.from_contract(
+                document_id=str(document.document_id),
+                position_index=position_index,
+                position=position,
+            )
+            for position_index, position in enumerate(document.source_positions)
+        ]
+        return record
+
+    @classmethod
+    def for_failed_ingest(
+        cls,
+        *,
+        document_id: str,
+        workspace_id: int,
+        file_entry_id: int,
+        source_relative_path: str,
+        source_format: str,
+        ingest_error: str,
+    ) -> "DocumentRecord":
+        """创建尚未生成规范化正文但已保存失败证据的记录。"""
+
+        return cls(
+            document_id=document_id,
+            workspace_id=workspace_id,
+            file_entry_id=file_entry_id,
+            source_relative_path=source_relative_path,
+            source_format=source_format,
+            normalized_text="",
+            source_version=None,
+            source_updated_at=None,
+            ingest_status="failed",
+            ingest_error=ingest_error,
+        )
+
+
+class DocumentPositionRecord(Base):
+    """DOCX 结构位置在规范化正文中的持久化记录。"""
+
+    __tablename__ = "document_positions"
+    __table_args__ = (
+        CheckConstraint(
+            "position_index >= 0",
+            name="ck_document_positions_index_non_negative",
+        ),
+        CheckConstraint(
+            "element_type IN ('paragraph', 'table_cell')",
+            name="ck_document_positions_element_type",
+        ),
+        CheckConstraint(
+            "start_offset >= 0 AND end_offset >= start_offset",
+            name="ck_document_positions_offset_order",
+        ),
+        CheckConstraint(
+            "heading_level IS NULL OR heading_level >= 1",
+            name="ck_document_positions_heading_level",
+        ),
+        CheckConstraint(
+            "section_index IS NULL OR section_index >= 0",
+            name="ck_document_positions_section_index",
+        ),
+        CheckConstraint(
+            "paragraph_index IS NULL OR paragraph_index >= 0",
+            name="ck_document_positions_paragraph_index",
+        ),
+        CheckConstraint(
+            "table_index IS NULL OR table_index >= 0",
+            name="ck_document_positions_table_index",
+        ),
+        CheckConstraint(
+            "row_index IS NULL OR row_index >= 0",
+            name="ck_document_positions_row_index",
+        ),
+        CheckConstraint(
+            "cell_index IS NULL OR cell_index >= 0",
+            name="ck_document_positions_cell_index",
+        ),
+        UniqueConstraint(
+            "document_id",
+            "position_index",
+            name="uq_document_positions_document_index",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.document_id"),
+        nullable=False,
+        index=True,
+    )
+    position_index: Mapped[int] = mapped_column(nullable=False)
+    element_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    start_offset: Mapped[int] = mapped_column(nullable=False)
+    end_offset: Mapped[int] = mapped_column(nullable=False)
+    section_index: Mapped[int | None] = mapped_column(nullable=True)
+    heading_level: Mapped[int | None] = mapped_column(nullable=True)
+    paragraph_index: Mapped[int | None] = mapped_column(nullable=True)
+    table_index: Mapped[int | None] = mapped_column(nullable=True)
+    row_index: Mapped[int | None] = mapped_column(nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(nullable=True)
+    document: Mapped["DocumentRecord"] = relationship(
+        back_populates="source_positions",
+    )
+
+    @classmethod
+    def from_contract(
+        cls,
+        *,
+        document_id: str,
+        position_index: int,
+        position: DocumentPosition,
+    ) -> "DocumentPositionRecord":
+        """将已验证的 DOCX 位置转换为待提交的 ORM 记录。"""
+
+        return cls(
+            document_id=document_id,
+            position_index=position_index,
+            element_type=position.element_type,
+            start_offset=position.start_offset,
+            end_offset=position.end_offset,
+            section_index=position.section_index,
+            heading_level=position.heading_level,
+            paragraph_index=position.paragraph_index,
+            table_index=position.table_index,
+            row_index=position.row_index,
+            cell_index=position.cell_index,
+        )
+
+
+class DocumentPageRecord(Base):
+    """PDF 页码及其在规范化正文中的可追踪区间。"""
+
+    __tablename__ = "document_pages"
+    __table_args__ = (
+        CheckConstraint(
+            "page_number >= 1",
+            name="ck_document_pages_number_positive",
+        ),
+        CheckConstraint(
+            "start_offset >= 0 AND end_offset >= start_offset",
+            name="ck_document_pages_offset_order",
+        ),
+        UniqueConstraint(
+            "document_id",
+            "page_number",
+            name="uq_document_pages_document_number",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.document_id"),
+        nullable=False,
+        index=True,
+    )
+    page_number: Mapped[int] = mapped_column(nullable=False)
+    start_offset: Mapped[int] = mapped_column(nullable=False)
+    end_offset: Mapped[int] = mapped_column(nullable=False)
+    document: Mapped["DocumentRecord"] = relationship(
+        back_populates="pages",
+    )
+
+    @classmethod
+    def from_contract(
+        cls,
+        *,
+        document_id: str,
+        page: DocumentPage,
+    ) -> "DocumentPageRecord":
+        """将已验证的 PDF 页元数据转换为待提交的 ORM 记录。"""
+
+        return cls(
+            document_id=document_id,
+            page_number=page.page_number,
+            start_offset=page.start_offset,
+            end_offset=page.end_offset,
         )
 
 
@@ -148,6 +373,15 @@ class ChunkRecord(Base):
         CheckConstraint(
             "start_line >= 1 AND end_line >= start_line",
             name="ck_document_chunks_line_order",
+        ),
+        CheckConstraint(
+            "(page_start IS NULL AND page_end IS NULL) "
+            "OR (page_start >= 1 AND page_end >= page_start)",
+            name="ck_document_chunks_page_range",
+        ),
+        CheckConstraint(
+            "source_positions_json IS NULL OR length(source_positions_json) > 0",
+            name="ck_document_chunks_source_positions_non_empty",
         ),
         UniqueConstraint(
             "document_id",
@@ -182,11 +416,32 @@ class ChunkRecord(Base):
     end_offset: Mapped[int] = mapped_column(nullable=False)
     start_line: Mapped[int] = mapped_column(nullable=False)
     end_line: Mapped[int] = mapped_column(nullable=False)
+    source_positions_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    page_start: Mapped[int | None] = mapped_column(nullable=True)
+    page_end: Mapped[int | None] = mapped_column(nullable=True)
+    document: Mapped["DocumentRecord"] = relationship(
+        back_populates="chunks",
+    )
 
     @classmethod
     def from_contract(cls, chunk: Chunk) -> "ChunkRecord":
         """将已验证的 Chunk 转换为待提交的 ORM 记录。"""
 
+        source_positions_json = (
+            json.dumps(
+                [
+                    position.model_dump(mode="json")
+                    for position in chunk.source_positions
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if chunk.source_positions
+            else None
+        )
         return cls(
             chunk_id=str(chunk.chunk_id),
             document_id=str(chunk.document_id),
@@ -198,6 +453,9 @@ class ChunkRecord(Base):
             end_offset=chunk.end_offset,
             start_line=chunk.start_line,
             end_line=chunk.end_line,
+            source_positions_json=source_positions_json,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
         )
 
 

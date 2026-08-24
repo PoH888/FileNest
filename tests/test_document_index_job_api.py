@@ -113,7 +113,51 @@ def test_document_index_job_parses_chunks_and_persists(
     assert len(documents) == 1
     assert documents[0].source_relative_path == "notes.md"
     assert documents[0].source_format == "markdown"
+    assert documents[0].ingest_status == "indexed"
     assert [chunk.text for chunk in chunks] == ["标题\n正文"]
+
+
+def test_document_index_job_supports_txt(
+    document_index_client: tuple[TestClient, Engine],
+    tmp_path: Path,
+) -> None:
+    client, engine = document_index_client
+    workspace_root = tmp_path / "txt-document-workspace"
+    workspace_root.mkdir()
+    (workspace_root / "notes.txt").write_text("纯文本内容", encoding="utf-8")
+
+    create_response = client.post(
+        "/api/v1/workspaces",
+        json={
+            "name": "TXT 文档索引测试",
+            "root_path": str(workspace_root),
+        },
+    )
+    workspace_id = create_response.json()["id"]
+
+    scan_response = client.post(
+        f"/api/v1/workspaces/{workspace_id}/scan",
+    )
+    assert scan_response.status_code == 202
+    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+
+    index_response = client.post(
+        f"/api/v1/workspaces/{workspace_id}/documents/index",
+    )
+    assert index_response.status_code == 202
+    index_job = _wait_for_job(
+        client,
+        index_response.json()["job_id"],
+        "completed",
+    )
+    assert index_job["error_code"] is None
+
+    with Session(engine) as session:
+        document = session.scalars(select(DocumentRecord)).one()
+
+    assert document.source_relative_path == "notes.txt"
+    assert document.source_format == "text"
+    assert document.normalized_text == "纯文本内容"
 
 
 def test_document_index_job_supports_pdf(
@@ -203,7 +247,11 @@ def test_document_index_job_rejects_malformed_pdf(
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
-        assert session.scalars(select(DocumentRecord)).first() is None
+        failed_document = session.scalars(select(DocumentRecord)).one()
+
+    assert failed_document.ingest_status == "failed"
+    assert failed_document.ingest_error is not None
+    assert "readable PDF" in failed_document.ingest_error
 
 
 def test_document_index_job_supports_docx(
@@ -291,7 +339,11 @@ def test_document_index_job_rejects_malformed_docx(
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
-        assert session.scalars(select(DocumentRecord)).first() is None
+        failed_document = session.scalars(select(DocumentRecord)).one()
+
+    assert failed_document.ingest_status == "failed"
+    assert failed_document.ingest_error is not None
+    assert "readable DOCX" in failed_document.ingest_error
 
 
 def test_document_index_job_failure_rolls_back_partial_index(
@@ -332,4 +384,8 @@ def test_document_index_job_failure_rolls_back_partial_index(
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
-        assert session.scalars(select(DocumentRecord)).first() is None
+        failed_document = session.scalars(select(DocumentRecord)).one()
+
+    assert failed_document.ingest_status == "failed"
+    assert failed_document.ingest_error is not None
+    assert failed_document.ingest_error.strip()

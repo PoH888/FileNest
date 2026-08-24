@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import Base
 from backend.app.document_chunker import chunk_document
-from backend.app.document_contracts import Document
+from backend.app.document_contracts import Document, DocumentPage
 from backend.app.models import ChunkRecord, DocumentRecord, FileEntry, Workspace
 from backend.app.tool_contracts import Tool, ToolResult
 from backend.app.tool_registry import ToolRegistry, build_read_tool_registry
@@ -183,6 +183,74 @@ def test_registry_dispatches_traceable_knowledge_search(
     assert item["score"] == 1
     assert "private/other.md" not in result.model_dump_json()
     assert "D:/Private" not in result.model_dump_json()
+
+
+def test_registry_returns_pdf_page_provenance_for_knowledge_search(
+    engine: Engine,
+) -> None:
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="PDF 知识搜索工作区",
+            root_path="D:/Private/PdfKnowledgeSearch",
+        )
+        session.add(workspace)
+        session.flush()
+
+        relative_path = "reports/approval.pdf"
+        text = "第一页审批说明\n\n第二页审批说明"
+        first_page_end = len("第一页审批说明")
+        file_entry = FileEntry(
+            workspace_id=workspace.id,
+            relative_path=relative_path,
+            name=Path(relative_path).name,
+            extension=".pdf",
+            size_bytes=len(text.encode("utf-8")),
+            mtime_ns=1_800_000_000_000_000_000,
+        )
+        session.add(file_entry)
+        session.flush()
+
+        document = Document(
+            document_id=uuid4(),
+            workspace_id=workspace.id,
+            file_entry_id=file_entry.id,
+            source_relative_path=relative_path,
+            source_format="pdf",
+            normalized_text=text,
+            pages=(
+                DocumentPage(
+                    page_number=1,
+                    start_offset=0,
+                    end_offset=first_page_end,
+                ),
+                DocumentPage(
+                    page_number=2,
+                    start_offset=first_page_end + 2,
+                    end_offset=len(text),
+                ),
+            ),
+            source_version="a" * 64,
+            source_updated_at="2026-09-01T00:00:00+00:00",
+        )
+        session.add(DocumentRecord.from_contract(document))
+        session.add_all(
+            ChunkRecord.from_contract(chunk)
+            for chunk in chunk_document(document)
+        )
+        session.commit()
+
+        result = build_read_tool_registry(session).invoke(
+            "knowledge_search",
+            {"workspace_id": workspace.id, "query": "审批"},
+        )
+
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["items"][0]["source_relative_path"] == relative_path
+    assert (result.data["items"][0]["page_start"], result.data["items"][0]["page_end"]) == (
+        1,
+        2,
+    )
 
 
 def test_registry_rejects_invalid_knowledge_search_arguments() -> None:

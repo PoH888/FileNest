@@ -5,6 +5,7 @@ from uuid import UUID
 
 import pytest
 from docx import Document as WordDocument
+from docx.enum.section import WD_SECTION
 
 from backend.app.document_parser import (
     DocumentParseError,
@@ -210,6 +211,69 @@ def test_load_document_supports_docx_and_preserves_source_positions(
     assert document.source_positions[1].cell_index == 0
     assert document.source_positions[2].cell_index == 1
     assert document.source_positions[3].paragraph_index == 1
+
+
+def test_load_document_preserves_docx_heading_level(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    docx_file = workspace_root / "reports" / "heading.docx"
+    docx_file.parent.mkdir(parents=True, exist_ok=True)
+
+    word_document = WordDocument()
+    word_document.add_heading("Overview", level=2)
+    word_document.add_paragraph("Body")
+    word_document.save(docx_file)
+    adapter = FileSystemAdapter(workspace_root)
+
+    document = load_document(
+        adapter,
+        workspace_id=3,
+        file_entry_id=7,
+        source_relative_path=Path("reports/heading.docx"),
+        document_id=DOCUMENT_ID,
+    )
+
+    assert [position.heading_level for position in document.source_positions] == [
+        2,
+        None,
+    ]
+
+
+def test_load_document_preserves_docx_section_index(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    docx_file = workspace_root / "reports" / "sections.docx"
+    docx_file.parent.mkdir(parents=True, exist_ok=True)
+
+    word_document = WordDocument()
+    word_document.add_paragraph("First section")
+    word_document.add_section(WD_SECTION.NEW_PAGE)
+    word_document.add_paragraph("Second section")
+    word_document.save(docx_file)
+    adapter = FileSystemAdapter(workspace_root)
+
+    document = load_document(
+        adapter,
+        workspace_id=3,
+        file_entry_id=7,
+        source_relative_path=Path("reports/sections.docx"),
+        document_id=DOCUMENT_ID,
+    )
+
+    nonempty_positions = [
+        position
+        for position in document.source_positions
+        if position.start_offset < position.end_offset
+    ]
+    assert [
+        (
+            document.normalized_text[position.start_offset : position.end_offset],
+            position.section_index,
+        )
+        for position in nonempty_positions
+    ] == [("First section", 0), ("Second section", 1)]
 
 
 def test_load_document_rejects_malformed_docx(tmp_path: Path) -> None:

@@ -56,6 +56,8 @@ class DocumentPosition(BaseModel):
     element_type: Literal["paragraph", "table_cell"]
     start_offset: int = Field(ge=0)
     end_offset: int = Field(ge=0)
+    section_index: int | None = Field(default=None, ge=0)
+    heading_level: int | None = Field(default=None, ge=1)
     paragraph_index: int | None = Field(default=None, ge=0)
     table_index: int | None = Field(default=None, ge=0)
     row_index: int | None = Field(default=None, ge=0)
@@ -164,6 +166,9 @@ class Chunk(BaseModel):
     end_offset: int = Field(ge=1)
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
+    source_positions: tuple[DocumentPosition, ...] = Field(default_factory=tuple)
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
 
     @field_validator("source_relative_path")
     @classmethod
@@ -177,4 +182,18 @@ class Chunk(BaseModel):
             raise ValueError("end_offset must be greater than start_offset")
         if self.end_line < self.start_line:
             raise ValueError("end_line must not be earlier than start_line")
+        if (self.page_start is None) != (self.page_end is None):
+            raise ValueError("page_start and page_end must be provided together")
+        if (
+            self.page_start is not None
+            and self.page_end is not None
+            and self.page_end < self.page_start
+        ):
+            raise ValueError("page_end must not be earlier than page_start")
+        for position in self.source_positions:
+            if (
+                self.start_offset >= position.end_offset
+                or position.start_offset >= self.end_offset
+            ):
+                raise ValueError("source position must overlap chunk range")
         return self

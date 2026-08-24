@@ -3,12 +3,13 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .document_chunker import chunk_document
-from .document_parser import parse_document
+from .document_parser import parse_document, source_format_for_path
 from .filesystem_adapter import FileSystemAdapter
 from .models import ChunkRecord, DocumentRecord, FileEntry, Workspace
 
@@ -48,8 +49,10 @@ def index_workspace_documents(
     indexed_chunks = 0
     skipped_documents = 0
 
+    failed_file_entry: tuple[int, str] | None = None
     try:
         for file_entry in file_entries:
+            failed_file_entry = (file_entry.id, file_entry.relative_path)
             document = parse_document(
                 adapter,
                 workspace_id=workspace_id,
@@ -71,8 +74,20 @@ def index_workspace_documents(
             indexed_chunks += len(chunks)
 
         session.commit()
-    except Exception:
+    except Exception as error:
         session.rollback()
+        if failed_file_entry is not None:
+            try:
+                _record_failed_ingest(
+                    session,
+                    workspace_id=workspace_id,
+                    file_entry_id=failed_file_entry[0],
+                    source_relative_path=failed_file_entry[1],
+                    error=error,
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
         raise
 
     return DocumentIndexResult(
@@ -112,3 +127,43 @@ def _document_version_exists(
         DocumentRecord.source_version == source_version,
     )
     return session.scalar(statement) is not None
+
+
+def _record_failed_ingest(
+    session: Session,
+    *,
+    workspace_id: int,
+    file_entry_id: int,
+    source_relative_path: str,
+    error: Exception,
+) -> None:
+    """保存失败证据，但不伪造尚未生成的规范化来源数据。"""
+
+    source_format = source_format_for_path(source_relative_path)
+    error_message = str(error).strip() or type(error).__name__
+    existing = session.scalar(
+        select(DocumentRecord)
+        .where(
+            DocumentRecord.file_entry_id == file_entry_id,
+            DocumentRecord.ingest_status == "failed",
+            DocumentRecord.source_version.is_(None),
+        )
+        .order_by(DocumentRecord.document_id.asc())
+    )
+    if existing is not None:
+        existing.source_relative_path = source_relative_path
+        existing.source_format = source_format
+        existing.ingest_status = "failed"
+        existing.ingest_error = error_message
+        return
+
+    session.add(
+        DocumentRecord.for_failed_ingest(
+            document_id=str(uuid4()),
+            workspace_id=workspace_id,
+            file_entry_id=file_entry_id,
+            source_relative_path=source_relative_path,
+            source_format=source_format,
+            ingest_error=error_message,
+        )
+    )

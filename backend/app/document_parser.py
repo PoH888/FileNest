@@ -1,5 +1,6 @@
 """多格式文档加载与规范化。"""
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +35,14 @@ class DocumentLoader(Protocol):
         """从已授权文件提取统一的文档内容。"""
 
 
+DocumentSourceFormat = Literal["markdown", "text", "pdf", "docx"]
+
+
 @dataclass(frozen=True, slots=True)
 class LoadedDocumentContent:
     """loader 提取的格式内容，供统一入口组装为 Document。"""
 
-    source_format: Literal["markdown", "text", "pdf", "docx"]
+    source_format: DocumentSourceFormat
     normalized_text: str
     pages: tuple[DocumentPage, ...] = ()
     source_positions: tuple[DocumentPosition, ...] = ()
@@ -160,10 +164,45 @@ class _DocxTextBlock:
 
     text: str
     element_type: Literal["paragraph", "table_cell"]
+    section_index: int | None = None
+    heading_level: int | None = None
     paragraph_index: int | None = None
     table_index: int | None = None
     row_index: int | None = None
     cell_index: int | None = None
+
+
+_HEADING_STYLE_PATTERN = re.compile(
+    r"^heading\s*([1-9][0-9]*)$",
+    re.IGNORECASE,
+)
+
+
+def _heading_level_for_paragraph(paragraph: object) -> int | None:
+    """从 DOCX 段落样式提取 heading 层级。"""
+
+    style = getattr(paragraph, "style", None)
+    if style is None:
+        return None
+
+    for identifier in (
+        getattr(style, "style_id", None),
+        getattr(style, "name", None),
+    ):
+        if not isinstance(identifier, str):
+            continue
+        match = _HEADING_STYLE_PATTERN.fullmatch(identifier.strip())
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _paragraph_ends_section(paragraph: object) -> bool:
+    """判断段落是否携带结束当前 DOCX section 的 sectPr。"""
+
+    paragraph_element = getattr(paragraph, "_p", None)
+    paragraph_properties = getattr(paragraph_element, "pPr", None)
+    return getattr(paragraph_properties, "sectPr", None) is not None
 
 
 class DocxDocumentLoader:
@@ -206,18 +245,24 @@ class DocxDocumentLoader:
             blocks: list[_DocxTextBlock] = []
             paragraph_index = 0
             table_index = 0
+            section_index = 0
 
             for element in word_document.element.body.iterchildren():
                 element_type = element.tag.rsplit("}", 1)[-1]
                 if element_type == "p":
+                    paragraph = Paragraph(element, word_document)
                     blocks.append(
                         _DocxTextBlock(
-                            text=Paragraph(element, word_document).text,
+                            text=paragraph.text,
                             element_type="paragraph",
+                            section_index=section_index,
+                            heading_level=_heading_level_for_paragraph(paragraph),
                             paragraph_index=paragraph_index,
                         )
                     )
                     paragraph_index += 1
+                    if _paragraph_ends_section(paragraph):
+                        section_index += 1
                 elif element_type == "tbl":
                     table = Table(element, word_document)
                     for row_index, row in enumerate(table.rows):
@@ -226,6 +271,7 @@ class DocxDocumentLoader:
                                 _DocxTextBlock(
                                     text=cell.text,
                                     element_type="table_cell",
+                                    section_index=section_index,
                                     table_index=table_index,
                                     row_index=row_index,
                                     cell_index=cell_index,
@@ -260,6 +306,8 @@ class DocxDocumentLoader:
                     element_type=block.element_type,
                     start_offset=start_offset,
                     end_offset=current_offset,
+                    section_index=block.section_index,
+                    heading_level=block.heading_level,
                     paragraph_index=block.paragraph_index,
                     table_index=block.table_index,
                     row_index=block.row_index,
@@ -344,6 +392,22 @@ def parse_document(
         file_entry_id=file_entry_id,
         source_relative_path=source_relative_path,
         document_id=document_id,
+    )
+
+
+def source_format_for_path(source_relative_path: str | Path) -> DocumentSourceFormat:
+    """按统一 ingestion 入口支持的扩展名返回格式名。"""
+
+    suffix = Path(source_relative_path).suffix.casefold()
+    text_format = TextDocumentLoader._SOURCE_FORMATS.get(suffix)
+    if text_format is not None:
+        return text_format
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix == ".docx":
+        return "docx"
+    raise UnsupportedDocumentFormatError(
+        f"unsupported document format: {suffix or '<none>'}"
     )
 
 

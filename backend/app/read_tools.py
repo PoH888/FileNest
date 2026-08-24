@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     field_validator,
+    model_validator,
 )
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -166,7 +167,21 @@ class KnowledgeSearchToolItem(BaseModel):
     end_offset: int = Field(gt=0)
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
     score: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_page_range(self) -> "KnowledgeSearchToolItem":
+        if (self.page_start is None) != (self.page_end is None):
+            raise ValueError("page_start and page_end must be provided together")
+        if (
+            self.page_start is not None
+            and self.page_end is not None
+            and self.page_end < self.page_start
+        ):
+            raise ValueError("page_end must not be earlier than page_start")
+        return self
 
 
 class KnowledgeSearchData(BaseModel):
@@ -339,6 +354,8 @@ def build_knowledge_search_tool(session: Session) -> Tool:
                     end_offset=chunk.end_offset,
                     start_line=chunk.start_line,
                     end_line=chunk.end_line,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
                     score=-negative_score,
                 )
                 for negative_score, _, _, _, chunk in ranked_chunks[

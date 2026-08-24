@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -10,11 +11,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.document_chunker import chunk_document
-from backend.app.document_contracts import Document, DocumentPage
+from backend.app.document_contracts import (
+    Document,
+    DocumentPage,
+    DocumentPosition,
+)
 from backend.app.models import (
     ChunkRecord,
     ChunkEmbeddingRecord,
     DocumentRecord,
+    DocumentPageRecord,
+    DocumentPositionRecord,
     FileEntry,
     Workspace,
 )
@@ -162,13 +169,38 @@ def test_pdf_document_format_is_accepted_by_persisted_schema(
                 source_version="f" * 64,
                 source_updated_at=SOURCE_UPDATED_AT,
             )
+            chunks = chunk_document(document)
             session.add(DocumentRecord.from_contract(document))
+            session.add_all(
+                ChunkRecord.from_contract(chunk) for chunk in chunks
+            )
             session.commit()
 
             restored = session.get(DocumentRecord, str(DOCUMENT_ID))
+            restored_pages = list(
+                session.scalars(
+                    select(DocumentPageRecord)
+                    .where(DocumentPageRecord.document_id == str(DOCUMENT_ID))
+                    .order_by(DocumentPageRecord.page_number)
+                )
+            )
+            restored_chunks = list(
+                session.scalars(
+                    select(ChunkRecord)
+                    .where(ChunkRecord.document_id == str(DOCUMENT_ID))
+                    .order_by(ChunkRecord.chunk_index)
+                )
+            )
 
         assert restored is not None
         assert restored.source_format == "pdf"
+        assert [
+            (page.page_number, page.start_offset, page.end_offset)
+            for page in restored_pages
+        ] == [(1, 0, 8)]
+        assert [
+            (chunk.page_start, chunk.page_end) for chunk in restored_chunks
+        ] == [(1, 1)]
     finally:
         engine.dispose()
 
@@ -204,17 +236,83 @@ def test_docx_document_format_is_accepted_by_persisted_schema(
                 file_entry_id=file_entry.id,
                 source_relative_path=file_entry.relative_path,
                 source_format="docx",
-                normalized_text="DOCX text",
+                normalized_text="Heading\n\nBody",
+                source_positions=(
+                    DocumentPosition(
+                        element_type="paragraph",
+                        start_offset=0,
+                        end_offset=7,
+                        section_index=0,
+                        heading_level=1,
+                        paragraph_index=0,
+                    ),
+                    DocumentPosition(
+                        element_type="paragraph",
+                        start_offset=9,
+                        end_offset=13,
+                        section_index=0,
+                        paragraph_index=1,
+                    ),
+                ),
                 source_version="a" * 64,
                 source_updated_at=SOURCE_UPDATED_AT,
             )
+            chunks = chunk_document(document)
             session.add(DocumentRecord.from_contract(document))
+            session.add_all(
+                ChunkRecord.from_contract(chunk) for chunk in chunks
+            )
             session.commit()
 
             restored = session.get(DocumentRecord, str(DOCUMENT_ID))
+            restored_positions = list(
+                session.scalars(
+                    select(DocumentPositionRecord)
+                    .where(
+                        DocumentPositionRecord.document_id
+                        == str(DOCUMENT_ID)
+                    )
+                    .order_by(DocumentPositionRecord.position_index)
+                )
+            )
+            restored_chunks = list(
+                session.scalars(
+                    select(ChunkRecord)
+                    .where(ChunkRecord.document_id == str(DOCUMENT_ID))
+                    .order_by(ChunkRecord.chunk_index)
+                )
+            )
 
         assert restored is not None
         assert restored.source_format == "docx"
+        assert [
+            (
+                position.element_type,
+                position.position_index,
+                position.start_offset,
+                position.end_offset,
+                position.section_index,
+                position.heading_level,
+                position.paragraph_index,
+            )
+            for position in restored_positions
+        ] == [
+            ("paragraph", 0, 0, 7, 0, 1, 0),
+            ("paragraph", 1, 9, 13, 0, None, 1),
+        ]
+        assert len(restored_chunks) == 1
+        assert restored_chunks[0].source_positions_json is not None
+        saved_provenance = json.loads(
+            restored_chunks[0].source_positions_json
+        )
+        assert [
+            (
+                position["section_index"],
+                position["heading_level"],
+                position["paragraph_index"],
+            )
+            for position in saved_provenance
+        ] == [(0, 1, 0), (0, None, 1)]
     finally:
         engine.dispose()
 

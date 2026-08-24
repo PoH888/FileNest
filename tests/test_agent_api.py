@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.agent_api import (
     _stream_agent_run_events,
+    _source_references,
     AgentRunResponse,
     ReadOnlyAgentRunExecutor,
     get_agent_run_executor,
@@ -737,6 +738,98 @@ def test_agent_run_api_returns_knowledge_source_location(
     )
     assert state_response.json()["status"] == "completed"
     assert model_client.calls[1].messages[-1].content is not None
+
+
+def test_source_references_preserve_pdf_page_range() -> None:
+    tool_result = ToolResult.success(
+        {
+            "items": [
+                {
+                    "file_id": 7,
+                    "name": "approval.pdf",
+                    "chunk_id": "chunk-1",
+                    "document_id": "document-1",
+                    "source_relative_path": "reports/approval.pdf",
+                    "chunk_index": 0,
+                    "text": "审批说明",
+                    "start_offset": 0,
+                    "end_offset": 4,
+                    "start_line": 1,
+                    "end_line": 1,
+                    "page_start": 17,
+                    "page_end": 17,
+                    "score": 1,
+                }
+            ],
+        }
+    )
+    messages = (
+        ModelMessage(
+            role="assistant",
+            tool_calls=(
+                ModelToolCall(
+                    id="call_pdf_source",
+                    name="knowledge_search",
+                    arguments={},
+                ),
+            ),
+        ),
+        ModelMessage(
+            role="tool",
+            tool_call_id="call_pdf_source",
+            content=tool_result.model_dump_json(),
+        ),
+    )
+
+    references = _source_references(messages, workspace_id=3)
+
+    assert len(references) == 1
+    assert references[0].relative_path == "reports/approval.pdf"
+    assert (references[0].page_start, references[0].page_end) == (17, 17)
+
+
+def test_source_references_drop_incomplete_pdf_page_range() -> None:
+    tool_result = ToolResult.success(
+        {
+            "items": [
+                {
+                    "file_id": 7,
+                    "name": "approval.pdf",
+                    "chunk_id": "chunk-1",
+                    "document_id": "document-1",
+                    "source_relative_path": "reports/approval.pdf",
+                    "chunk_index": 0,
+                    "text": "审批说明",
+                    "start_offset": 0,
+                    "end_offset": 4,
+                    "start_line": 1,
+                    "end_line": 1,
+                    "page_start": 17,
+                    "page_end": None,
+                    "score": 1,
+                }
+            ],
+        }
+    )
+    messages = (
+        ModelMessage(
+            role="assistant",
+            tool_calls=(
+                ModelToolCall(
+                    id="call_invalid_pdf_source",
+                    name="knowledge_search",
+                    arguments={},
+                ),
+            ),
+        ),
+        ModelMessage(
+            role="tool",
+            tool_call_id="call_invalid_pdf_source",
+            content=tool_result.model_dump_json(),
+        ),
+    )
+
+    assert _source_references(messages, workspace_id=3) == ()
 
 
 def test_agent_run_api_refuses_knowledge_answer_without_evidence(

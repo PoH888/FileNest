@@ -2,7 +2,7 @@
 
 from uuid import uuid5
 
-from .document_contracts import Chunk, Document
+from .document_contracts import Chunk, Document, DocumentPosition
 
 
 DEFAULT_MAX_CHARS = 800
@@ -112,6 +112,12 @@ def _append_chunk(
 ) -> int:
     """从文档区间创建一个片段，并返回下一个顺序号。"""
 
+    page_start, page_end = _page_range_for_offsets(
+        document,
+        start_offset=start_offset,
+        end_offset=end_offset,
+    )
+
     chunks.append(
         Chunk(
             chunk_id=uuid5(
@@ -127,6 +133,71 @@ def _append_chunk(
             end_offset=end_offset,
             start_line=start_line,
             end_line=end_line,
+            source_positions=_source_positions_for_offsets(
+                document,
+                start_offset=start_offset,
+                end_offset=end_offset,
+            ),
+            page_start=page_start,
+            page_end=page_end,
         )
     )
     return chunk_index + 1
+
+
+def _page_range_for_offsets(
+    document: Document,
+    *,
+    start_offset: int,
+    end_offset: int,
+) -> tuple[int | None, int | None]:
+    """按文本区间计算 PDF 片段覆盖的首尾页码。"""
+
+    if document.source_format != "pdf":
+        return None, None
+
+    overlapping_pages = [
+        page.page_number
+        for page in document.pages
+        if start_offset < page.end_offset
+        and page.start_offset < end_offset
+    ]
+    if overlapping_pages:
+        return overlapping_pages[0], overlapping_pages[-1]
+
+    # PDF 页间分隔符不属于任一页正文，但仍应保留两侧页码边界。
+    first_page = next(
+        (
+            page.page_number
+            for page in document.pages
+            if page.end_offset > start_offset
+        ),
+        None,
+    )
+    last_page = next(
+        (
+            page.page_number
+            for page in reversed(document.pages)
+            if page.start_offset < end_offset
+        ),
+        None,
+    )
+    if first_page is None or last_page is None:
+        return None, None
+    return min(first_page, last_page), max(first_page, last_page)
+
+
+def _source_positions_for_offsets(
+    document: Document,
+    *,
+    start_offset: int,
+    end_offset: int,
+) -> tuple[DocumentPosition, ...]:
+    """保留与 Chunk 文本区间相交的 DOCX 结构位置。"""
+
+    return tuple(
+        position
+        for position in document.source_positions
+        if start_offset < position.end_offset
+        and position.start_offset < end_offset
+    )

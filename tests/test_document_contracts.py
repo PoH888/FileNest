@@ -4,7 +4,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from backend.app.document_contracts import Chunk, Document
+from backend.app.document_contracts import Chunk, Document, DocumentPosition
 
 
 DOCUMENT_ID = UUID("233eb1b5-4298-4ae0-8d25-19d5555d5f3f")
@@ -67,3 +67,24 @@ def test_document_rejects_unsafe_source_path() -> None:
 def test_chunk_rejects_invalid_source_position() -> None:
     with pytest.raises(ValidationError, match="greater than start_offset"):
         _chunk(end_offset=4)
+
+
+def test_document_position_rejects_paragraph_without_index() -> None:
+    with pytest.raises(ValidationError, match="paragraph position metadata"):
+        DocumentPosition(
+            element_type="paragraph",
+            start_offset=0,
+            end_offset=4,
+        )
+
+
+def test_chunk_rejects_non_overlapping_source_position() -> None:
+    position = DocumentPosition(
+        element_type="paragraph",
+        start_offset=0,
+        end_offset=2,
+        paragraph_index=0,
+    )
+
+    with pytest.raises(ValidationError, match="overlap chunk range"):
+        _chunk(source_positions=(position,))
