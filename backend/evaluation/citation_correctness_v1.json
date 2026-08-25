@@ -1,0 +1,119 @@
+{
+  "schema_version": "1.0",
+  "cases": [
+    {
+      "case_id": "release-date-supported",
+      "question": "FileNest V2 计划何时发布？",
+      "answer": "FileNest V2 计划在 2026 年 9 月发布。",
+      "sources": [
+        {
+          "source_id": "v2-roadmap",
+          "title": "FileNest V2 路线图",
+          "content": "FileNest V2 计划在 2026 年 9 月发布。"
+        }
+      ],
+      "citations": [
+        {
+          "citation_id": "cite-v2-roadmap",
+          "source_id": "v2-roadmap",
+          "relevant_to_question": true
+        }
+      ],
+      "facts": [
+        {
+          "fact_id": "fact-release-date",
+          "claim": "FileNest V2 计划在 2026 年 9 月发布。",
+          "citation_ids": ["cite-v2-roadmap"],
+          "supported_by_source": true
+        }
+      ]
+    },
+    {
+      "case_id": "irrelevant-source",
+      "question": "FileNest V2 计划何时发布？",
+      "answer": "FileNest V2 计划在 2026 年 9 月发布。",
+      "sources": [
+        {
+          "source_id": "team-budget",
+          "title": "团队预算",
+          "content": "本季度测试预算为 30000 元。"
+        }
+      ],
+      "citations": [
+        {
+          "citation_id": "cite-team-budget",
+          "source_id": "team-budget",
+          "relevant_to_question": false
+        }
+      ],
+      "facts": [
+        {
+          "fact_id": "fact-unsupported-release-date",
+          "claim": "FileNest V2 计划在 2026 年 9 月发布。",
+          "citation_ids": ["cite-team-budget"],
+          "supported_by_source": false
+        }
+      ]
+    },
+    {
+      "case_id": "unfaithful-answer",
+      "question": "本季度测试预算是多少？",
+      "answer": "本季度测试预算为 50000 元。",
+      "sources": [
+        {
+          "source_id": "quarterly-budget",
+          "title": "季度预算",
+          "content": "本季度测试预算为 30000 元。"
+        }
+      ],
+      "citations": [
+        {
+          "citation_id": "cite-quarterly-budget",
+          "source_id": "quarterly-budget",
+          "relevant_to_question": true
+        }
+      ],
+      "facts": [
+        {
+          "fact_id": "fact-wrong-budget",
+          "claim": "本季度测试预算为 50000 元。",
+          "citation_ids": ["cite-quarterly-budget"],
+          "supported_by_source": false
+        }
+      ]
+    },
+    {
+      "case_id": "uncited-fact",
+      "question": "FileNest 的写入操作有什么要求？",
+      "answer": "所有写入操作都必须经过审批。系统每周进行审计。",
+      "sources": [
+        {
+          "source_id": "write-policy",
+          "title": "写入策略",
+          "content": "所有写入操作都必须经过审批。"
+        }
+      ],
+      "citations": [
+        {
+          "citation_id": "cite-write-policy",
+          "source_id": "write-policy",
+          "relevant_to_question": true
+        }
+      ],
+      "facts": [
+        {
+          "fact_id": "fact-approval-required",
+          "claim": "所有写入操作都必须经过审批。",
+          "citation_ids": ["cite-write-policy"],
+          "supported_by_source": true
+        },
+        {
+          "fact_id": "fact-weekly-audit",
+          "claim": "系统每周进行审计。",
+          "citation_ids": [],
+          "supported_by_source": false
+        }
+      ]
+    }
+  ]
+}

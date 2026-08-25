@@ -4,11 +4,13 @@
   "evaluation_scope": {
     "embedding_source": "scripted_fake",
     "embedding_design": "one_hot_document_vectors",
+    "quality_evidence": false,
+    "purpose": "pipeline_fixture_only",
     "ranking_depth": 5,
     "top_k": [1, 3],
     "limitations": [
       "离线固定向量只验证评测管线和排序组合，不代表真实 Embedding 模型能力。",
-      "仅覆盖 3 个固定问题，不替代规模测试或生产 benchmark。"
+      "仅覆盖 5 个固定问题，不替代规模测试或生产 benchmark。"
     ]
   },
   "cases": [
@@ -16,6 +18,8 @@
       "case_id": "approval-consent",
       "question_id": "approval-before-move",
       "query": "用户同意",
+      "keyword_query": "用户同意",
+      "vector_query": "文件整理前是否必须征得用户同意？",
       "relevant_document_paths": [
         "guides/approval-flow.md"
       ],
@@ -41,6 +45,8 @@
       "case_id": "sqlite-persistence",
       "question_id": "sqlite-persistence",
       "query": "sqlite",
+      "keyword_query": "sqlite",
+      "vector_query": "工作区和文件索引使用什么持久化方式？",
       "relevant_document_paths": [
         "guides/persistence.md"
       ],
@@ -69,6 +75,8 @@
       "case_id": "approval-file",
       "question_id": "approval-before-move",
       "query": "文件",
+      "keyword_query": "文件",
+      "vector_query": "文件整理前是否必须征得用户同意？",
       "relevant_document_paths": [
         "guides/approval-flow.md"
       ],
@@ -93,25 +101,93 @@
           "notes/retrieval-baseline.txt"
         ]
       }
+    },
+    {
+      "case_id": "document-formats",
+      "question_id": "document-formats",
+      "query": "规范化",
+      "keyword_query": "规范化",
+      "vector_query": "哪些格式的文档会被规范化？",
+      "relevant_document_paths": [
+        "notes/document-tracking.md"
+      ],
+      "rankings": {
+        "keyword": [
+          "notes/document-tracking.md"
+        ],
+        "vector": [
+          "notes/document-tracking.md",
+          "guides/approval-flow.md",
+          "guides/persistence.md",
+          "notes/retrieval-baseline.txt",
+          "archive/legacy-plan.md"
+        ],
+        "hybrid": [
+          "notes/document-tracking.md",
+          "guides/approval-flow.md",
+          "guides/persistence.md",
+          "notes/retrieval-baseline.txt",
+          "archive/legacy-plan.md"
+        ]
+      }
+    },
+    {
+      "case_id": "retrieval-baseline",
+      "question_id": "retrieval-baseline",
+      "query": "固定文档集合",
+      "keyword_query": "固定文档集合",
+      "vector_query": "关键词检索基线由什么组成？",
+      "relevant_document_paths": [
+        "notes/retrieval-baseline.txt"
+      ],
+      "rankings": {
+        "keyword": [
+          "notes/retrieval-baseline.txt"
+        ],
+        "vector": [
+          "notes/retrieval-baseline.txt",
+          "guides/approval-flow.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "archive/legacy-plan.md"
+        ],
+        "hybrid": [
+          "notes/retrieval-baseline.txt",
+          "guides/approval-flow.md",
+          "guides/persistence.md",
+          "notes/document-tracking.md",
+          "archive/legacy-plan.md"
+        ]
+      }
     }
   ],
   "metrics": {
     "keyword": {
-      "case_count": 3,
+      "case_count": 5,
       "recall_at_k": [
         {
           "k": 1,
-          "value": 0.6666666666666666
+          "value": 0.8
         },
         {
           "k": 3,
-          "value": 0.6666666666666666
+          "value": 0.8
         }
       ],
-      "mrr": 0.6666666666666666
+      "precision_at_k": [
+        {
+          "k": 1,
+          "value": 0.8
+        },
+        {
+          "k": 3,
+          "value": 0.26666666666666666
+        }
+      ],
+      "mrr": 0.8
     },
     "vector": {
-      "case_count": 3,
+      "case_count": 5,
       "recall_at_k": [
         {
           "k": 1,
@@ -120,12 +196,22 @@
         {
           "k": 3,
           "value": 1.0
+        }
+      ],
+      "precision_at_k": [
+        {
+          "k": 1,
+          "value": 1.0
+        },
+        {
+          "k": 3,
+          "value": 0.3333333333333333
         }
       ],
       "mrr": 1.0
     },
     "hybrid": {
-      "case_count": 3,
+      "case_count": 5,
       "recall_at_k": [
         {
           "k": 1,
@@ -136,12 +222,39 @@
           "value": 1.0
         }
       ],
+      "precision_at_k": [
+        {
+          "k": 1,
+          "value": 1.0
+        },
+        {
+          "k": 3,
+          "value": 0.3333333333333333
+        }
+      ],
       "mrr": 1.0
+    }
+  },
+  "latency": {
+    "unit": "ms",
+    "measurement": "perf_counter around search_keyword_results",
+    "samples_per_case": 20,
+    "keyword": {
+      "sample_count": 100,
+      "mean_ms": 0.008319998742081224,
+      "min_ms": 0.0019999570213258266,
+      "max_ms": 0.06220000796020031
     }
   },
   "decision": {
     "status": "retain_minimal_experiment",
     "default_retrieval": "keyword",
+    "hybrid_default_enabled": false,
+    "hybrid_mode": "comparison_only",
+    "hybrid_adoption_gate": {
+      "requires_real_embedding_evidence": true,
+      "required_ordering": "Hybrid > Vector > Keyword"
+    },
     "retained": [
       "replaceable_embedding_client",
       "sqlite_chunk_embedding_storage",

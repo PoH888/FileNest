@@ -1,6 +1,10 @@
-"""Recall@K 与 MRR 的最小检索评测计算。"""
+"""Recall@K、Precision@K、MRR 与 latency 的检索评测计算。"""
 
+import math
 from collections.abc import Sequence
+from numbers import Real
+from time import perf_counter
+from typing import Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -44,14 +48,35 @@ class RecallAtKMetric(BaseModel):
     value: float = Field(ge=0, le=1)
 
 
+class PrecisionAtKMetric(BaseModel):
+    """一组评测案例在指定 K 下的平均 Precision。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    k: int = Field(gt=0)
+    value: float = Field(ge=0, le=1)
+
+
 class RetrievalMetricsSummary(BaseModel):
-    """一组评测案例的 Recall@K 与 MRR 汇总。"""
+    """一组评测案例的 Recall@K、Precision@K 与 MRR 汇总。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     case_count: int = Field(gt=0)
     recall_at_k: tuple[RecallAtKMetric, ...] = Field(min_length=1)
+    precision_at_k: tuple[PrecisionAtKMetric, ...] = Field(min_length=1)
     mrr: float = Field(ge=0, le=1)
+
+
+class RetrievalLatencySummary(BaseModel):
+    """一组检索调用的运行时 latency 汇总，单位为毫秒。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sample_count: int = Field(gt=0)
+    mean_ms: float = Field(ge=0)
+    min_ms: float = Field(ge=0)
+    max_ms: float = Field(ge=0)
 
 
 def recall_at_k(case: RetrievalMetricCase, k: int) -> float:
@@ -62,6 +87,16 @@ def recall_at_k(case: RetrievalMetricCase, k: int) -> float:
     relevant_paths = set(case.relevant_document_paths)
     retrieved_paths = set(case.ranked_document_paths[:k])
     return len(relevant_paths & retrieved_paths) / len(relevant_paths)
+
+
+def precision_at_k(case: RetrievalMetricCase, k: int) -> float:
+    """计算单个案例的 Precision@K，未填满的结果位按未命中计。"""
+
+    _validate_case(case)
+    k = _validate_positive_k(k)
+    relevant_paths = set(case.relevant_document_paths)
+    retrieved_paths = set(case.ranked_document_paths[:k])
+    return len(relevant_paths & retrieved_paths) / k
 
 
 def reciprocal_rank(case: RetrievalMetricCase) -> float:
@@ -92,13 +127,59 @@ def aggregate_retrieval_metrics(
         )
         for k in normalized_ks
     )
+    precision_metrics = tuple(
+        PrecisionAtKMetric(
+            k=k,
+            value=sum(precision_at_k(case, k) for case in normalized_cases)
+            / len(normalized_cases),
+        )
+        for k in normalized_ks
+    )
     mean_reciprocal_rank = sum(
         reciprocal_rank(case) for case in normalized_cases
     ) / len(normalized_cases)
     return RetrievalMetricsSummary(
         case_count=len(normalized_cases),
         recall_at_k=recall_metrics,
+        precision_at_k=precision_metrics,
         mrr=mean_reciprocal_rank,
+    )
+
+
+def measure_latency_ms(operation: Callable[[], object]) -> tuple[object, float]:
+    """执行一次检索操作并返回结果与墙钟 latency，单位为毫秒。"""
+
+    started_at = perf_counter()
+    result = operation()
+    return result, (perf_counter() - started_at) * 1000
+
+
+def summarize_latency_ms(
+    latencies_ms: Sequence[float],
+) -> RetrievalLatencySummary:
+    """校验并汇总一组运行时 latency。"""
+
+    if isinstance(latencies_ms, (str, bytes)) or not latencies_ms:
+        raise RetrievalMetricError("latencies_ms must not be empty")
+
+    normalized: list[float] = []
+    for latency in latencies_ms:
+        if (
+            isinstance(latency, bool)
+            or not isinstance(latency, Real)
+            or not math.isfinite(float(latency))
+            or latency < 0
+        ):
+            raise RetrievalMetricError(
+                "latencies_ms must contain non-negative finite numbers"
+            )
+        normalized.append(float(latency))
+
+    return RetrievalLatencySummary(
+        sample_count=len(normalized),
+        mean_ms=sum(normalized) / len(normalized),
+        min_ms=min(normalized),
+        max_ms=max(normalized),
     )
 
 

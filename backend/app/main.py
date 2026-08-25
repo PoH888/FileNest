@@ -22,6 +22,7 @@ from .document_indexer import (
 )
 from .job_runner import JobContext, JobNotFoundError, JobTaskError, SingleProcessJobRunner
 from .job_store import SqlAlchemyJobStore
+from .knowledge_api import router as knowledge_router
 from .organization_api import router as organization_router
 from .models import FileEntry, Workspace
 from .database import SessionFactory, check_database_connection, get_session
@@ -95,6 +96,7 @@ async def _lifespan(application: FastAPI):
 
 app = FastAPI(title="FileNest API", lifespan=_lifespan)
 app.include_router(agent_router)
+app.include_router(knowledge_router)
 app.include_router(organization_router)
 _MINIMAL_UI_PATH = Path(__file__).parent / "static" / "index.html"
 
@@ -109,6 +111,12 @@ class JobSubmissionResponse(BaseModel):
     """后台 Job 提交成功后的最小公开标识。"""
 
     job_id: UUID
+
+
+class KnowledgeIndexRequest(BaseModel):
+    """Knowledge 索引请求。"""
+
+    workspace_id: int
 
 
 class JobStatusResponse(BaseModel):
@@ -178,6 +186,35 @@ def _public_job_status(status: str) -> str:
     """将内部 succeeded 状态转换为 API 约定的 completed。"""
 
     return "completed" if status == "succeeded" else status
+
+
+def _submit_document_index_job(
+    session: Session,
+    workspace_id: int,
+) -> JobSubmissionResponse:
+    """校验工作区并提交可复用的文档索引 Job。"""
+
+    if get_workspace_service(session, workspace_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        )
+
+    runtime = _job_runtime_for_session(session)
+    submitted = runtime.runner.submit(
+        kind="document_index",
+        workspace_id=workspace_id,
+        idempotency_key=f"document-index:{workspace_id}:{uuid4()}",
+        task=lambda context: _run_document_index(
+            context,
+            session_factory=runtime.session_factory,
+            workspace_id=workspace_id,
+        ),
+    )
+    return JobSubmissionResponse(job_id=submitted.job_id)
 
 
 @app.get("/", include_in_schema=False)
@@ -441,27 +478,21 @@ def index_documents(
 ) -> JobSubmissionResponse:
     """创建后台文档索引 Job，并立即返回其标识。"""
 
-    if get_workspace_service(session, workspace_id) is None:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "workspace_not_found",
-                "message": "工作区不存在。",
-            },
-        )
+    return _submit_document_index_job(session, workspace_id)
 
-    runtime = _job_runtime_for_session(session)
-    submitted = runtime.runner.submit(
-        kind="document_index",
-        workspace_id=workspace_id,
-        idempotency_key=f"document-index:{workspace_id}:{uuid4()}",
-        task=lambda context: _run_document_index(
-            context,
-            session_factory=runtime.session_factory,
-            workspace_id=workspace_id,
-        ),
-    )
-    return JobSubmissionResponse(job_id=submitted.job_id)
+
+@app.post(
+    "/api/v1/knowledge/index",
+    response_model=JobSubmissionResponse,
+    status_code=202,
+)
+def index_knowledge(
+    request: KnowledgeIndexRequest,
+    session: Session = Depends(get_session),
+) -> JobSubmissionResponse:
+    """创建 Knowledge 文档索引 Job，并立即返回其标识。"""
+
+    return _submit_document_index_job(session, request.workspace_id)
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobStatusResponse)
