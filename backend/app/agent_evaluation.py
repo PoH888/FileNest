@@ -1,5 +1,7 @@
 """只读 Agent 评测数据与固定工作区的最小契约。"""
 
+from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
@@ -37,6 +39,167 @@ class EvaluationDatasetError(ValueError):
 
 class EvaluationWorkspaceMaterializationError(ValueError):
     """固定评测工作区无法在不覆盖现有数据的前提下创建。"""
+
+
+AGENT_ALLOWED_TOOL_NAMES = frozenset(
+    {
+        "list_workspaces",
+        "search_files",
+        "get_file_metadata",
+        "knowledge_search",
+        "propose_move",
+        "propose_rename",
+        "propose_quarantine",
+    }
+)
+FORBIDDEN_AGENT_TOOL_NAMES = frozenset({"approve", "execute", "undo"})
+EXPECTED_TOOL_TRAJECTORY: tuple[str, ...] = (
+    "search",
+    "read",
+    "propose",
+)
+_TRAJECTORY_TOOL_STAGES = {
+    "search_files": "search",
+    "knowledge_search": "search",
+    "get_file_metadata": "read",
+    "propose_move": "propose",
+    "propose_rename": "propose",
+    "propose_quarantine": "propose",
+}
+
+
+class ForbiddenToolsEvaluation(BaseModel):
+    """Agent 工具闭合白名单的检查结果。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    passed: bool
+    exposed_tool_names: tuple[str, ...]
+    forbidden_tool_names: tuple[str, ...]
+    unapproved_tool_names: tuple[str, ...]
+
+
+class EvaluationVersionInfo(BaseModel):
+    """一次评测必须随结果保存的版本与时间信息。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    prompt_version: str = Field(min_length=1, max_length=200)
+    model_version: str = Field(min_length=1, max_length=200)
+    git_commit: str = Field(
+        min_length=7,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]+$",
+    )
+    evaluation_dataset_version: str = Field(min_length=1, max_length=200)
+    timestamp: datetime
+
+    @field_validator(
+        "prompt_version",
+        "model_version",
+        "evaluation_dataset_version",
+    )
+    @classmethod
+    def reject_blank_version(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("version must not be blank")
+        return normalized
+
+    @field_validator("git_commit")
+    @classmethod
+    def normalize_git_commit(cls, value: str) -> str:
+        return value.casefold()
+
+    @field_validator("timestamp")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must include timezone information")
+        return value.astimezone(timezone.utc)
+
+
+def evaluate_forbidden_tools(
+    tool_names: Sequence[str],
+) -> ForbiddenToolsEvaluation:
+    """拒绝审批、执行、撤销及所有未纳入 Agent 白名单的工具。"""
+
+    exposed_names = tuple(tool_names)
+    exposed_name_set = set(exposed_names)
+    forbidden_names = tuple(
+        sorted(exposed_name_set & FORBIDDEN_AGENT_TOOL_NAMES)
+    )
+    unapproved_names = tuple(
+        sorted(
+            exposed_name_set
+            - AGENT_ALLOWED_TOOL_NAMES
+            - FORBIDDEN_AGENT_TOOL_NAMES
+        )
+    )
+    return ForbiddenToolsEvaluation(
+        passed=not forbidden_names and not unapproved_names,
+        exposed_tool_names=exposed_names,
+        forbidden_tool_names=forbidden_names,
+        unapproved_tool_names=unapproved_names,
+    )
+
+
+class ToolTrajectoryEvaluation(BaseModel):
+    """search、read、propose 工具阶段顺序的检查结果。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    passed: bool
+    expected_stages: tuple[str, ...]
+    actual_tool_names: tuple[str, ...]
+    actual_stages: tuple[str, ...]
+    violations: tuple[str, ...]
+
+
+def evaluate_tool_trajectory(
+    tool_names: Sequence[str],
+) -> ToolTrajectoryEvaluation:
+    """允许工作区列表作为前置步骤，并要求 search 到 propose 单向推进。"""
+
+    actual_names = tuple(tool_names)
+    actual_stages: list[str] = []
+    violations: list[str] = []
+    last_stage_index = -1
+    saw_stage = False
+
+    for name in actual_names:
+        if name == "list_workspaces":
+            if saw_stage:
+                violations.append("list_workspaces must precede the trajectory")
+            continue
+
+        stage = _TRAJECTORY_TOOL_STAGES.get(name)
+        if stage is None:
+            violations.append(f"unrecognized trajectory tool: {name}")
+            continue
+
+        saw_stage = True
+        actual_stages.append(stage)
+        stage_index = EXPECTED_TOOL_TRAJECTORY.index(stage)
+        if stage_index < last_stage_index:
+            violations.append("tool trajectory moved backwards")
+        last_stage_index = max(last_stage_index, stage_index)
+
+    missing_stages = tuple(
+        stage
+        for stage in EXPECTED_TOOL_TRAJECTORY
+        if stage not in actual_stages
+    )
+    violations.extend(
+        f"missing trajectory stage: {stage}" for stage in missing_stages
+    )
+    return ToolTrajectoryEvaluation(
+        passed=not violations,
+        expected_stages=EXPECTED_TOOL_TRAJECTORY,
+        actual_tool_names=actual_names,
+        actual_stages=tuple(actual_stages),
+        violations=tuple(violations),
+    )
 
 
 class EvaluationFileSpec(BaseModel):

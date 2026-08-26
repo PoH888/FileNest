@@ -1,7 +1,11 @@
 """路径安全策略的输入、成功输出与结构化错误契约。"""
 
+import fnmatch
+import logging
 import os
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict
@@ -13,6 +17,10 @@ _SENSITIVE_DIRECTORY_NAMES = frozenset(
         ".ssh",
         ".aws",
         ".gnupg",
+        ".azure",
+        ".docker",
+        ".kube",
+        ".terraform.d",
         "$recycle.bin",
         "system volume information",
     }
@@ -20,8 +28,27 @@ _SENSITIVE_DIRECTORY_NAMES = frozenset(
 _SENSITIVE_FILE_NAMES = frozenset(
     {
         ".env",
+        ".dockerconfigjson",
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "auth.json",
+        "credentials",
+        "credentials.json",
+        "credentials.tfrc.json",
+        "credentials.xml",
         "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
         "id_ed25519",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+        "id_xmss",
+        "secret.json",
+        "secrets.json",
+        "service-account.json",
+        "kubeconfig",
     }
 )
 _SENSITIVE_FILE_SUFFIXES = frozenset(
@@ -30,8 +57,103 @@ _SENSITIVE_FILE_SUFFIXES = frozenset(
         ".pem",
         ".p12",
         ".pfx",
+        ".jks",
+        ".kdb",
+        ".kdbx",
+        ".keystore",
     }
 )
+
+
+def _normalize_rule_values(
+    values: Iterable[str],
+    rule_name: str,
+) -> frozenset[str]:
+    """规范化配置项，避免大小写差异绕过敏感规则。"""
+
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{rule_name} 必须是字符串集合。")
+
+    try:
+        normalized_values = tuple(values)
+    except TypeError as error:
+        raise ValueError(f"{rule_name} 必须是字符串集合。") from error
+
+    if any(not isinstance(value, str) or not value for value in normalized_values):
+        raise ValueError(f"{rule_name} 必须只包含非空字符串。")
+
+    return frozenset(value.casefold() for value in normalized_values)
+
+
+@dataclass(frozen=True, slots=True)
+class SensitivePathRules:
+    """可注入的敏感路径规则集合。"""
+
+    directory_names: frozenset[str] = frozenset()
+    file_names: frozenset[str] = frozenset()
+    file_name_prefixes: frozenset[str] = frozenset()
+    file_suffixes: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "directory_names",
+            _normalize_rule_values(self.directory_names, "directory_names"),
+        )
+        object.__setattr__(
+            self,
+            "file_names",
+            _normalize_rule_values(self.file_names, "file_names"),
+        )
+        object.__setattr__(
+            self,
+            "file_name_prefixes",
+            _normalize_rule_values(
+                self.file_name_prefixes,
+                "file_name_prefixes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "file_suffixes",
+            _normalize_rule_values(self.file_suffixes, "file_suffixes"),
+        )
+
+
+DEFAULT_SENSITIVE_PATH_RULES = SensitivePathRules(
+    directory_names=_SENSITIVE_DIRECTORY_NAMES,
+    file_names=_SENSITIVE_FILE_NAMES,
+    file_name_prefixes=frozenset({".env."}),
+    file_suffixes=_SENSITIVE_FILE_SUFFIXES,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalIgnorePolicy:
+    """对工作区扫描结果统一生效的忽略模式。"""
+
+    patterns: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "patterns",
+            _normalize_rule_values(self.patterns, "patterns"),
+        )
+
+    def matches(self, path: Path) -> bool:
+        """按文件名或工作区相对路径匹配忽略模式。"""
+
+        normalized_path = path.as_posix().lstrip("./").casefold()
+        file_name = path.name.casefold()
+        return any(
+            fnmatch.fnmatchcase(file_name, pattern)
+            or fnmatch.fnmatchcase(normalized_path, pattern)
+            for pattern in self.patterns
+        )
+
+
+DEFAULT_GLOBAL_IGNORE_POLICY = GlobalIgnorePolicy()
 
 
 class PathPolicyErrorCode(StrEnum):
@@ -43,6 +165,40 @@ class PathPolicyErrorCode(StrEnum):
     PATH_OUTSIDE_WORKSPACE = "path_outside_workspace"
     PATH_LINK_OUTSIDE_WORKSPACE = "path_link_outside_workspace"
     SENSITIVE_PATH = "sensitive_path"
+    PATH_DENYLISTED = "path_denylisted"
+
+
+@dataclass(frozen=True, slots=True)
+class SensitivePathWriteAuditRecord:
+    """一次被拒绝的敏感路径写访问审计记录。"""
+
+    workspace_root: Path
+    requested_path: Path
+    operation: str = "write"
+    outcome: str = "denied"
+    reason: str = PathPolicyErrorCode.SENSITIVE_PATH.value
+    recorded_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc),
+    )
+
+
+def write_sensitive_path_audit(
+    record: SensitivePathWriteAuditRecord,
+) -> None:
+    """通过现有日志管道写入结构化敏感路径审计记录。"""
+
+    logging.getLogger("FileNest.security_audit").warning(
+        "敏感路径写访问被拒绝",
+        extra={
+            "audit_event": "sensitive_path_write",
+            "audit_workspace_root": str(record.workspace_root),
+            "audit_requested_path": str(record.requested_path),
+            "audit_operation": record.operation,
+            "audit_outcome": record.outcome,
+            "audit_reason": record.reason,
+            "audit_recorded_at": record.recorded_at.isoformat(),
+        },
+    )
 
 
 class PathPolicyErrorDetail(TypedDict):
@@ -58,6 +214,24 @@ class PathPolicyRequest:
 
     workspace_root: Path
     requested_path: Path
+    sensitive_path_rules: SensitivePathRules = DEFAULT_SENSITIVE_PATH_RULES
+    user_denylist: tuple[Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        """将用户提供的 denylist 固定为不可变路径集合。"""
+
+        if isinstance(self.user_denylist, (str, bytes)):
+            raise ValueError("user_denylist 必须是路径集合。")
+
+        try:
+            normalized_denylist = tuple(
+                Path(denylisted_path)
+                for denylisted_path in self.user_denylist
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("user_denylist 必须是路径集合。") from error
+
+        object.__setattr__(self, "user_denylist", normalized_denylist)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,12 +277,16 @@ def normalize_workspace_root(root_path: str | Path) -> Path:
     return _resolve_path(_normalize_path(path))
 
 
-def validate_workspace_root(root_path: str | Path) -> Path:
+def validate_workspace_root(
+    root_path: str | Path,
+    *,
+    sensitive_path_rules: SensitivePathRules = DEFAULT_SENSITIVE_PATH_RULES,
+) -> Path:
     """验证工作区根路径安全可用，并返回规范化路径。"""
 
     normalized_root = normalize_workspace_root(root_path)
 
-    if _is_sensitive_path(normalized_root):
+    if _is_sensitive_path(normalized_root, sensitive_path_rules):
         raise PathPolicyError(
             PathPolicyErrorCode.SENSITIVE_PATH,
             "请求路径属于受保护的敏感文件或目录。",
@@ -159,10 +337,21 @@ def authorize_path(request: PathPolicyRequest) -> AuthorizedPath:
             "请求路径通过链接指向授权工作区之外。",
         )
 
-    if _is_sensitive_path(resolved_path):
+    if _is_sensitive_path(resolved_path, request.sensitive_path_rules):
         raise PathPolicyError(
             PathPolicyErrorCode.SENSITIVE_PATH,
             "请求路径属于受保护的敏感文件或目录。",
+        )
+
+    if _is_user_denylisted(
+        normalized_path,
+        resolved_path,
+        workspace_root,
+        request.user_denylist,
+    ):
+        raise PathPolicyError(
+            PathPolicyErrorCode.PATH_DENYLISTED,
+            "请求路径命中用户拒绝列表。",
         )
 
     return AuthorizedPath(
@@ -206,16 +395,41 @@ def _is_within(path: Path, workspace_root: Path) -> bool:
     return True
 
 
-def _is_sensitive_path(path: Path) -> bool:
+def _is_user_denylisted(
+    normalized_path: Path,
+    resolved_path: Path,
+    workspace_root: Path,
+    user_denylist: tuple[Path, ...],
+) -> bool:
+    """检查词法路径和解析路径是否命中用户拒绝项及其子树。"""
+
+    for denylisted_path in user_denylist:
+        candidate = denylisted_path
+        if not candidate.is_absolute():
+            candidate = workspace_root / candidate
+        normalized_denylisted_path = _normalize_path(candidate)
+
+        if _is_within(normalized_path, normalized_denylisted_path):
+            return True
+        if _is_within(resolved_path, normalized_denylisted_path):
+            return True
+
+    return False
+
+
+def _is_sensitive_path(path: Path, rules: SensitivePathRules) -> bool:
     """对完整路径段和最终文件名应用统一的敏感项规则。"""
 
     normalized_parts = (part.casefold() for part in path.parts)
-    if any(part in _SENSITIVE_DIRECTORY_NAMES for part in normalized_parts):
+    if any(part in rules.directory_names for part in normalized_parts):
         return True
 
     file_name = path.name.casefold()
     return (
-        file_name in _SENSITIVE_FILE_NAMES
-        or file_name.startswith(".env.")
-        or path.suffix.casefold() in _SENSITIVE_FILE_SUFFIXES
+        file_name in rules.file_names
+        or any(
+            file_name.startswith(prefix)
+            for prefix in rules.file_name_prefixes
+        )
+        or path.suffix.casefold() in rules.file_suffixes
     )

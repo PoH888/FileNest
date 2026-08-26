@@ -1,11 +1,10 @@
-"""受 PathPolicy 约束的 V1 文件移动包装层。"""
+"""受 PathPolicy 约束的 V2 文件移动执行器。"""
 
 from enum import StrEnum
 from pathlib import Path
 
-from core.file_mover import move_file as v1_move_file
-
 from .filesystem_adapter import FileSystemAdapter
+from .v2_file_mover import move_file as v2_move_file
 
 
 class SafeFileMoveErrorCode(StrEnum):
@@ -19,7 +18,7 @@ class SafeFileMoveErrorCode(StrEnum):
 
 
 class SafeFileMoveError(RuntimeError):
-    """V1 mover 无法满足安全移动约束。"""
+    """V2 移动原语无法满足安全移动约束。"""
 
     def __init__(
         self,
@@ -31,7 +30,7 @@ class SafeFileMoveError(RuntimeError):
 
 
 class SafeFileMover:
-    """只在一个已授权工作区内调用 V1 mover。"""
+    """只在一个已授权工作区内调用 V2 专用移动原语。"""
 
     def __init__(self, adapter: FileSystemAdapter) -> None:
         self._adapter = adapter
@@ -43,7 +42,7 @@ class SafeFileMover:
     ) -> Path:
         """把普通文件移动到确定目标路径，并禁止覆盖或自动改名。"""
 
-        authorized_source = self._adapter.authorized_path(source_path)
+        authorized_source = self._adapter.authorized_write_path(source_path)
         try:
             source_metadata = self._adapter.get_file_metadata(
                 authorized_source
@@ -59,7 +58,7 @@ class SafeFileMover:
                 "待移动的源路径不是普通文件",
             )
 
-        expected_target = self._adapter.authorized_path(target_path)
+        expected_target = self._adapter.authorized_write_path(target_path)
         authorized_target_directory = expected_target.parent
         if not self._adapter.is_directory(authorized_target_directory):
             raise SafeFileMoveError(
@@ -73,11 +72,9 @@ class SafeFileMover:
                 "目标路径已经被占用",
             )
 
-        moved_path = v1_move_file(
+        moved_path = v2_move_file(
             authorized_source,
-            authorized_target_directory,
-            collision_strategy="skip",
-            target_name=expected_target.name,
+            expected_target,
         )
         if moved_path is None:
             if self._adapter.path_exists(expected_target):
@@ -87,7 +84,7 @@ class SafeFileMover:
                 )
             raise SafeFileMoveError(
                 SafeFileMoveErrorCode.MOVE_FAILED,
-                "V1 文件移动失败",
+                "V2 文件移动失败",
             )
 
         authorized_result = self._adapter.authorized_path(moved_path)
@@ -98,12 +95,12 @@ class SafeFileMover:
         except OSError as error:
             raise SafeFileMoveError(
                 SafeFileMoveErrorCode.RESULT_MISMATCH,
-                "V1 mover 返回的结果文件不可用",
+                "V2 移动器返回的结果文件不可用",
             ) from error
         if authorized_result != expected_target or result_metadata is None:
             raise SafeFileMoveError(
                 SafeFileMoveErrorCode.RESULT_MISMATCH,
-                "V1 mover 返回了非预期结果",
+                "V2 移动器返回了非预期结果",
             )
 
         return authorized_result

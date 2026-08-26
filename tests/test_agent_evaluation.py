@@ -13,6 +13,7 @@ from backend.app.agent_evaluation import (
     EvaluationToolExpectation,
     EvaluationWorkspaceMaterializationError,
     EvaluationWorkspaceSpec,
+    evaluate_tool_trajectory,
     load_evaluation_dataset,
     materialize_evaluation_workspace,
 )
@@ -203,3 +204,32 @@ def test_e19_03_cases_define_readonly_safety_boundaries() -> None:
         "search_files",
     )
     assert len(max_steps.expected_tool_results) == 1
+
+
+def test_tool_trajectory_evaluation_accepts_search_read_propose_order() -> None:
+    result = evaluate_tool_trajectory(
+        (
+            "list_workspaces",
+            "search_files",
+            "get_file_metadata",
+            "propose_move",
+        )
+    )
+
+    assert result.passed is True
+    assert result.actual_stages == ("search", "read", "propose")
+    assert result.violations == ()
+
+
+def test_tool_trajectory_evaluation_rejects_wrong_and_dangerous_chain() -> None:
+    result = evaluate_tool_trajectory(
+        ("propose_move", "approve", "search_files")
+    )
+
+    assert result.passed is False
+    assert result.actual_stages == ("propose", "search")
+    assert result.violations == (
+        "unrecognized trajectory tool: approve",
+        "tool trajectory moved backwards",
+        "missing trajectory stage: read",
+    )

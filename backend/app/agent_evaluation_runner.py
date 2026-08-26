@@ -3,9 +3,10 @@
 from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
+from collections.abc import Callable, Sequence
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -13,16 +14,24 @@ from .agent_evaluation import (
     EvaluationCase,
     EvaluationDataset,
     EvaluationToolExpectation,
+    EvaluationVersionInfo,
+    ForbiddenToolsEvaluation,
+    evaluate_forbidden_tools,
     materialize_evaluation_workspace,
 )
 from .agent_loop import AgentLoop
 from .agent_observability import SqlAlchemyAgentRunRecorder
 from .database import Base
 from .fake_model_client import FakeModelClient
-from .model_client import ModelMessage, ModelResponse, ModelToolCall
+from .model_client import (
+    ModelClient,
+    ModelMessage,
+    ModelResponse,
+    ModelToolCall,
+)
 from .services import create_workspace, scan_workspace
 from .tool_contracts import ToolResult
-from .tool_registry import build_read_tool_registry
+from .tool_registry import ToolDefinition, build_read_tool_registry
 
 
 class EvaluationRunDirectoryError(ValueError):
@@ -67,6 +76,16 @@ class EvaluationMetrics(BaseModel):
     parameter_validity_rate: float = Field(ge=0, le=1)
 
 
+class RiskConstraintEvaluation(BaseModel):
+    """固定数据集风险边界用例的汇总结果。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    passed: bool
+    checked_case_ids: tuple[str, ...]
+    failed_case_ids: tuple[str, ...]
+
+
 class EvaluationSummary(BaseModel):
     """一次完整评测返回的逐用例证据和聚合指标。"""
 
@@ -75,6 +94,9 @@ class EvaluationSummary(BaseModel):
     schema_version: str
     dataset_schema_version: str
     model_source: str
+    version_info: EvaluationVersionInfo
+    forbidden_tools: ForbiddenToolsEvaluation
+    risk_constraints: RiskConstraintEvaluation
     cases: tuple[EvaluationCaseResult, ...]
     metrics: EvaluationMetrics
     total_model_turns: int = Field(ge=0)
@@ -82,11 +104,36 @@ class EvaluationSummary(BaseModel):
     total_estimated_model_cost_usd: Decimal = Field(ge=0)
 
 
+class EvaluationHistoryError(ValueError):
+    """评测历史无法读取、追加或比较。"""
+
+
+class EvaluationComparison(BaseModel):
+    """两个 Git commit 的评测能力差异。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    commit_a: str
+    commit_b: str
+    task_success_rate_delta: float
+    tool_selection_rate_delta: float
+    parameter_validity_rate_delta: float
+    risk_constraints_a_passed: bool
+    risk_constraints_b_passed: bool
+    forbidden_tools_a_passed: bool
+    forbidden_tools_b_passed: bool
+    regressions: tuple[str, ...]
+
+
 def run_evaluation_dataset(
     dataset: EvaluationDataset,
     run_root: Path,
+    *,
+    model_client_factory: Callable[[], ModelClient] | None = None,
+    model_source: str = "scripted_fake",
+    version_info: EvaluationVersionInfo,
 ) -> EvaluationSummary:
-    """在全新隔离目录中运行数据集并返回确定性评分。"""
+    """在全新隔离目录中运行数据集并返回评分。"""
 
     if run_root.exists() or run_root.is_symlink():
         raise EvaluationRunDirectoryError("评测运行目录必须尚不存在")
@@ -108,17 +155,28 @@ def run_evaluation_dataset(
                 str(workspace_root),
             )
             scan_workspace(session, workspace.id)
+            forbidden_tools = evaluate_forbidden_tools(
+                build_read_tool_registry(session).names
+            )
             case_results = tuple(
-                _run_case(case, session)
+                _run_case(
+                    case,
+                    session,
+                    model_client_factory=model_client_factory,
+                )
                 for case in dataset.cases
             )
+            risk_constraints = _evaluate_risk_constraints(case_results)
     finally:
         engine.dispose()
 
     summary = EvaluationSummary(
         schema_version="1.0",
         dataset_schema_version=dataset.schema_version,
-        model_source="scripted_fake",
+        model_source=model_source,
+        version_info=version_info,
+        forbidden_tools=forbidden_tools,
+        risk_constraints=risk_constraints,
         cases=case_results,
         metrics=_aggregate_metrics(case_results),
         total_model_turns=sum(case.model_turns for case in case_results),
@@ -140,10 +198,17 @@ def run_evaluation_dataset(
 def _run_case(
     case: EvaluationCase,
     session: Session,
+    *,
+    model_client_factory: Callable[[], ModelClient] | None,
 ) -> EvaluationCaseResult:
-    model_client = FakeModelClient(_model_responses(case))
+    model_client = (
+        model_client_factory()
+        if model_client_factory is not None
+        else FakeModelClient(_model_responses(case))
+    )
+    measured_model_client = _MeasuredModelClient(model_client)
     loop = AgentLoop(
-        model_client=model_client,
+        model_client=measured_model_client,
         tool_registry=build_read_tool_registry(session),
         recorder=SqlAlchemyAgentRunRecorder(session),
     )
@@ -194,8 +259,53 @@ def _run_case(
         parameter_call_total=parameter_total,
         model_turns=run_result.model_turns,
         run_latency_ms=run_latency_ms,
-        estimated_model_cost_usd=Decimal("0"),
+        estimated_model_cost_usd=measured_model_client.cost_usd,
     )
+
+
+def _evaluate_risk_constraints(
+    case_results: tuple[EvaluationCaseResult, ...],
+) -> RiskConstraintEvaluation:
+    """检查非法参数、越权请求和步骤上限用例是否保持安全结果。"""
+
+    risk_categories = {"invalid_arguments", "unauthorized", "max_steps"}
+    checked_case_ids = tuple(
+        case.case_id
+        for case in case_results
+        if case.category in risk_categories
+    )
+    failed_case_ids = tuple(
+        case.case_id
+        for case in case_results
+        if case.category in risk_categories and not case.task_success
+    )
+    return RiskConstraintEvaluation(
+        passed=not failed_case_ids,
+        checked_case_ids=checked_case_ids,
+        failed_case_ids=failed_case_ids,
+    )
+
+
+class _MeasuredModelClient:
+    """保留真实模型客户端的费用指标而不改变 Agent Loop 契约。"""
+
+    def __init__(self, delegate: ModelClient) -> None:
+        self._delegate = delegate
+        self.cost_usd = Decimal("0")
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ModelMessage],
+        tools: Sequence[ToolDefinition],
+    ) -> ModelResponse:
+        response = self._delegate.complete(messages=messages, tools=tools)
+        if (
+            response.metrics is not None
+            and response.metrics.estimated_cost_usd is not None
+        ):
+            self.cost_usd += response.metrics.estimated_cost_usd
+        return response
 
 
 def save_evaluation_summary(
@@ -207,6 +317,139 @@ def save_evaluation_summary(
     with result_path.open("x", encoding="utf-8", newline="\n") as result_file:
         result_file.write(summary.model_dump_json(indent=2))
         result_file.write("\n")
+
+
+def append_evaluation_history(
+    summary: EvaluationSummary,
+    history_path: Path,
+) -> None:
+    """以一行一个摘要的追加方式保存跨运行评测历史。"""
+
+    if history_path.is_symlink():
+        raise EvaluationHistoryError("拒绝向符号链接追加评测历史")
+    if not history_path.parent.is_dir():
+        raise EvaluationHistoryError("评测历史文件的父目录不存在")
+
+    try:
+        with history_path.open(
+            "a",
+            encoding="utf-8",
+            newline="\n",
+        ) as history_file:
+            history_file.write(summary.model_dump_json())
+            history_file.write("\n")
+    except OSError as error:
+        raise EvaluationHistoryError("无法追加评测历史") from error
+
+
+def load_evaluation_history(
+    history_path: Path,
+) -> tuple[EvaluationSummary, ...]:
+    """严格读取每行一个评测摘要的历史文件。"""
+
+    try:
+        history_text = history_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise EvaluationHistoryError("无法读取评测历史") from error
+
+    records: list[EvaluationSummary] = []
+    for line_number, line in enumerate(history_text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(EvaluationSummary.model_validate_json(line))
+        except ValidationError as error:
+            raise EvaluationHistoryError(
+                f"评测历史第 {line_number} 行格式无效"
+            ) from error
+    return tuple(records)
+
+
+def compare_evaluation_commits(
+    history_path: Path,
+    commit_a: str,
+    commit_b: str,
+) -> EvaluationComparison:
+    """比较同一评测配置下两个 commit 的最新历史记录。"""
+
+    normalized_a = commit_a.casefold()
+    normalized_b = commit_b.casefold()
+    if normalized_a == normalized_b:
+        raise EvaluationHistoryError("比较需要两个不同的 Git commit")
+
+    records = load_evaluation_history(history_path)
+    record_a = _latest_commit_record(records, normalized_a)
+    record_b = _latest_commit_record(records, normalized_b)
+    for field_name in (
+        "prompt_version",
+        "model_version",
+        "evaluation_dataset_version",
+    ):
+        value_a = getattr(record_a.version_info, field_name)
+        value_b = getattr(record_b.version_info, field_name)
+        if value_a != value_b:
+            raise EvaluationHistoryError(
+                "两个 commit 的评测版本信息不一致，不能直接比较"
+            )
+
+    regressions: list[str] = []
+    task_success_rate_delta = (
+        record_b.metrics.task_success_rate
+        - record_a.metrics.task_success_rate
+    )
+    tool_selection_rate_delta = (
+        record_b.metrics.tool_selection_rate
+        - record_a.metrics.tool_selection_rate
+    )
+    parameter_validity_rate_delta = (
+        record_b.metrics.parameter_validity_rate
+        - record_a.metrics.parameter_validity_rate
+    )
+    if task_success_rate_delta < 0:
+        regressions.append("task_success_rate")
+    if tool_selection_rate_delta < 0:
+        regressions.append("tool_selection_rate")
+    if parameter_validity_rate_delta < 0:
+        regressions.append("parameter_validity_rate")
+    if (
+        record_a.risk_constraints.passed
+        and not record_b.risk_constraints.passed
+    ):
+        regressions.append("risk_constraints")
+    if record_a.forbidden_tools.passed and not record_b.forbidden_tools.passed:
+        regressions.append("forbidden_tools")
+
+    return EvaluationComparison(
+        commit_a=normalized_a,
+        commit_b=normalized_b,
+        task_success_rate_delta=task_success_rate_delta,
+        tool_selection_rate_delta=tool_selection_rate_delta,
+        parameter_validity_rate_delta=parameter_validity_rate_delta,
+        risk_constraints_a_passed=record_a.risk_constraints.passed,
+        risk_constraints_b_passed=record_b.risk_constraints.passed,
+        forbidden_tools_a_passed=record_a.forbidden_tools.passed,
+        forbidden_tools_b_passed=record_b.forbidden_tools.passed,
+        regressions=tuple(regressions),
+    )
+
+
+def _latest_commit_record(
+    records: tuple[EvaluationSummary, ...],
+    commit: str,
+) -> EvaluationSummary:
+    matching_records = tuple(
+        record
+        for record in records
+        if record.version_info.git_commit == commit
+    )
+    if not matching_records:
+        raise EvaluationHistoryError(
+            f"评测历史中不存在 Git commit: {commit}"
+        )
+    return max(
+        matching_records,
+        key=lambda record: record.version_info.timestamp,
+    )
 
 
 def _model_responses(case: EvaluationCase) -> tuple[ModelResponse, ...]:

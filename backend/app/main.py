@@ -20,6 +20,7 @@ from .document_indexer import (
     DocumentIndexWorkspaceNotFoundError,
     index_workspace_documents,
 )
+from .evaluation_api import router as evaluation_router
 from .job_runner import JobContext, JobNotFoundError, JobTaskError, SingleProcessJobRunner
 from .job_store import SqlAlchemyJobStore
 from .knowledge_api import router as knowledge_router
@@ -96,6 +97,7 @@ async def _lifespan(application: FastAPI):
 
 app = FastAPI(title="FileNest API", lifespan=_lifespan)
 app.include_router(agent_router)
+app.include_router(evaluation_router)
 app.include_router(knowledge_router)
 app.include_router(organization_router)
 _MINIMAL_UI_PATH = Path(__file__).parent / "static" / "index.html"

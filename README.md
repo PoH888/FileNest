@@ -23,6 +23,14 @@ The V2 backend currently provides:
 
 The main V2 safety chain is deliberately explicit. Approval changes workflow state but does not write files. Execution reloads the approved checkpoint and revalidates authorization, the plan, and file preconditions. Undo relies on recorded execution history and current file metadata rather than unconditionally overwriting a path.
 
+## V2 Agent / V2 API Security Boundary
+
+This Human-in-the-loop security boundary applies only to the V2 Agent and V2
+API paths described above. The V1 Windows desktop path starts at `main.py`,
+and its legacy direct-write `core/file_mover.py` is outside this boundary.
+The V2 API image does not package that V1 mover. This README therefore makes
+no repository-wide security guarantee.
+
 ## Existing desktop demo media
 
 These clips show the legacy Windows desktop application. They are not evidence that the V2 backend has integrated the legacy file monitor.
@@ -88,7 +96,9 @@ The CI-equivalent test commands additionally require `pytest` and `httpx`:
 
 ## Usage
 
-### Desktop application
+### V1 legacy desktop application
+
+The V1 Windows desktop application starts at `main.py`:
 
 ```powershell
 & .\.venv\Scripts\python.exe .\main.py
@@ -96,6 +106,7 @@ The CI-equivalent test commands additionally require `pytest` and `httpx`:
 
 ### V2 API locally
 
+The V2 startup entrypoint is the ASGI application `backend.app.main:app`.
 Run the migration from the `backend` directory, then start the existing FastAPI
 app from the repository root:
 

@@ -12,7 +12,7 @@ from backend.app.quarantine import (
     QuarantineErrorCode,
     QuarantineManager,
 )
-from core.file_mover import move_file as real_v1_move_file
+from backend.app.v2_file_mover import move_file as real_v2_move_file
 
 
 PLAN_ID = UUID("2d053752-d3c4-45cb-b696-bd043e78ed92")
@@ -54,11 +54,11 @@ def test_quarantine_moves_file_to_deterministic_isolated_path(
 ) -> None:
     workspace_root, source_path = _workspace(tmp_path)
     quarantine_root = tmp_path / "application-quarantine"
-    wrapped_v1_mover = Mock(wraps=real_v1_move_file)
+    wrapped_v2_mover = Mock(wraps=real_v2_move_file)
     monkeypatch.setattr(
         quarantine_module,
-        "v1_move_file",
-        wrapped_v1_mover,
+        "v2_move_file",
+        wrapped_v2_mover,
     )
 
     result = _quarantine(_manager(workspace_root, quarantine_root))
@@ -74,11 +74,9 @@ def test_quarantine_moves_file_to_deterministic_isolated_path(
     assert result.quarantine_path == expected_target
     assert expected_target.read_bytes() == b"content to quarantine"
     assert not source_path.exists()
-    wrapped_v1_mover.assert_called_once_with(
+    wrapped_v2_mover.assert_called_once_with(
         source_path.resolve(),
-        expected_target.parent,
-        collision_strategy="skip",
-        target_name="report.pdf",
+        expected_target,
     )
 
 
@@ -111,7 +109,7 @@ def test_quarantine_rejects_overlapping_roots(
         (Path(".ssh/id.txt"), PathPolicyErrorCode.SENSITIVE_PATH),
     ],
 )
-def test_rejected_source_never_creates_quarantine_or_calls_v1(
+def test_rejected_source_never_creates_quarantine_or_calls_v2_mover(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_path: Path,
@@ -124,8 +122,8 @@ def test_rejected_source_never_creates_quarantine_or_calls_v1(
         encoding="utf-8",
     )
     quarantine_root = tmp_path / "application-quarantine"
-    v1_mover = Mock()
-    monkeypatch.setattr(quarantine_module, "v1_move_file", v1_mover)
+    v2_mover = Mock()
+    monkeypatch.setattr(quarantine_module, "v2_move_file", v2_mover)
 
     with pytest.raises(PathPolicyError) as error:
         _quarantine(
@@ -135,7 +133,7 @@ def test_rejected_source_never_creates_quarantine_or_calls_v1(
 
     assert error.value.code is expected_code
     assert not quarantine_root.exists()
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
 
 
 def test_missing_source_does_not_create_quarantine(
@@ -144,8 +142,8 @@ def test_missing_source_does_not_create_quarantine(
 ) -> None:
     workspace_root, _ = _workspace(tmp_path)
     quarantine_root = tmp_path / "application-quarantine"
-    v1_mover = Mock()
-    monkeypatch.setattr(quarantine_module, "v1_move_file", v1_mover)
+    v2_mover = Mock()
+    monkeypatch.setattr(quarantine_module, "v2_move_file", v2_mover)
 
     with pytest.raises(QuarantineError) as error:
         _quarantine(
@@ -155,7 +153,7 @@ def test_missing_source_does_not_create_quarantine(
 
     assert error.value.code is QuarantineErrorCode.SOURCE_UNAVAILABLE
     assert not quarantine_root.exists()
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
 
 
 def test_existing_quarantine_target_is_never_overwritten(
@@ -173,8 +171,8 @@ def test_existing_quarantine_target_is_never_overwritten(
     )
     existing_target.parent.mkdir(parents=True)
     existing_target.write_bytes(b"existing quarantined content")
-    v1_mover = Mock()
-    monkeypatch.setattr(quarantine_module, "v1_move_file", v1_mover)
+    v2_mover = Mock()
+    monkeypatch.setattr(quarantine_module, "v2_move_file", v2_mover)
 
     with pytest.raises(QuarantineError) as error:
         _quarantine(_manager(workspace_root, quarantine_root))
@@ -182,7 +180,7 @@ def test_existing_quarantine_target_is_never_overwritten(
     assert error.value.code is QuarantineErrorCode.TARGET_CONFLICT
     assert source_path.read_bytes() == b"content to quarantine"
     assert existing_target.read_bytes() == b"existing quarantined content"
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
 
 
 def test_conflict_created_during_quarantine_is_not_overwritten(
@@ -205,7 +203,7 @@ def test_conflict_created_during_quarantine_is_not_overwritten(
 
     monkeypatch.setattr(
         quarantine_module,
-        "v1_move_file",
+        "v2_move_file",
         create_competing_target,
     )
 
@@ -217,7 +215,7 @@ def test_conflict_created_during_quarantine_is_not_overwritten(
     assert expected_target.read_bytes() == b"competing content"
 
 
-def test_v1_failure_becomes_stable_quarantine_error(
+def test_v2_failure_becomes_stable_quarantine_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,7 +223,7 @@ def test_v1_failure_becomes_stable_quarantine_error(
     quarantine_root = tmp_path / "application-quarantine"
     monkeypatch.setattr(
         quarantine_module,
-        "v1_move_file",
+        "v2_move_file",
         Mock(return_value=None),
     )
 

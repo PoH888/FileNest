@@ -5,12 +5,17 @@ import pytest
 
 import backend.app.safe_file_mover as safe_file_mover_module
 from backend.app.filesystem_adapter import FileSystemAdapter
-from backend.app.path_policy import PathPolicyError, PathPolicyErrorCode
+from backend.app.path_policy import (
+    PathPolicyError,
+    PathPolicyErrorCode,
+    SensitivePathWriteAuditRecord,
+)
 from backend.app.safe_file_mover import (
     SafeFileMoveError,
     SafeFileMoveErrorCode,
     SafeFileMover,
 )
+from backend.app.v2_file_mover import move_file as real_v2_move_file
 from core.file_mover import move_file as real_v1_move_file
 
 
@@ -29,11 +34,11 @@ def test_safe_file_mover_authorizes_paths_and_uses_non_overwrite_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace_root, source_path, target_directory = _workspace(tmp_path)
-    wrapped_v1_mover = Mock(wraps=real_v1_move_file)
+    wrapped_v2_mover = Mock(wraps=real_v2_move_file)
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
-        wrapped_v1_mover,
+        "v2_move_file",
+        wrapped_v2_mover,
     )
 
     mover = SafeFileMover(FileSystemAdapter(workspace_root))
@@ -46,11 +51,9 @@ def test_safe_file_mover_authorizes_paths_and_uses_non_overwrite_strategy(
     assert result == expected_target
     assert result.read_bytes() == b"safe move content"
     assert not source_path.exists()
-    wrapped_v1_mover.assert_called_once_with(
+    wrapped_v2_mover.assert_called_once_with(
         source_path.resolve(),
-        target_directory.resolve(),
-        collision_strategy="skip",
-        target_name="report.pdf",
+        (target_directory / "report.pdf").resolve(),
     )
 
 
@@ -79,7 +82,7 @@ def test_safe_file_mover_authorizes_paths_and_uses_non_overwrite_strategy(
         ),
     ],
 )
-def test_rejected_path_never_reaches_v1_mover(
+def test_rejected_path_never_reaches_v2_mover(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_path: Path,
@@ -92,11 +95,11 @@ def test_rejected_path_never_reaches_v1_mover(
         "sensitive",
         encoding="utf-8",
     )
-    v1_mover = Mock()
+    v2_mover = Mock()
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
-        v1_mover,
+        "v2_move_file",
+        v2_mover,
     )
 
     mover = SafeFileMover(FileSystemAdapter(workspace_root))
@@ -104,7 +107,35 @@ def test_rejected_path_never_reaches_v1_mover(
         mover.move(source_path, target_path)
 
     assert error.value.code is expected_code
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
+
+
+def test_sensitive_write_rejection_is_audited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root, _, _ = _workspace(tmp_path)
+    records: list[SensitivePathWriteAuditRecord] = []
+    v2_mover = Mock()
+    monkeypatch.setattr(safe_file_mover_module, "v2_move_file", v2_mover)
+    mover = SafeFileMover(
+        FileSystemAdapter(
+            workspace_root,
+            sensitive_path_audit_writer=records.append,
+        )
+    )
+
+    with pytest.raises(PathPolicyError) as error:
+        mover.move(
+            Path("inbox/report.pdf"),
+            Path(".git/report.pdf"),
+        )
+
+    assert error.value.code is PathPolicyErrorCode.SENSITIVE_PATH
+    assert len(records) == 1
+    assert records[0].requested_path == Path(".git/report.pdf")
+    assert records[0].operation == "write"
+    v2_mover.assert_not_called()
 
 
 def test_missing_target_directory_is_not_created(
@@ -113,11 +144,11 @@ def test_missing_target_directory_is_not_created(
 ) -> None:
     workspace_root, source_path, _ = _workspace(tmp_path)
     missing_directory = workspace_root / "missing"
-    v1_mover = Mock()
+    v2_mover = Mock()
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
-        v1_mover,
+        "v2_move_file",
+        v2_mover,
     )
 
     mover = SafeFileMover(FileSystemAdapter(workspace_root))
@@ -133,7 +164,7 @@ def test_missing_target_directory_is_not_created(
     )
     assert source_path.exists()
     assert not missing_directory.exists()
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
 
 
 def test_existing_target_is_never_overwritten(
@@ -143,11 +174,11 @@ def test_existing_target_is_never_overwritten(
     workspace_root, source_path, target_directory = _workspace(tmp_path)
     existing_target = target_directory / source_path.name
     existing_target.write_bytes(b"existing content")
-    v1_mover = Mock()
+    v2_mover = Mock()
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
-        v1_mover,
+        "v2_move_file",
+        v2_mover,
     )
 
     mover = SafeFileMover(FileSystemAdapter(workspace_root))
@@ -160,19 +191,19 @@ def test_existing_target_is_never_overwritten(
     assert error.value.code is SafeFileMoveErrorCode.TARGET_CONFLICT
     assert source_path.read_bytes() == b"safe move content"
     assert existing_target.read_bytes() == b"existing content"
-    v1_mover.assert_not_called()
+    v2_mover.assert_not_called()
 
 
-def test_v1_failure_becomes_stable_safe_move_error(
+def test_v2_failure_becomes_stable_safe_move_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace_root, source_path, _ = _workspace(tmp_path)
-    v1_mover = Mock(return_value=None)
+    v2_mover = Mock(return_value=None)
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
-        v1_mover,
+        "v2_move_file",
+        v2_mover,
     )
 
     mover = SafeFileMover(FileSystemAdapter(workspace_root))
@@ -231,7 +262,7 @@ def test_conflict_created_during_move_is_reported_without_overwrite(
 
     monkeypatch.setattr(
         safe_file_mover_module,
-        "v1_move_file",
+        "v2_move_file",
         create_competing_target,
     )
 

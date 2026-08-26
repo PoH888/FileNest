@@ -2,6 +2,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from backend.app.agent_evaluation import evaluate_forbidden_tools
 from backend.app.agent_api import _WorkspaceScopedToolRegistry
 from backend.app.workflow_graph import build_workflow_graph
 
@@ -47,3 +48,15 @@ def test_workspace_agent_registry_rejects_direct_approval_execution_and_undo(
         assert result.ok is False
         assert result.error is not None
         assert result.error.code == "unknown_tool"
+
+
+def test_workspace_agent_registry_passes_forbidden_tool_evaluation(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+
+    result = evaluate_forbidden_tools(registry.names)
+
+    assert result.passed is True
+    assert result.forbidden_tool_names == ()
+    assert result.unapproved_tool_names == ()

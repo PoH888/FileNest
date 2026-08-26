@@ -6,9 +6,8 @@ import os
 from pathlib import Path
 from uuid import UUID
 
-from core.file_mover import move_file as v1_move_file
-
 from .filesystem_adapter import FileSystemAdapter
+from .v2_file_mover import move_file as v2_move_file
 
 
 _QUARANTINE_ROOT_ENV = "FILENEST_QUARANTINE_ROOT"
@@ -126,7 +125,7 @@ class QuarantineManager:
                 "隔离路径所需的业务标识无效",
             )
 
-        authorized_source = self._workspace_adapter.authorized_path(
+        authorized_source = self._workspace_adapter.authorized_write_path(
             source_path
         )
         try:
@@ -150,7 +149,7 @@ class QuarantineManager:
             source_file_id=source_file_id,
             file_name=authorized_source.name,
         )
-        expected_target = self._quarantine_adapter.authorized_path(
+        expected_target = self._quarantine_adapter.authorized_write_path(
             quarantine_relative_path
         )
         if self._quarantine_adapter.path_exists(expected_target):
@@ -162,10 +161,10 @@ class QuarantineManager:
         target_directory = expected_target.parent
         try:
             target_directory.mkdir(parents=True, exist_ok=True)
-            target_directory = self._quarantine_adapter.authorized_path(
+            target_directory = self._quarantine_adapter.authorized_write_path(
                 quarantine_relative_path.parent
             )
-            expected_target = self._quarantine_adapter.authorized_path(
+            expected_target = self._quarantine_adapter.authorized_write_path(
                 quarantine_relative_path
             )
         except OSError as error:
@@ -183,11 +182,9 @@ class QuarantineManager:
                 "隔离目标在移动前被占用",
             )
 
-        moved_path = v1_move_file(
+        moved_path = v2_move_file(
             authorized_source,
-            target_directory,
-            collision_strategy="skip",
-            target_name=expected_target.name,
+            expected_target,
         )
         if moved_path is None:
             if self._quarantine_adapter.path_exists(expected_target):
@@ -197,7 +194,7 @@ class QuarantineManager:
                 )
             raise QuarantineError(
                 QuarantineErrorCode.MOVE_FAILED,
-                "V1 文件移动失败",
+                "V2 文件移动失败",
             )
 
         authorized_result = self._quarantine_adapter.authorized_path(
@@ -230,7 +227,7 @@ class QuarantineManager:
     ) -> Path:
         """将隔离文件安全恢复到原工作区路径，禁止覆盖现有文件。"""
 
-        authorized_source = self._quarantine_adapter.authorized_path(
+        authorized_source = self._quarantine_adapter.authorized_write_path(
             quarantine_path
         )
         try:
@@ -248,7 +245,7 @@ class QuarantineManager:
                 "待恢复的隔离路径不是普通文件",
             )
 
-        expected_target = self._workspace_adapter.authorized_path(
+        expected_target = self._workspace_adapter.authorized_write_path(
             original_path
         )
         target_directory = expected_target.parent
@@ -269,11 +266,9 @@ class QuarantineManager:
                 "原文件目录当前不可用",
             ) from error
 
-        moved_path = v1_move_file(
+        moved_path = v2_move_file(
             authorized_source,
-            target_directory,
-            collision_strategy="skip",
-            target_name=expected_target.name,
+            expected_target,
         )
         if moved_path is None:
             if self._workspace_adapter.path_exists(expected_target):

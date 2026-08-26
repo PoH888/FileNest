@@ -12,7 +12,9 @@ RUN python -m pip install --no-cache-dir -r ./requirements.txt
 COPY backend/alembic.ini ./backend/alembic.ini
 COPY backend/alembic ./backend/alembic
 COPY backend/app ./backend/app
-COPY core ./core
+# V2 only packages the shared scan/match helpers; the V1 direct-write mover
+# stays in the desktop distribution and is not part of the API image.
+COPY core/__init__.py core/config_manager.py core/folder_scanner.py core/matcher.py core/utils.py ./core/
 
 RUN mkdir -p /app/data
 

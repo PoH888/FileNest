@@ -7,6 +7,7 @@ import pytest
 
 from backend.app.path_policy import (
     AuthorizedPath,
+    SensitivePathRules,
     PathPolicyError,
     PathPolicyErrorCode,
     PathPolicyRequest,
@@ -63,6 +64,7 @@ def test_path_policy_contracts_are_immutable() -> None:
             "path_link_outside_workspace",
         ),
         (PathPolicyErrorCode.SENSITIVE_PATH, "sensitive_path"),
+        (PathPolicyErrorCode.PATH_DENYLISTED, "path_denylisted"),
     ],
 )
 def test_path_policy_error_codes_are_stable(
@@ -240,6 +242,10 @@ def test_authorize_path_rejects_junction_to_outside_workspace(
         ".SSH",
         ".aws",
         ".gnupg",
+        ".Azure",
+        ".Docker",
+        ".Kube",
+        ".Terraform.d",
         "$RECYCLE.BIN",
         "System Volume Information",
     ],
@@ -271,12 +277,35 @@ def test_authorize_path_rejects_sensitive_directory(
     [
         ".env",
         ".env.production",
+        ".dockerconfigjson",
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "auth.json",
+        "credentials",
+        "credentials.json",
+        "credentials.tfrc.json",
+        "credentials.xml",
         "ID_RSA",
+        "id_dsa",
+        "id_ecdsa",
         "id_ed25519",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+        "id_xmss",
         "private.key",
+        "secret.json",
+        "secrets.json",
+        "service-account.json",
+        "kubeconfig",
         "certificate.PEM",
         "certificate.p12",
         "certificate.pfx",
+        "truststore.jks",
+        "truststore.kdb",
+        "truststore.kdbx",
+        "truststore.keystore",
     ],
 )
 def test_authorize_path_rejects_sensitive_file(
@@ -318,3 +347,69 @@ def test_authorize_path_allows_non_sensitive_similar_names(
     )
 
     assert result.path == workspace_root / safe_path
+
+
+def test_authorize_path_applies_user_denylist_to_a_subtree(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    denylist = (Path("documents") / "private",)
+
+    allowed = authorize_path(
+        PathPolicyRequest(
+            workspace_root=workspace_root,
+            requested_path=Path("documents") / "public" / "report.txt",
+            user_denylist=denylist,
+        )
+    )
+
+    assert allowed.path == workspace_root / "documents" / "public" / "report.txt"
+
+    with pytest.raises(PathPolicyError) as captured_error:
+        authorize_path(
+            PathPolicyRequest(
+                workspace_root=workspace_root,
+                requested_path=Path("documents") / "private" / "secret.txt",
+                user_denylist=denylist,
+            )
+        )
+
+    assert captured_error.value.code is PathPolicyErrorCode.PATH_DENYLISTED
+
+
+def test_authorize_path_uses_configured_sensitive_path_rules(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    rules = SensitivePathRules(
+        directory_names={"private-data"},
+        file_names={"service-token"},
+        file_name_prefixes={"secret-"},
+        file_suffixes={".vault"},
+    )
+
+    result = authorize_path(
+        PathPolicyRequest(
+            workspace_root=workspace_root,
+            requested_path=Path("documents") / "report.txt",
+            sensitive_path_rules=rules,
+        )
+    )
+
+    assert result.path == workspace_root / "documents" / "report.txt"
+
+    with pytest.raises(PathPolicyError) as captured_error:
+        authorize_path(
+            PathPolicyRequest(
+                workspace_root=workspace_root,
+                requested_path=Path("documents") / "private-data" / "report.txt",
+                sensitive_path_rules=rules,
+            )
+        )
+
+    assert captured_error.value.code is PathPolicyErrorCode.SENSITIVE_PATH
+
+
+def test_sensitive_path_rules_reject_invalid_values() -> None:
+    with pytest.raises(ValueError, match="file_names"):
+        SensitivePathRules(file_names="service-token")  # type: ignore[arg-type]

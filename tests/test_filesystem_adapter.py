@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from backend.app.filesystem_adapter import FileSystemAdapter
-from backend.app.path_policy import PathPolicyError, PathPolicyErrorCode
+from backend.app.path_policy import (
+    PathPolicyError,
+    PathPolicyErrorCode,
+    SensitivePathWriteAuditRecord,
+)
 
 
 def test_read_text_reads_file_inside_workspace(tmp_path: Path) -> None:
@@ -55,6 +59,49 @@ def test_read_text_rejects_sensitive_file(tmp_path: Path) -> None:
         adapter.read_text(Path(".env"))
 
     assert captured_error.value.code is PathPolicyErrorCode.SENSITIVE_PATH
+
+
+def test_authorized_write_path_records_sensitive_rejection(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    records: list[SensitivePathWriteAuditRecord] = []
+    adapter = FileSystemAdapter(
+        workspace_root,
+        sensitive_path_audit_writer=records.append,
+    )
+
+    allowed_path = adapter.authorized_write_path(Path("documents/report.txt"))
+
+    assert allowed_path == workspace_root / "documents/report.txt"
+    assert records == []
+
+    with pytest.raises(PathPolicyError) as captured_error:
+        adapter.authorized_write_path(Path(".env"))
+
+    assert captured_error.value.code is PathPolicyErrorCode.SENSITIVE_PATH
+    assert len(records) == 1
+    assert records[0].requested_path == Path(".env")
+    assert records[0].operation == "write"
+    assert records[0].outcome == "denied"
+    assert records[0].reason == "sensitive_path"
+
+
+def test_read_text_rejects_user_denylisted_path(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    denied_file = workspace_root / "private" / "secret.txt"
+    denied_file.parent.mkdir(parents=True)
+    denied_file.write_text("secret", encoding="utf-8")
+    adapter = FileSystemAdapter(
+        workspace_root,
+        user_denylist=(Path("private"),),
+    )
+
+    with pytest.raises(PathPolicyError) as captured_error:
+        adapter.read_text(Path("private") / "secret.txt")
+
+    assert captured_error.value.code is PathPolicyErrorCode.PATH_DENYLISTED
 
 
 def test_list_directory_rejects_path_outside_workspace(tmp_path: Path) -> None:

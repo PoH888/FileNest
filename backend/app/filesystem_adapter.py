@@ -1,5 +1,7 @@
 """所有正式文件读取都必须经过的安全文件系统边界。"""
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -8,8 +10,11 @@ from stat import S_ISREG
 from .path_policy import (
     AuthorizedPath,
     PathPolicyError,
+    PathPolicyErrorCode,
     PathPolicyRequest,
+    SensitivePathWriteAuditRecord,
     authorize_path,
+    write_sensitive_path_audit,
 )
 
 
@@ -24,8 +29,18 @@ class FileMetadata:
 class FileSystemAdapter:
     """只允许在一个授权工作区内读取文件和列出目录。"""
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        user_denylist: tuple[Path, ...] = (),
+        sensitive_path_audit_writer: Callable[
+            [SensitivePathWriteAuditRecord], None
+        ] = write_sensitive_path_audit,
+    ) -> None:
         self._workspace_root = workspace_root
+        self._user_denylist = user_denylist
+        self._sensitive_path_audit_writer = sensitive_path_audit_writer
 
     @property
     def workspace_root(self) -> Path:
@@ -37,6 +52,19 @@ class FileSystemAdapter:
         """返回经过完整策略校验的规范路径。"""
 
         return self._authorize(requested_path).path
+
+    def authorized_write_path(self, requested_path: Path) -> Path:
+        """授权写操作路径，并审计被拒绝的敏感路径。"""
+
+        try:
+            return self._authorize(requested_path).path
+        except PathPolicyError as error:
+            if error.code is PathPolicyErrorCode.SENSITIVE_PATH:
+                self._record_sensitive_path_write(
+                    requested_path,
+                    error.code.value,
+                )
+            raise
 
     def is_directory(self, requested_path: Path) -> bool:
         """授权路径后判断它是否为目录。"""
@@ -93,7 +121,12 @@ class FileSystemAdapter:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def list_directory(self, requested_path: Path = Path(".")) -> list[str]:
+    def list_directory(
+        self,
+        requested_path: Path = Path("."),
+        *,
+        on_ignored: Callable[[Path, PathPolicyError], None] | None = None,
+    ) -> list[str]:
         """列出目录中经过 Path Policy 授权的直接子项名称。"""
 
         authorized_directory = self._authorize(requested_path)
@@ -105,9 +138,12 @@ class FileSystemAdapter:
                     PathPolicyRequest(
                         workspace_root=authorized_directory.workspace_root,
                         requested_path=child_path,
+                        user_denylist=self._user_denylist,
                     )
                 )
-            except PathPolicyError:
+            except PathPolicyError as error:
+                if on_ignored is not None:
+                    on_ignored(child_path, error)
                 continue
 
             visible_names.append(child_path.name)
@@ -121,5 +157,26 @@ class FileSystemAdapter:
             PathPolicyRequest(
                 workspace_root=self._workspace_root,
                 requested_path=requested_path,
+                user_denylist=self._user_denylist,
             )
         )
+
+    def _record_sensitive_path_write(
+        self,
+        requested_path: Path,
+        reason: str,
+    ) -> None:
+        """记录审计失败不应改变原有拒绝结果。"""
+
+        try:
+            self._sensitive_path_audit_writer(
+                SensitivePathWriteAuditRecord(
+                    workspace_root=self._workspace_root,
+                    requested_path=requested_path,
+                    reason=reason,
+                )
+            )
+        except Exception:
+            logging.getLogger("FileNest.security_audit").exception(
+                "敏感路径写审计记录失败"
+            )
