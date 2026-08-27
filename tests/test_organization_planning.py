@@ -124,6 +124,7 @@ def test_create_waiting_workflow_persists_safe_plan_without_disk_mutation(
         assert approval.status == "WAITING_APPROVAL"
         assert plan_record.workflow_id == str(WORKFLOW_ID)
         assert plan_record.workspace_id == workspace_id
+        assert plan_record.agent_run_id is None
         assert plan_record.status == "WAITING_APPROVAL"
         assert len(plan_record.items) == 1
         assert plan_record.items[0].source_file_id == file_id

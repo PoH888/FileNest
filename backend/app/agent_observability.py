@@ -38,6 +38,7 @@ _SAFE_RUN_ERROR_CODES = frozenset(
         "model_server_error",
         "model_request_rejected",
         "model_provider_error",
+        "agent_result_persistence_error",
         "worker_interrupted",
     }
 )
@@ -99,6 +100,17 @@ class AgentRunRecorder(Protocol):
         error_code: str | None,
     ) -> None:
         """记录 Agent Run 终态。"""
+
+        ...
+
+    def record_result(
+        self,
+        *,
+        agent_run_id: int,
+        final_answer: str | None,
+        sources_json: str | None,
+    ) -> None:
+        """保存已经过响应模型校验的用户可见结果。"""
 
         ...
 
@@ -174,6 +186,8 @@ class SqlAlchemyAgentRunRecorder:
                 status="pending",
                 finished_at=None,
                 error_code=None,
+                final_answer=None,
+                sources_json=None,
             )
         )
         if result.rowcount != 1:
@@ -261,6 +275,33 @@ class SqlAlchemyAgentRunRecorder:
         agent_run.finished_at = self._now()
         agent_run.model_turns = model_turns
         agent_run.error_code = error_code
+        self._commit()
+
+    def record_result(
+        self,
+        *,
+        agent_run_id: int,
+        final_answer: str | None,
+        sources_json: str | None,
+    ) -> None:
+        """独立提交用户可见结果，不保存隐藏推理或原始工具载荷。"""
+
+        if sources_json is not None:
+            try:
+                TypeAdapter(list[dict[str, object]]).validate_json(
+                    sources_json
+                )
+            except (TypeError, ValueError, ValidationError) as error:
+                raise AgentObservabilityError(
+                    "Agent 运行的引用结果不可持久化"
+                ) from error
+
+        agent_run = get_agent_run_by_id(self._session, agent_run_id)
+        if agent_run is None:
+            raise AgentObservabilityError("Agent 运行记录不存在")
+
+        agent_run.final_answer = final_answer
+        agent_run.sources_json = sources_json
         self._commit()
 
     def checkpoint_run(

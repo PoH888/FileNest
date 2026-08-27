@@ -558,6 +558,8 @@ def execute_safe_operation_plan(
     )
     _commit_completion(session, "无法保存批量执行汇总状态")
     session.refresh(execution)
+    # CAS 使用 bulk UPDATE 且不同步 ORM 缓存，结果必须重新读取真实明细。
+    session.expire_all()
     persisted_items = find_operation_execution_items(session, execution_id)
     return _build_execution_result(
         execution,
@@ -1061,6 +1063,8 @@ def _restore_operation_execution(
     _commit_completion(session, f"无法保存{action}汇总状态")
 
     session.refresh(execution)
+    # CAS 使用 bulk UPDATE 且不同步 ORM 缓存，撤销结果必须重新读取明细。
+    session.expire_all()
     return _build_execution_result(
         execution,
         workflow_id=workflow_id,

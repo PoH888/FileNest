@@ -702,6 +702,8 @@ def test_agent_runs_store_resume_context_without_tool_payload_columns(
             "finished_at",
             "model_turns",
             "error_code",
+            "final_answer",
+            "sources_json",
         }
         assert tool_call_columns == {
             "id",

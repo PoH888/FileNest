@@ -13,6 +13,7 @@ def _registry(tmp_path: Path) -> _WorkspaceScopedToolRegistry:
         7,
         build_workflow_graph(),
         tmp_path / "quarantine",
+        agent_run_id=1,
     )
 
 

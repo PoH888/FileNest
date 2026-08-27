@@ -196,7 +196,7 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
     agent_client: tuple[TestClient, sessionmaker[Session]],
 ) -> None:
     client, session_factory = agent_client
-    workspace_id, _ = _seed_workspace(session_factory, name="只读请求")
+    workspace_id, file_id = _seed_workspace(session_factory, name="只读请求")
     model_client = FakeModelClient(
         [
             _tool_call_response(
@@ -225,7 +225,20 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
     assert response.status_code == 202
     run_id = response.json()["run_id"]
     state_response = _wait_for_agent_run_completion(client, run_id)
-    assert state_response.json()["status"] == "completed"
+    state_payload = state_response.json()
+    assert state_payload["run_id"] == run_id
+    assert state_payload["status"] == "completed"
+    assert state_payload["model_turns"] == 2
+    assert state_payload["error_code"] is None
+    assert state_payload["final_answer"] == "找到季度报告。"
+    assert state_payload["proposals"] == []
+    assert state_payload["error"] is None
+    assert len(state_payload["sources"]) == 1
+    assert state_payload["sources"][0]["workspace_id"] == workspace_id
+    assert state_payload["sources"][0]["file_id"] == file_id
+    assert state_payload["sources"][0]["relative_path"] == (
+        "reports/quarterly.txt"
+    )
     assert model_client.calls[0].messages[-1].content == "查找季度报告"
     system_prompt = model_client.calls[0].messages[0].content
     assert system_prompt is not None
@@ -295,6 +308,9 @@ def test_agent_run_api_returns_before_background_executor_finishes(
         state_response = client.get(f"/api/v1/agent-runs/{run_id}")
         assert state_response.status_code == 200
         assert state_response.json()["status"] == "running"
+        assert state_response.json()["final_answer"] is None
+        assert state_response.json()["sources"] == []
+        assert state_response.json()["proposals"] == []
     finally:
         release.set()
 
@@ -343,6 +359,11 @@ def test_agent_run_api_records_background_failure(
     )
     assert state_response.json()["status"] == "failed"
     assert state_response.json()["error_code"] == "model_provider_error"
+    assert state_response.json()["error"] == {
+        "code": "model_provider_error",
+        "retryable": None,
+        "attempts": None,
+    }
     events_response = client.get(
         f"/api/v1/agent-runs/{response.json()['run_id']}/events"
     )
@@ -924,7 +945,8 @@ def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
     )
 
     assert response.status_code == 202
-    _wait_for_agent_run_completion(client, response.json()["run_id"])
+    run_id = response.json()["run_id"]
+    _wait_for_agent_run_completion(client, run_id)
     proposal_message = model_client.calls[2].messages[-1]
     proposal_result = ToolResult.model_validate_json(proposal_message.content)
     assert proposal_result.ok is True
@@ -933,6 +955,7 @@ def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
     with session_factory() as session:
         plan = session.get(OperationPlanRecord, plan_id)
         assert plan is not None
+        workflow_id = plan.workflow_id
         assert plan.status == "WAITING_APPROVAL"
         assert plan.workspace_id == workspace_id
         assert plan.items[0].source_file_id == file_id
@@ -942,6 +965,114 @@ def test_agent_run_api_turns_natural_language_into_waiting_move_proposal(
     assert source_path.exists()
     assert source_path.read_bytes() == original_contents
     assert not (target_directory / source_path.name).exists()
+    result = client.get(f"/api/v1/agent-runs/{run_id}")
+    assert result.status_code == 200
+    assert result.json()["proposals"] == [
+        {
+            "workflow_id": workflow_id,
+            "plan_id": plan_id,
+            "operation_type": "move",
+            "approval_status": "WAITING_APPROVAL",
+        }
+    ]
+
+
+def test_agent_run_api_returns_all_proposals_for_one_run(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_root = tmp_path / "multiple-proposals-workspace"
+    workspace_id, file_id, source_path = _seed_disk_workspace(
+        session_factory,
+        workspace_root,
+        name="多个提案工作区",
+        relative_path="downloads/calculus-course.pdf",
+        contents=b"course pdf",
+    )
+    (workspace_root / "subjects").mkdir(parents=True)
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_search_multiple_proposals",
+                name="search_files",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "keyword": "课程 PDF",
+                },
+            ),
+            _tool_call_response(
+                call_id="call_propose_move_multiple",
+                name="propose_move",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "source_file_id": file_id,
+                    "destination": "subjects",
+                },
+            ),
+            _tool_call_response(
+                call_id="call_propose_rename_multiple",
+                name="propose_rename",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "source_file_id": file_id,
+                    "new_name": "calculus-course-renamed.pdf",
+                },
+            ),
+            _final_response("已生成两个待审批提案。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "提出课程文件的移动和重命名方案",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    _wait_for_agent_run_completion(client, run_id)
+    result = client.get(f"/api/v1/agent-runs/{run_id}")
+    assert result.status_code == 200
+    proposals = result.json()["proposals"]
+    assert len(proposals) == 2
+    assert [proposal["operation_type"] for proposal in proposals] == [
+        "move",
+        "rename",
+    ]
+    assert all(
+        proposal["approval_status"] == "WAITING_APPROVAL"
+        for proposal in proposals
+    )
+    for proposal in proposals:
+        workflow_response = client.get(
+            f"/api/v1/workflows/{proposal['workflow_id']}"
+        )
+        assert workflow_response.status_code == 200
+        workflow_payload = workflow_response.json()
+        assert workflow_payload["operation_plan"]["plan_id"] == proposal[
+            "plan_id"
+        ]
+        assert workflow_payload["operation_plan"]["operations"]
+    with session_factory() as session:
+        plans = list(
+            session.scalars(
+                select(OperationPlanRecord)
+                .where(OperationPlanRecord.agent_run_id == run_id)
+                .order_by(OperationPlanRecord.created_at)
+            )
+        )
+        assert len(plans) == 2
+        assert {proposal["plan_id"] for proposal in proposals} == {
+            plan.plan_id for plan in plans
+        }
+        assert all(plan.agent_run_id == run_id for plan in plans)
+    assert source_path.exists()
 
 
 def test_agent_run_api_does_not_create_move_proposal_without_search_results(
@@ -1256,6 +1387,10 @@ def test_agent_run_recovery_fetches_state_and_resumes_after_last_event_id(
         "status": "completed",
         "model_turns": 2,
         "error_code": None,
+        "final_answer": None,
+        "sources": [],
+        "proposals": [],
+        "error": None,
     }
     blocks = [block for block in event_response.text.split("\n\n") if block]
     event_lines = [block.splitlines() for block in blocks]
@@ -1347,4 +1482,8 @@ def test_agent_run_stream_disconnect_does_not_lose_background_run(
         "status": "completed",
         "model_turns": 1,
         "error_code": None,
+        "final_answer": None,
+        "sources": [],
+        "proposals": [],
+        "error": None,
     }

@@ -38,3 +38,66 @@ jobs:
 
       - name: Run mypy
         run: python -m mypy -p backend.app
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build container
+        run: docker compose build
+
+      - name: Start container
+        run: docker compose up -d
+
+      - name: Poll container health
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id="$(docker compose ps -q api)"
+          if [[ -z "${container_id}" ]]; then
+            docker compose ps
+            exit 1
+          fi
+
+          for attempt in {1..30}; do
+            state="$(docker inspect --format '{{.State.Status}}' "${container_id}")"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "${container_id}")"
+            echo "health attempt ${attempt}/30: state=${state}, health=${health}"
+
+            case "${health}" in
+              healthy)
+                exit 0
+                ;;
+              unhealthy)
+                docker compose ps
+                docker compose logs api
+                exit 1
+                ;;
+            esac
+
+            if [[ "${state}" == "exited" || "${state}" == "dead" ]]; then
+              docker compose ps
+              docker compose logs api
+              exit 1
+            fi
+            sleep 5
+          done
+
+          docker compose ps
+          docker compose logs api
+          exit 1
+
+      - name: Run API smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error http://127.0.0.1:8000/api/v1/health)"
+          echo "${response}"
+          grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"${response}"
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down

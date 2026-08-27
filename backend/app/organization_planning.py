@@ -119,6 +119,7 @@ def build_operation_plan_record(
     plan: OperationPlan,
     *,
     workflow_id: UUID,
+    agent_run_id: int | None = None,
     parent_plan_id: UUID | None = None,
 ) -> OperationPlanRecord:
     """将已验证的计划契约转换为可在业务库中保存的完整记录。"""
@@ -127,6 +128,7 @@ def build_operation_plan_record(
         plan_id=str(plan.plan_id),
         schema_version=plan.schema_version,
         workspace_id=plan.workspace_id,
+        agent_run_id=agent_run_id,
         workflow_id=str(workflow_id),
         operation_type=plan.operations[0].operation_type,
         metadata_json=json.dumps(
@@ -309,6 +311,7 @@ def create_waiting_approval_workflow(
     now: datetime | None = None,
     workflow_id_factory: UuidFactory = uuid4,
     plan_id_factory: UuidFactory = uuid4,
+    agent_run_id: int | None = None,
 ) -> CreatedApprovalWorkflow:
     """安全构造计划，并在 checkpoint 成功后提交待审批业务状态。"""
 
@@ -324,6 +327,7 @@ def create_waiting_approval_workflow(
         graph,
         plan,
         workflow_id_factory=workflow_id_factory,
+        agent_run_id=agent_run_id,
     )
 
 
@@ -333,6 +337,7 @@ def create_waiting_approval_workflow_for_plan(
     plan: OperationPlan,
     *,
     workflow_id_factory: UuidFactory = uuid4,
+    agent_run_id: int | None = None,
 ) -> CreatedApprovalWorkflow:
     """把已完成业务校验的计划安全提交为待审批工作流。"""
 
@@ -354,6 +359,7 @@ def create_waiting_approval_workflow_for_plan(
     plan_record = build_operation_plan_record(
         plan,
         workflow_id=workflow_id,
+        agent_run_id=agent_run_id,
     )
 
     try:

@@ -10,8 +10,10 @@ from backend.app.events import (
     AgentToolCallStatusChangedEvent,
     ApprovalStatusChangedEvent,
     WorkflowStatusChangedEvent,
+    build_agent_run_event_stream,
     encode_sse_event,
 )
+from backend.app.models import AgentRun
 
 
 OCCURRED_AT = datetime(2026, 8, 31, 20, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -86,3 +88,29 @@ def test_business_event_rejects_timestamp_without_timezone() -> None:
             run_id=1,
             status="running",
         )
+
+
+def test_agent_terminal_sse_only_notifies_result_readiness() -> None:
+    started_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 8, 31, 12, 1, tzinfo=timezone.utc)
+    agent_run = AgentRun(
+        id=7,
+        status="completed",
+        started_at=started_at,
+        finished_at=finished_at,
+        model_turns=2,
+        final_answer="答案不应进入 SSE",
+        sources_json="[]",
+    )
+
+    events = build_agent_run_event_stream(agent_run, [])
+
+    assert [event.data.kind for event in events] == [
+        "agent_run.status_changed",
+        "agent.started",
+        "agent_run.status_changed",
+    ]
+    terminal_payload = events[-1].data.model_dump()
+    assert terminal_payload["status"] == "completed"
+    assert "final_answer" not in terminal_payload
+    assert "sources" not in terminal_payload

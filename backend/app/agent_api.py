@@ -4,11 +4,13 @@ from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
+import json
 import os
 from pathlib import Path
 from threading import Event, Lock
 from time import sleep
 from typing import Protocol
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,6 +19,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -32,13 +35,14 @@ from .agent_loop import (
 )
 from .agent_observability import (
     AgentObservabilityError,
+    RecordedRunStatus,
     SqlAlchemyAgentRunRecorder,
 )
 from .database import get_session
 from .events import build_agent_run_event_stream
 from .model_client import ModelClient, ModelMessage
 from .model_settings import ModelSettings
-from .models import AgentToolCall
+from .models import AgentToolCall, OperationPlanRecord
 from .openai_compatible_model_client import (
     OpenAICompatibleModelClient,
     UnsupportedModelProviderError,
@@ -85,13 +89,13 @@ class AgentRunRequest(BaseModel):
 
 
 class AgentRunResponseError(BaseModel):
-    """可以安全交给界面显示或判断的模型请求错误。"""
+    """可以安全交给界面显示或判断的运行错误。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    code: str
-    retryable: bool
-    attempts: int = Field(ge=1)
+    code: str = Field(min_length=1)
+    retryable: bool | None = None
+    attempts: int | None = Field(default=None, ge=1)
 
 
 class AgentSourceReference(BaseModel):
@@ -144,6 +148,17 @@ class AgentSourceReference(BaseModel):
         return self
 
 
+class AgentRunProposalResponse(BaseModel):
+    """一次 Agent Run 产生的、等待外部审批的操作提案摘要。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_id: UUID
+    plan_id: UUID
+    operation_type: str = Field(min_length=1)
+    approval_status: str = Field(min_length=1)
+
+
 class AgentRunResponse(BaseModel):
     """一次同步 Agent Run 的最小公开结果。"""
 
@@ -154,6 +169,7 @@ class AgentRunResponse(BaseModel):
     final_answer: str | None = None
     error: AgentRunResponseError | None = None
     sources: tuple[AgentSourceReference, ...] = ()
+    proposals: tuple[AgentRunProposalResponse, ...] = ()
 
 
 class AgentRunAcceptedResponse(BaseModel):
@@ -175,6 +191,15 @@ class AgentRunStateResponse(BaseModel):
     error_code: str | None = None
 
 
+class AgentRunResultResponse(AgentRunStateResponse):
+    """GET 返回的稳定 Agent Run 状态与终态结果合同。"""
+
+    final_answer: str | None = None
+    sources: tuple[AgentSourceReference, ...] = ()
+    proposals: tuple[AgentRunProposalResponse, ...] = ()
+    error: AgentRunResponseError | None = None
+
+
 class AgentRunExecutor(Protocol):
     """供 API 注入真实或确定性 Agent 执行器。"""
 
@@ -191,6 +216,10 @@ class AgentRunExecutor(Protocol):
 
 class _ModelConfigurationUnavailableError(RuntimeError):
     """把配置校验失败收敛为不含密钥和原始输入的内部错误。"""
+
+
+class _AgentResultPersistenceError(RuntimeError):
+    """区分模型执行失败与公开结果持久化失败。"""
 
 
 def _resolve_quarantine_root() -> Path:
@@ -258,18 +287,28 @@ class _WorkspaceScopedToolRegistry(ToolRegistry):
         workspace_id: int,
         graph: CompiledStateGraph,
         quarantine_root: Path,
+        agent_run_id: int | None = None,
     ) -> None:
         super().__init__(
             [
                 build_search_files_tool(session),
                 build_get_file_metadata_tool(session),
                 build_knowledge_search_tool(session),
-                build_propose_move_tool(session, graph),
-                build_propose_rename_tool(session, graph),
+                build_propose_move_tool(
+                    session,
+                    graph,
+                    agent_run_id=agent_run_id,
+                ),
+                build_propose_rename_tool(
+                    session,
+                    graph,
+                    agent_run_id=agent_run_id,
+                ),
                 build_propose_quarantine_tool(
                     session,
                     graph,
                     quarantine_root=quarantine_root,
+                    agent_run_id=agent_run_id,
                 ),
             ]
         )
@@ -310,6 +349,11 @@ class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
         super().__init__(session)
         self.run_id = run_id
         self._run_started = False
+        self._pending_finish: tuple[
+            RecordedRunStatus,
+            int,
+            str | None,
+        ] | None = None
 
     run_id: int | None = None
 
@@ -321,9 +365,43 @@ class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
         self._run_started = True
         return self.run_id
 
+    def finish_run(
+        self,
+        *,
+        agent_run_id: int,
+        status: RecordedRunStatus,
+        model_turns: int,
+        error_code: str | None,
+    ) -> None:
+        """暂存终态，避免公开结果写入前被轮询观察到。"""
+
+        self._pending_finish = (status, model_turns, error_code)
+
+    def finalize_result(self, result: AgentRunResponse) -> None:
+        """先写结果字段，再提交 Agent Run 终态。"""
+
+        if self.run_id is None or self._pending_finish is None:
+            raise AgentObservabilityError("Agent 运行终态未准备完成")
+
+        _record_agent_run_result(
+            self._session,
+            run_id=self.run_id,
+            result=result,
+        )
+        status, model_turns, error_code = self._pending_finish
+        SqlAlchemyAgentRunRecorder.finish_run(
+            self,
+            agent_run_id=self.run_id,
+            status=status,
+            model_turns=model_turns,
+            error_code=error_code,
+        )
+
 
 class ReadOnlyAgentRunExecutor:
     """使用真实模型客户端和工作区受限只读工具执行请求。"""
+
+    _persists_result_in_run = True
 
     def __init__(
         self,
@@ -368,6 +446,7 @@ class ReadOnlyAgentRunExecutor:
                 workspace_id,
                 request_text,
             )
+        agent_run_id = recorder.start_run()
         with _open_agent_workflow_graph(session) as graph:
             loop = AgentLoop(
                 model_client=self._model_client_factory(),
@@ -376,6 +455,7 @@ class ReadOnlyAgentRunExecutor:
                     workspace_id,
                     graph,
                     self._quarantine_root,
+                    agent_run_id,
                 ),
                 recorder=recorder,
             )
@@ -385,9 +465,6 @@ class ReadOnlyAgentRunExecutor:
                 initial_tool_sequence_no=initial_tool_sequence_no,
                 cancel_event=cancel_event,
             )
-        if recorder.run_id is None:
-            raise AgentObservabilityError("Agent 运行记录不存在")
-
         response_error = (
             AgentRunResponseError(
                 code=result.error.code,
@@ -403,13 +480,20 @@ class ReadOnlyAgentRunExecutor:
             if result.status == "completed" and not sources
             else result.final_answer
         )
-        return AgentRunResponse(
+        response = AgentRunResponse(
             run_id=recorder.run_id,
             status=result.status,
             final_answer=final_answer,
             error=response_error,
             sources=sources,
         )
+        try:
+            recorder.finalize_result(response)
+        except Exception as error:
+            raise _AgentResultPersistenceError(
+                "Agent 运行结果持久化失败"
+            ) from error
+        return response
 
 
 def _build_model_client() -> ModelClient:
@@ -501,6 +585,49 @@ def _source_references(
     return tuple(references)
 
 
+def _load_persisted_sources(
+    sources_json: str | None,
+) -> tuple[AgentSourceReference, ...]:
+    if sources_json is None:
+        return ()
+    try:
+        return TypeAdapter(
+            tuple[AgentSourceReference, ...]
+        ).validate_json(sources_json)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise AgentObservabilityError(
+            "Agent 运行的持久化引用不可读取"
+        ) from error
+
+
+def _load_persisted_proposals(
+    session: Session,
+    run_id: int,
+) -> tuple[AgentRunProposalResponse, ...]:
+    plans = session.scalars(
+        select(OperationPlanRecord)
+        .where(OperationPlanRecord.agent_run_id == run_id)
+        .order_by(
+            OperationPlanRecord.created_at,
+            OperationPlanRecord.plan_id,
+        )
+    )
+    try:
+        return tuple(
+            AgentRunProposalResponse(
+                workflow_id=UUID(plan.workflow_id),
+                plan_id=UUID(plan.plan_id),
+                operation_type=plan.operation_type,
+                approval_status=plan.status,
+            )
+            for plan in plans
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise AgentObservabilityError(
+            "Agent 运行的持久化提案不可读取"
+        ) from error
+
+
 _default_executor = ReadOnlyAgentRunExecutor()
 _agent_run_background_pool = ThreadPoolExecutor(
     max_workers=4,
@@ -554,6 +681,8 @@ def _remove_agent_run_resumed(session: Session, run_id: int) -> None:
 def _mark_background_agent_run_failed(
     session: Session,
     run_id: int,
+    *,
+    error_code: str = "model_provider_error",
 ) -> None:
     try:
         agent_run = get_agent_run_by_id(session, run_id)
@@ -562,10 +691,32 @@ def _mark_background_agent_run_failed(
             agent_run_id=run_id,
             status="failed",
             model_turns=model_turns,
-            error_code="model_provider_error",
+            error_code=error_code,
         )
     except (AgentObservabilityError, ValueError):
         return
+
+
+def _record_agent_run_result(
+    session: Session,
+    *,
+    run_id: int,
+    result: AgentRunResponse,
+) -> None:
+    validated_result = AgentRunResponse.model_validate(result)
+    if validated_result.run_id != run_id:
+        raise AgentObservabilityError("Agent 运行结果与当前记录不匹配")
+
+    sources_json = json.dumps(
+        [source.model_dump(mode="json") for source in validated_result.sources],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    SqlAlchemyAgentRunRecorder(session).record_result(
+        agent_run_id=run_id,
+        final_answer=validated_result.final_answer,
+        sources_json=sources_json,
+    )
 
 
 def _run_agent_run_in_background(
@@ -583,15 +734,39 @@ def _run_agent_run_in_background(
                 SqlAlchemyAgentRunRecorder(worker_session).start_existing_run(
                     run_id
                 )
-                executor.run(
+                result = executor.run(
                     worker_session,
                     workspace_id=workspace_id,
                     request_text=request_text,
                     run_id=run_id,
                     cancel_event=cancel_event,
                 )
+            except _AgentResultPersistenceError:
+                _mark_background_agent_run_failed(
+                    worker_session,
+                    run_id,
+                    error_code="agent_result_persistence_error",
+                )
             except Exception:
                 _mark_background_agent_run_failed(worker_session, run_id)
+            else:
+                try:
+                    if not getattr(
+                        executor,
+                        "_persists_result_in_run",
+                        False,
+                    ):
+                        _record_agent_run_result(
+                            worker_session,
+                            run_id=run_id,
+                            result=result,
+                        )
+                except Exception:
+                    _mark_background_agent_run_failed(
+                        worker_session,
+                        run_id,
+                        error_code="agent_result_persistence_error",
+                    )
     finally:
         _remove_agent_run_cancel_event(run_id)
 
@@ -866,12 +1041,12 @@ def cancel_agent_run(
     )
 
 
-@router.get("/agent-runs/{run_id}", response_model=AgentRunStateResponse)
+@router.get("/agent-runs/{run_id}", response_model=AgentRunResultResponse)
 def get_agent_run_state(
     run_id: int,
     session: Session = Depends(get_session),
-) -> AgentRunStateResponse:
-    """读取 Agent Run 的持久化当前状态，不介入任务执行。"""
+) -> AgentRunResultResponse:
+    """读取 Agent Run 的状态和当前可用结果，不介入任务执行。"""
 
     agent_run = get_agent_run_by_id(session, run_id)
     if agent_run is None:
@@ -883,11 +1058,40 @@ def get_agent_run_state(
             },
         )
 
-    return AgentRunStateResponse(
+    final_answer: str | None
+    sources: tuple[AgentSourceReference, ...]
+    proposals: tuple[AgentRunProposalResponse, ...]
+    if agent_run.status in AGENT_RUN_ACTIVE_STATUSES:
+        final_answer = None
+        sources = ()
+        proposals = ()
+    else:
+        try:
+            sources = _load_persisted_sources(agent_run.sources_json)
+            proposals = _load_persisted_proposals(session, run_id)
+        except AgentObservabilityError as error:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "agent_run_result_invalid",
+                    "message": "Agent 运行结果不可读取。",
+                },
+            ) from error
+        final_answer = agent_run.final_answer
+
+    return AgentRunResultResponse(
         run_id=agent_run.id,
         status=agent_run.status,
         model_turns=agent_run.model_turns,
         error_code=agent_run.error_code,
+        final_answer=final_answer,
+        sources=sources,
+        proposals=proposals,
+        error=(
+            AgentRunResponseError(code=agent_run.error_code)
+            if agent_run.error_code is not None
+            else None
+        ),
     )
 
 

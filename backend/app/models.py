@@ -834,6 +834,12 @@ class AgentRun(Base):
         server_default="0",
     )
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sources_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_plans: Mapped[list["OperationPlanRecord"]] = relationship(
+        back_populates="agent_run",
+        order_by="OperationPlanRecord.created_at",
+    )
 
 
 class AgentToolCall(Base):
@@ -921,6 +927,11 @@ class OperationPlanRecord(Base):
         nullable=False,
         index=True,
     )
+    agent_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id"),
+        nullable=True,
+        index=True,
+    )
     workflow_id: Mapped[str] = mapped_column(
         String(36),
         nullable=False,
@@ -958,6 +969,9 @@ class OperationPlanRecord(Base):
         back_populates="plan",
         cascade="all, delete-orphan",
         order_by="OperationItemRecord.sequence_no",
+    )
+    agent_run: Mapped["AgentRun | None"] = relationship(
+        back_populates="operation_plans",
     )
 
 

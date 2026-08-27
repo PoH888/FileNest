@@ -88,11 +88,20 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "workspace_id",
             "request_text",
             "context_json",
+            "final_answer",
+            "sources_json",
         ]
         assert all(
             column["nullable"]
             for column in schema.get_columns("agent_runs")
-            if column["name"] in {"workspace_id", "request_text", "context_json"}
+            if column["name"]
+            in {
+                "workspace_id",
+                "request_text",
+                "context_json",
+                "final_answer",
+                "sources_json",
+            }
         )
         assert {
             constraint["name"]
@@ -108,6 +117,27 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
         ]
         assert agent_run_foreign_keys[0]["referred_table"] == "workspaces"
         assert agent_run_foreign_keys[0]["referred_columns"] == ["id"]
+
+        operation_plan_columns = {
+            column["name"]
+            for column in schema.get_columns("operation_plans")
+        }
+        assert "agent_run_id" in operation_plan_columns
+        operation_plan_foreign_keys = schema.get_foreign_keys(
+            "operation_plans"
+        )
+        assert any(
+            foreign_key["constrained_columns"] == ["agent_run_id"]
+            and foreign_key["referred_table"] == "agent_runs"
+            and foreign_key["referred_columns"] == ["id"]
+            for foreign_key in operation_plan_foreign_keys
+        )
+        assert any(
+            index["name"] == "ix_operation_plans_agent_run_id"
+            and index["column_names"] == ["agent_run_id"]
+            and index["unique"] == 0
+            for index in schema.get_indexes("operation_plans")
+        )
 
         assert "agent_tool_calls" in schema.get_table_names()
         assert [

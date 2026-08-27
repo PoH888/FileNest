@@ -56,6 +56,14 @@ def test_recorder_persists_only_safe_run_and_tool_lifecycle(
                 model_turns=2,
                 error_code=None,
             )
+            recorder.record_result(
+                agent_run_id=run_id,
+                final_answer="找到报告。",
+                sources_json=(
+                    '[{"workspace_id":1,"file_id":2,'
+                    '"name":"report.txt","relative_path":"report.txt"}]'
+                ),
+            )
 
         with Session(engine) as session:
             saved_run = session.get(AgentRun, run_id)
@@ -65,6 +73,11 @@ def test_recorder_persists_only_safe_run_and_tool_lifecycle(
             assert saved_run.status == "completed"
             assert saved_run.model_turns == 2
             assert saved_run.finished_at is not None
+            assert saved_run.final_answer == "找到报告。"
+            assert saved_run.sources_json == (
+                '[{"workspace_id":1,"file_id":2,'
+                '"name":"report.txt","relative_path":"report.txt"}]'
+            )
             assert saved_call is not None
             assert saved_call.status == "succeeded"
             assert saved_call.finished_at is not None
@@ -116,6 +129,35 @@ def test_recorder_keeps_safe_error_code_without_payload(
             assert saved_run.error_code == "model_request_rejected"
             assert saved_call is not None
             assert saved_call.error_code == "invalid_arguments"
+    finally:
+        engine.dispose()
+
+
+def test_recorder_rejects_malformed_sources_result(tmp_path: Path) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'malformed-sources.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            recorder = SqlAlchemyAgentRunRecorder(session)
+            run_id = recorder.start_run()
+
+            with pytest.raises(
+                AgentObservabilityError,
+                match="引用结果不可持久化",
+            ):
+                recorder.record_result(
+                    agent_run_id=run_id,
+                    final_answer="不应写入",
+                    sources_json='{"not":"a list"}',
+                )
+
+            saved_run = session.get(AgentRun, run_id)
+            assert saved_run is not None
+            assert saved_run.final_answer is None
+            assert saved_run.sources_json is None
     finally:
         engine.dispose()
 

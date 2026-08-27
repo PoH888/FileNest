@@ -16,12 +16,14 @@ The V2 status and boundaries below describe the current code, not a future roadm
 The V2 backend currently provides:
 
 - authorized workspace registration, explicit workspace scanning, file search, and file metadata retrieval;
-- document loading, traceable chunks, keyword knowledge search, and an offline experimental vector path;
+- document loading, traceable chunks, keyword knowledge search, and an offline experimental vector path. Document loading alone does not mean that PDF, DOCX, MD, and TXT have all entered a complete product knowledge chain;
 - a read-only Agent run with persisted run/tool state and SSE state projection;
 - operation-plan preview, persisted approval decisions, safe execution, execution history, and guarded undo;
 - a local-stdio MCP server exposing `search_files`, `knowledge_search`, and `create_operation_proposal`.
 
 The main V2 safety chain is deliberately explicit. Approval changes workflow state but does not write files. Execution reloads the approved checkpoint and revalidates authorization, the plan, and file preconditions. Undo relies on recorded execution history and current file metadata rather than unconditionally overwriting a path.
+
+The operation workflow above is not, by itself, a claim of a complete Agent file-organization chain. That claim requires the natural-language → Proposal → Approval → Execute path to be connected end to end. The current Agent/MCP description remains bounded to read-only querying and pending operation proposals.
 
 ## V2 Agent / V2 API Security Boundary
 
@@ -30,6 +32,15 @@ API paths described above. The V1 Windows desktop path starts at `main.py`,
 and its legacy direct-write `core/file_mover.py` is outside this boundary.
 The V2 API image does not package that V1 mover. This README therefore makes
 no repository-wide security guarantee.
+
+The V2 security declaration is bounded by these conditions:
+
+- [ ] Agent only Proposal
+- [ ] Human Approval
+- [ ] Server-side validation
+- [ ] Execution history
+- [ ] Undo
+- [ ] V1/V2 boundary
 
 ## Existing desktop demo media
 
@@ -295,9 +306,11 @@ Install the two test-only packages first, then run a representative local smoke 
   -q -p no:cacheprovider
 ```
 
-GitHub Actions runs the complete curated, non-overlapping unit, integration,
-security, and evaluation groups defined in `.github/workflows/ci.yml` on pushes,
-pull requests, and manual dispatch. It does not require a coverage threshold.
+GitHub Actions is configured with curated, non-overlapping unit, integration,
+security, and evaluation groups defined in `.github/workflows/ci.yml` for pushes,
+pull requests, and manual dispatch. This README does not claim a `complete
+curated` run until all tests have actually completed successfully. The workflow
+does not require a coverage threshold.
 
 ## How It Works
 

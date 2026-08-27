@@ -154,6 +154,7 @@ def build_propose_move_tool(
     *,
     workflow_id_factory: Callable[[], UUID] = uuid4,
     plan_id_factory: Callable[[], UUID] = uuid4,
+    agent_run_id: int | None = None,
 ) -> Tool:
     """构建只创建待审批移动计划、不会写入文件系统的 Agent 工具。"""
 
@@ -177,6 +178,7 @@ def build_propose_move_tool(
                 request,
                 workflow_id_factory=workflow_id_factory,
                 plan_id_factory=plan_id_factory,
+                agent_run_id=agent_run_id,
             )
         except WorkspaceNotFoundError:
             return ToolResult.failure(
@@ -227,6 +229,7 @@ def build_propose_rename_tool(
     *,
     workflow_id_factory: Callable[[], UUID] = uuid4,
     plan_id_factory: Callable[[], UUID] = uuid4,
+    agent_run_id: int | None = None,
 ) -> Tool:
     """构建只创建待审批重命名计划、不会写入文件系统的 Agent 工具。"""
 
@@ -310,6 +313,7 @@ def build_propose_rename_tool(
                 graph,
                 plan,
                 workflow_id_factory=workflow_id_factory,
+                agent_run_id=agent_run_id,
             )
         except WorkspaceNotFoundError:
             return ToolResult.failure(
@@ -366,6 +370,7 @@ def build_propose_quarantine_tool(
     quarantine_root: Path,
     workflow_id_factory: Callable[[], UUID] = uuid4,
     plan_id_factory: Callable[[], UUID] = uuid4,
+    agent_run_id: int | None = None,
 ) -> Tool:
     """构建只创建隔离计划、不会直接移动文件的 Agent 工具。"""
 
@@ -450,6 +455,7 @@ def build_propose_quarantine_tool(
                 graph,
                 plan,
                 workflow_id_factory=workflow_id_factory,
+                agent_run_id=agent_run_id,
             )
         except WorkspaceNotFoundError:
             return ToolResult.failure(
