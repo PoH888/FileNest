@@ -2,7 +2,6 @@
 
 import json
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
 from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Protocol, cast
@@ -25,6 +24,7 @@ from .model_client import (
     ModelTokenPricing,
     ModelTokenUsage,
     ModelToolCall,
+    estimate_model_cost_usd,
 )
 from .model_settings import ModelSettings
 from .tool_registry import ToolDefinition
@@ -84,6 +84,7 @@ class OpenAICompatibleModelClient:
                 f"不支持的模型供应商: {settings.provider}"
             )
 
+        self._model_provider = provider
         self._model_name = settings.name
         self._client = sdk_client or _build_sdk_client(settings, provider)
         self._token_pricing = token_pricing
@@ -145,6 +146,8 @@ class OpenAICompatibleModelClient:
             response,
             latency_ms=latency_ms,
             token_pricing=self._token_pricing,
+            model_provider=self._model_provider,
+            model_name=self._model_name,
         )
 
 
@@ -215,6 +218,8 @@ def _model_response(
     *,
     latency_ms: float,
     token_pricing: ModelTokenPricing | None,
+    model_provider: str,
+    model_name: str,
 ) -> ModelResponse:
     try:
         choices = getattr(response, "choices")
@@ -243,11 +248,16 @@ def _model_response(
                 tool_calls=tool_calls,
             ),
             finish_reason=finish_reason,
+            model_provider=model_provider,
+            model_name=model_name,
             metrics=ModelCallMetrics(
                 latency_ms=latency_ms,
                 requested_max_output_tokens=MAX_OUTPUT_TOKENS,
                 token_usage=token_usage,
-                estimated_cost_usd=_estimated_cost(token_usage, token_pricing),
+                estimated_cost_usd=estimate_model_cost_usd(
+                    token_usage,
+                    token_pricing,
+                ),
             ),
         )
     except InvalidModelProviderResponseError:
@@ -268,24 +278,6 @@ def _model_token_usage(response: object) -> ModelTokenUsage | None:
         output_tokens=getattr(usage, "completion_tokens"),
         total_tokens=getattr(usage, "total_tokens"),
     )
-
-
-def _estimated_cost(
-    token_usage: ModelTokenUsage | None,
-    token_pricing: ModelTokenPricing | None,
-) -> Decimal | None:
-    if token_usage is None or token_pricing is None:
-        return None
-
-    input_cost = (
-        Decimal(token_usage.input_tokens)
-        * token_pricing.input_usd_per_million_tokens
-    )
-    output_cost = (
-        Decimal(token_usage.output_tokens)
-        * token_pricing.output_usd_per_million_tokens
-    )
-    return (input_cost + output_cost) / Decimal(1_000_000)
 
 
 def _model_tool_call(tool_call: object) -> ModelToolCall:

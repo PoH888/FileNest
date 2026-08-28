@@ -266,6 +266,7 @@
 
     function saveActiveRun(runId) {
       try {
+        // 新请求会覆盖旧 Run；保留终态 Run 才能在刷新后恢复结果。
         window.localStorage.setItem(ACTIVE_RUN_STORAGE_KEY, String(runId));
       } catch {
         // 本地存储不可用时仍保留当前页面内的实时运行能力。
@@ -278,17 +279,6 @@
         return /^\d+$/.test(runId ?? "") ? runId : null;
       } catch {
         return null;
-      }
-    }
-
-    function clearActiveRun(runId) {
-      try {
-        const storedRunId = window.localStorage.getItem(ACTIVE_RUN_STORAGE_KEY);
-        if (runId === undefined || storedRunId === String(runId)) {
-          window.localStorage.removeItem(ACTIVE_RUN_STORAGE_KEY);
-        }
-      } catch {
-        // 清理失败不影响已经取得的权威结果。
       }
     }
 
@@ -415,7 +405,6 @@
             eventSource.close();
             activeRunEventSource = null;
           }
-          clearActiveRun(runId);
         } else if (timelinePrefix) {
           addRunTimelineItem(`实时连接恢复中：${describeRunEvent(payload)}`);
           resultStatus.textContent = `运行 #${runId} 实时连接恢复中…`;

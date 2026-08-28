@@ -345,6 +345,10 @@ def test_get_cancelled_agent_run_status(
         "status": "cancelled",
         "model_turns": 0,
         "error_code": None,
+        "final_answer": None,
+        "sources": [],
+        "proposals": [],
+        "error": None,
     }
 
 
@@ -648,4 +652,12 @@ def test_get_failed_agent_run_status_preserves_error_evidence(
         "status": "failed",
         "model_turns": 0,
         "error_code": "model_provider_error",
+        "final_answer": None,
+        "sources": [],
+        "proposals": [],
+        "error": {
+            "code": "model_provider_error",
+            "retryable": None,
+            "attempts": None,
+        },
     }

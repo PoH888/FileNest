@@ -26,6 +26,7 @@ ModelRequestErrorCode = Literal[
     "model_request_rejected",
     "model_provider_error",
 ]
+COST_CALCULATION_VERSION = "token-pricing-v1"
 
 
 class ModelClientRequestError(RuntimeError):
@@ -71,6 +72,26 @@ class ModelCallMetrics(BaseModel):
     requested_max_output_tokens: int = Field(gt=0)
     token_usage: ModelTokenUsage | None = None
     estimated_cost_usd: Decimal | None = Field(default=None, ge=0)
+
+
+def estimate_model_cost_usd(
+    token_usage: ModelTokenUsage | None,
+    token_pricing: ModelTokenPricing | None,
+) -> Decimal | None:
+    """按当前版本价目计算一次调用的美元成本；缺少依据时返回 None。"""
+
+    if token_usage is None or token_pricing is None:
+        return None
+
+    input_cost = (
+        Decimal(token_usage.input_tokens)
+        * token_pricing.input_usd_per_million_tokens
+    )
+    output_cost = (
+        Decimal(token_usage.output_tokens)
+        * token_pricing.output_usd_per_million_tokens
+    )
+    return (input_cost + output_cost) / Decimal(1_000_000)
 
 
 class ModelToolCall(BaseModel):
@@ -153,7 +174,18 @@ class ModelResponse(BaseModel):
 
     message: ModelMessage
     finish_reason: ModelFinishReason
+    model_provider: str | None = None
+    model_name: str | None = None
     metrics: ModelCallMetrics | None = None
+
+    @field_validator("model_provider", "model_name")
+    @classmethod
+    def reject_blank_model_identity(cls, value: str | None) -> str | None:
+        """模型身份必须是可解释且无首尾空格的标识。"""
+
+        if value is not None and (not value or value != value.strip()):
+            raise ValueError("model identity must be non-empty without whitespace")
+        return value
 
     @model_validator(mode="after")
     def validate_response_state(self) -> "ModelResponse":

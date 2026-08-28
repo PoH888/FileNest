@@ -90,6 +90,13 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
             "context_json",
             "final_answer",
             "sources_json",
+            "model_provider",
+            "model_name",
+            "prompt_version",
+            "latency_ms",
+            "input_tokens",
+            "output_tokens",
+            "estimated_cost_usd",
         ]
         assert all(
             column["nullable"]
@@ -101,6 +108,13 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
                 "context_json",
                 "final_answer",
                 "sources_json",
+                "model_provider",
+                "model_name",
+                "prompt_version",
+                "latency_ms",
+                "input_tokens",
+                "output_tokens",
+                "estimated_cost_usd",
             }
         )
         assert {
@@ -109,6 +123,14 @@ def test_migrations_build_schema_and_downgrade_each_latest_layer(
         } == {
             "ck_agent_runs_status",
             "ck_agent_runs_model_turns_non_negative",
+            "ck_agent_runs_model_provider",
+            "ck_agent_runs_model_name",
+            "ck_agent_runs_prompt_version",
+            "ck_agent_runs_latency_non_negative",
+            "ck_agent_runs_input_tokens_non_negative",
+            "ck_agent_runs_output_tokens_non_negative",
+            "ck_agent_runs_token_usage_complete",
+            "ck_agent_runs_estimated_cost_non_negative",
         }
         agent_run_foreign_keys = schema.get_foreign_keys("agent_runs")
         assert len(agent_run_foreign_keys) == 1

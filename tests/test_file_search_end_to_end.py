@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +38,22 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     test_engine.dispose()
 
 
+def _wait_for_job(
+    client: TestClient,
+    job_id: str,
+    expected_status: str,
+) -> dict[str, object]:
+    deadline = monotonic() + 2
+    while monotonic() < deadline:
+        response = client.get(f"/api/v1/jobs/{job_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] == expected_status:
+            return payload
+        sleep(0.005)
+    pytest.fail(f"job did not reach status {expected_status!r}")
+
+
 def test_create_scan_search_and_read_file_detail(
     client: TestClient,
     tmp_path: Path,
@@ -63,13 +80,13 @@ def test_create_scan_search_and_read_file_detail(
     scan_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
-    assert scan_response.status_code == 200
-    assert scan_response.json() == {
-        "created": 3,
-        "updated": 0,
-        "deleted": 0,
-        "unchanged": 0,
-    }
+    assert scan_response.status_code == 202
+    scan_job = _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+    )
+    assert scan_job["error_code"] is None
 
     search_response = client.get(
         f"/api/v1/workspaces/{workspace_id}/files",

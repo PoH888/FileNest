@@ -1,6 +1,7 @@
 import json
 from collections.abc import Sequence
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -9,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -798,6 +800,42 @@ class AgentRun(Base):
             "model_turns >= 0",
             name="ck_agent_runs_model_turns_non_negative",
         ),
+        CheckConstraint(
+            "model_provider IS NULL OR (length(model_provider) > 0 "
+            "AND model_provider = trim(model_provider))",
+            name="ck_agent_runs_model_provider",
+        ),
+        CheckConstraint(
+            "model_name IS NULL OR (length(model_name) > 0 "
+            "AND model_name = trim(model_name))",
+            name="ck_agent_runs_model_name",
+        ),
+        CheckConstraint(
+            "prompt_version IS NULL OR (length(prompt_version) > 0 "
+            "AND prompt_version = trim(prompt_version))",
+            name="ck_agent_runs_prompt_version",
+        ),
+        CheckConstraint(
+            "latency_ms IS NULL OR latency_ms >= 0",
+            name="ck_agent_runs_latency_non_negative",
+        ),
+        CheckConstraint(
+            "input_tokens IS NULL OR input_tokens >= 0",
+            name="ck_agent_runs_input_tokens_non_negative",
+        ),
+        CheckConstraint(
+            "output_tokens IS NULL OR output_tokens >= 0",
+            name="ck_agent_runs_output_tokens_non_negative",
+        ),
+        CheckConstraint(
+            "(input_tokens IS NULL AND output_tokens IS NULL) OR "
+            "(input_tokens IS NOT NULL AND output_tokens IS NOT NULL)",
+            name="ck_agent_runs_token_usage_complete",
+        ),
+        CheckConstraint(
+            "estimated_cost_usd IS NULL OR estimated_cost_usd >= 0",
+            name="ck_agent_runs_estimated_cost_non_negative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -836,6 +874,28 @@ class AgentRun(Base):
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     sources_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_provider: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    model_name: Mapped[str | None] = mapped_column(
+        String(200),
+        nullable=True,
+    )
+    prompt_version: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+    latency_ms: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+    input_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 10),
+        nullable=True,
+    )
     operation_plans: Mapped[list["OperationPlanRecord"]] = relationship(
         back_populates="agent_run",
         order_by="OperationPlanRecord.created_at",

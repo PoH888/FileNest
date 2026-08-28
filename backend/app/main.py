@@ -36,7 +36,6 @@ from .safe_execution import (
 
 from .services import (
     FileEntryNotFoundError,
-    FileIndexSyncResult,
     FileSearchResult,
     WorkspacePathConflictError,
     WorkspaceNotFoundError,

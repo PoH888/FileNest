@@ -2,11 +2,20 @@
 
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -54,6 +63,33 @@ _SAFE_TOOL_ERROR_CODES = frozenset(
 )
 
 
+class AgentRunMetrics(BaseModel):
+    """一次 Run 已知的安全模型指标汇总。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_provider: str | None = None
+    model_name: str | None = None
+    prompt_version: str | None = None
+    latency_ms: float | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    estimated_cost_usd: Decimal | None = Field(default=None, ge=0)
+
+    @field_validator("model_provider", "model_name", "prompt_version")
+    @classmethod
+    def reject_blank_identity(cls, value: str | None) -> str | None:
+        if value is not None and (not value or value != value.strip()):
+            raise ValueError("metric identity must be non-empty without whitespace")
+        return value
+
+    @model_validator(mode="after")
+    def validate_token_usage_pair(self) -> "AgentRunMetrics":
+        if (self.input_tokens is None) != (self.output_tokens is None):
+            raise ValueError("run token usage must contain both token counts")
+        return self
+
+
 class AgentObservabilityError(RuntimeError):
     """记录失败时向上层公开的稳定且不含数据库细节的错误。"""
 
@@ -98,8 +134,9 @@ class AgentRunRecorder(Protocol):
         status: RecordedRunStatus,
         model_turns: int,
         error_code: str | None,
+        metrics: AgentRunMetrics | None = None,
     ) -> None:
-        """记录 Agent Run 终态。"""
+        """记录 Agent Run 终态与已知模型指标。"""
 
         ...
 
@@ -261,6 +298,7 @@ class SqlAlchemyAgentRunRecorder:
         status: RecordedRunStatus,
         model_turns: int,
         error_code: str | None,
+        metrics: AgentRunMetrics | None = None,
     ) -> None:
         _validate_terminal_error(
             failed=status == "failed",
@@ -275,6 +313,17 @@ class SqlAlchemyAgentRunRecorder:
         agent_run.finished_at = self._now()
         agent_run.model_turns = model_turns
         agent_run.error_code = error_code
+        if metrics is not None:
+            validated_metrics = AgentRunMetrics.model_validate(metrics)
+            agent_run.model_provider = validated_metrics.model_provider
+            agent_run.model_name = validated_metrics.model_name
+            agent_run.prompt_version = validated_metrics.prompt_version
+            agent_run.latency_ms = validated_metrics.latency_ms
+            agent_run.input_tokens = validated_metrics.input_tokens
+            agent_run.output_tokens = validated_metrics.output_tokens
+            agent_run.estimated_cost_usd = (
+                validated_metrics.estimated_cost_usd
+            )
         self._commit()
 
     def record_result(

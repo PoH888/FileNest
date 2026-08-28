@@ -247,11 +247,11 @@ def run_retrieval_evaluation(
         for method, ranker in rankers.items():
             query = case.keyword_query if method == "keyword" else case.vector_query
             try:
+                def run_ranker() -> Sequence[str]:
+                    return ranker(query, case.top_k)
+
                 ranking_result, latency_ms = measure_latency_ms(
-                    lambda ranker=ranker, query=query, top_k=case.top_k: ranker(
-                        query,
-                        top_k,
-                    )
+                    run_ranker
                 )
                 ranking = _normalize_ranking(ranking_result)
             except RetrievalEvaluationError:

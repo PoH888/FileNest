@@ -25,6 +25,7 @@ from .repositories import (
     get_operation_execution_by_workflow_id,
     get_workspace_by_id,
     find_unfinished_operation_executions,
+    OperationExecutionItemStatus,
     OperationExecutionStatus,
     compare_and_set_operation_status,
 )
@@ -1398,7 +1399,7 @@ def _recover_interrupted_execution_items(
 
     mover = SafeFileMover(adapter)
     for item, action in recovery_actions:
-        expected_item_status = (
+        expected_item_status: OperationExecutionItemStatus = (
             "EXECUTING" if item.status == "EXECUTING" else "PENDING"
         )
         if expected_item_status == "PENDING":

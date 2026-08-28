@@ -1,13 +1,18 @@
 from collections.abc import Sequence
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
 from backend.app.model_client import (
+    COST_CALCULATION_VERSION,
     ModelClient,
     ModelMessage,
     ModelResponse,
+    ModelTokenPricing,
+    ModelTokenUsage,
     ModelToolCall,
+    estimate_model_cost_usd,
 )
 from backend.app.tool_registry import ToolDefinition
 
@@ -117,3 +122,19 @@ def test_structural_client_can_receive_vendor_independent_contracts() -> None:
 
     assert isinstance(client, ModelClient)
     assert response.message.content == "你好"
+
+
+def test_model_cost_calculation_is_versioned_and_uses_observed_usage() -> None:
+    assert COST_CALCULATION_VERSION == "token-pricing-v1"
+    assert estimate_model_cost_usd(
+        ModelTokenUsage(
+            input_tokens=1_000,
+            output_tokens=200,
+            total_tokens=1_200,
+        ),
+        ModelTokenPricing(
+            input_usd_per_million_tokens=1.25,
+            output_usd_per_million_tokens=2.50,
+        ),
+    ) == Decimal("0.00175")
+    assert estimate_model_cost_usd(None, None) is None

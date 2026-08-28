@@ -285,6 +285,7 @@ def test_plan_schema_has_relationship_indexes_and_constraints(
             "ix_operation_plans_workspace_id",
             "ix_operation_plans_workflow_id",
             "ix_operation_plans_parent_plan_id",
+            "ix_operation_plans_agent_run_id",
         }
         assert {
             index["name"] for index in schema.get_indexes("operation_items")

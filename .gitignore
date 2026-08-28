@@ -1,5 +1,7 @@
 # --- Python ---
 __pycache__/
+.mypy_cache/
+.ruff_cache/
 .pytest_cache/
 *.pyc
 *.pyo
@@ -58,7 +60,3 @@ PHASE1_HANDOFF.md
 lessons/
 docs/
 backend/backups/
-<<<<<<< Updated upstream
-=======
-backend/workflow-checkpoints.sqlite
->>>>>>> Stashed changes

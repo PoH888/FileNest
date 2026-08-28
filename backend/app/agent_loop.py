@@ -1,6 +1,7 @@
 """正式 Agent Loop 的模型回合编排。"""
 
 from collections.abc import Sequence
+from decimal import Decimal
 from math import isfinite
 from threading import Event
 from time import monotonic, sleep
@@ -9,12 +10,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .agent_observability import (
+    AgentRunMetrics,
     AgentRunRecorder,
     RecordedToolStatus,
 )
 from .model_client import (
     ModelClient,
     ModelClientRequestError,
+    ModelCallMetrics,
     ModelFinishReason,
     ModelMessage,
     ModelRequestErrorCode,
@@ -31,6 +34,9 @@ class AgentModelTurn(BaseModel):
     messages: tuple[ModelMessage, ...]
     finish_reason: ModelFinishReason
     tool_calls: tuple[ModelToolCall, ...]
+    model_provider: str | None = None
+    model_name: str | None = None
+    metrics: ModelCallMetrics | None = None
 
 
 AgentRunStatus = Literal[
@@ -50,6 +56,79 @@ AGENT_RUN_ACTIVE_STATUSES = frozenset(
 )
 AgentBoundaryStatus = Literal["timed_out", "cancelled"]
 MAX_MODEL_RETRIES = 5
+
+
+class _RunMetricsAccumulator:
+    """只累计 provider 实际返回的指标，不对缺失 usage 做估算。"""
+
+    def __init__(self, prompt_version: str | None) -> None:
+        self._prompt_version = prompt_version
+        self._model_providers: set[str] = set()
+        self._model_names: set[str] = set()
+        self._latency_ms = 0.0
+        self._has_latency = False
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._has_complete_usage = True
+        self._has_model_response = False
+        self._estimated_cost_usd = Decimal("0")
+        self._has_complete_cost = True
+
+    def add(self, turn: AgentModelTurn) -> None:
+        """记录一次已返回的模型响应及其可用指标。"""
+
+        self._has_model_response = True
+        if turn.model_provider is not None:
+            self._model_providers.add(turn.model_provider)
+        if turn.model_name is not None:
+            self._model_names.add(turn.model_name)
+
+        if turn.metrics is None:
+            self._has_complete_usage = False
+            self._has_complete_cost = False
+            return
+
+        self._latency_ms += turn.metrics.latency_ms
+        self._has_latency = True
+        if turn.metrics.token_usage is None:
+            self._has_complete_usage = False
+        elif self._has_complete_usage:
+            self._input_tokens += turn.metrics.token_usage.input_tokens
+            self._output_tokens += turn.metrics.token_usage.output_tokens
+
+        if turn.metrics.estimated_cost_usd is None:
+            self._has_complete_cost = False
+        elif self._has_complete_cost:
+            self._estimated_cost_usd += turn.metrics.estimated_cost_usd
+
+    def snapshot(self) -> AgentRunMetrics:
+        """生成可写入 AgentRun 的安全汇总。"""
+
+        return AgentRunMetrics(
+            model_provider=_single_value(self._model_providers),
+            model_name=_single_value(self._model_names),
+            prompt_version=self._prompt_version,
+            latency_ms=self._latency_ms if self._has_latency else None,
+            input_tokens=(
+                self._input_tokens
+                if self._has_model_response and self._has_complete_usage
+                else None
+            ),
+            output_tokens=(
+                self._output_tokens
+                if self._has_model_response and self._has_complete_usage
+                else None
+            ),
+            estimated_cost_usd=(
+                self._estimated_cost_usd
+                if self._has_model_response and self._has_complete_cost
+                else None
+            ),
+        )
+
+
+def _single_value(values: set[str]) -> str | None:
+    return next(iter(values)) if len(values) == 1 else None
 
 
 class AgentRunError(BaseModel):
@@ -99,10 +178,18 @@ class AgentLoop:
         model_client: ModelClient,
         tool_registry: ToolRegistry,
         recorder: AgentRunRecorder | None = None,
+        prompt_version: str | None = None,
     ) -> None:
+        if prompt_version is not None and (
+            not prompt_version or prompt_version != prompt_version.strip()
+        ):
+            raise ValueError(
+                "prompt_version must be non-empty without surrounding whitespace"
+            )
         self._model_client = model_client
         self._tool_registry = tool_registry
         self._recorder = recorder
+        self._prompt_version = prompt_version
 
     def request_model_turn(
         self,
@@ -120,6 +207,9 @@ class AgentLoop:
             messages=(*current_messages, response.message),
             finish_reason=response.finish_reason,
             tool_calls=response.message.tool_calls,
+            model_provider=response.model_provider,
+            model_name=response.model_name,
+            metrics=response.metrics,
         )
 
     def run(
@@ -162,6 +252,7 @@ class AgentLoop:
             if self._recorder is not None
             else None
         )
+        run_metrics = _RunMetricsAccumulator(self._prompt_version)
         current_messages = tuple(messages)
         self._checkpoint_run(
             agent_run_id=agent_run_id,
@@ -183,9 +274,11 @@ class AgentLoop:
                 return self._finish_recorded_run(
                     turn_or_result,
                     agent_run_id=agent_run_id,
+                    metrics=run_metrics.snapshot(),
                 )
 
             turn = turn_or_result
+            run_metrics.add(turn)
             current_messages = turn.messages
             self._checkpoint_run(
                 agent_run_id=agent_run_id,
@@ -205,6 +298,7 @@ class AgentLoop:
                         model_turns=model_turns,
                     ),
                     agent_run_id=agent_run_id,
+                    metrics=run_metrics.snapshot(),
                 )
 
             if turn.finish_reason == "stop":
@@ -216,6 +310,7 @@ class AgentLoop:
                         final_answer=current_messages[-1].content,
                     ),
                     agent_run_id=agent_run_id,
+                    metrics=run_metrics.snapshot(),
                 )
 
             if additional_turn == max_steps:
@@ -226,6 +321,7 @@ class AgentLoop:
                         model_turns=model_turns,
                     ),
                     agent_run_id=agent_run_id,
+                    metrics=run_metrics.snapshot(),
                 )
 
             for tool_call in turn.tool_calls:
@@ -241,6 +337,7 @@ class AgentLoop:
                             model_turns=model_turns,
                         ),
                         agent_run_id=agent_run_id,
+                        metrics=run_metrics.snapshot(),
                     )
 
                 tool_sequence_no += 1
@@ -296,6 +393,7 @@ class AgentLoop:
                             model_turns=model_turns,
                         ),
                         agent_run_id=agent_run_id,
+                        metrics=run_metrics.snapshot(),
                     )
 
         raise RuntimeError("Agent Loop reached an unreachable state")
@@ -324,6 +422,7 @@ class AgentLoop:
         result: AgentRunResult,
         *,
         agent_run_id: int | None,
+        metrics: AgentRunMetrics | None = None,
     ) -> AgentRunResult:
         """先持久化终态，再把同一运行结果交还调用方。"""
 
@@ -332,6 +431,7 @@ class AgentLoop:
                 agent_run_id=agent_run_id,
                 status=result.status,
                 model_turns=result.model_turns,
+                metrics=metrics,
                 error_code=(
                     result.error.code
                     if result.error is not None

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -518,6 +519,13 @@ def test_agent_run_and_tool_calls_persist_safe_lifecycle_metadata(
                 status="completed",
                 finished_at=finished_at,
                 model_turns=2,
+                model_provider="fake",
+                model_name="deterministic-model",
+                prompt_version="agent-v1",
+                latency_ms=12.5,
+                input_tokens=10,
+                output_tokens=6,
+                estimated_cost_usd=Decimal("0.0012345678"),
             )
             session.add(agent_run)
             session.flush()
@@ -560,6 +568,13 @@ def test_agent_run_and_tool_calls_persist_safe_lifecycle_metadata(
             assert saved_run.finished_at is not None
             assert saved_run.model_turns == 2
             assert saved_run.error_code is None
+            assert saved_run.model_provider == "fake"
+            assert saved_run.model_name == "deterministic-model"
+            assert saved_run.prompt_version == "agent-v1"
+            assert saved_run.latency_ms == 12.5
+            assert saved_run.input_tokens == 10
+            assert saved_run.output_tokens == 6
+            assert saved_run.estimated_cost_usd == Decimal("0.0012345678")
             assert [call.tool_name for call in saved_calls] == [
                 "list_workspaces",
                 "search_files",
@@ -676,6 +691,37 @@ def test_agent_run_rejects_invalid_lifecycle_values(
         engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "agent_run",
+    [
+        AgentRun(model_provider=" "),
+        AgentRun(model_name=""),
+        AgentRun(prompt_version=" "),
+        AgentRun(latency_ms=-1),
+        AgentRun(input_tokens=-1, output_tokens=1),
+        AgentRun(input_tokens=1),
+        AgentRun(estimated_cost_usd=Decimal("-0.01")),
+    ],
+)
+def test_agent_run_rejects_invalid_metadata_values(
+    tmp_path: Path,
+    agent_run: AgentRun,
+) -> None:
+    engine = _engine(tmp_path, "invalid-agent-run-metadata.db")
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        with Session(engine) as session:
+            session.add(agent_run)
+
+            with pytest.raises(IntegrityError):
+                session.commit()
+
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
 def test_agent_runs_store_resume_context_without_tool_payload_columns(
     tmp_path: Path,
 ) -> None:
@@ -704,6 +750,13 @@ def test_agent_runs_store_resume_context_without_tool_payload_columns(
             "error_code",
             "final_answer",
             "sources_json",
+            "model_provider",
+            "model_name",
+            "prompt_version",
+            "latency_ms",
+            "input_tokens",
+            "output_tokens",
+            "estimated_cost_usd",
         }
         assert tool_call_columns == {
             "id",

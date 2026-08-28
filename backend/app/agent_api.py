@@ -35,6 +35,7 @@ from .agent_loop import (
 )
 from .agent_observability import (
     AgentObservabilityError,
+    AgentRunMetrics,
     RecordedRunStatus,
     SqlAlchemyAgentRunRecorder,
 )
@@ -69,6 +70,7 @@ from .workflow_runtime import WORKFLOW_CHECKPOINT_PATH
 router = APIRouter(prefix="/api/v1")
 NO_EVIDENCE_REFUSAL = "没有足够的文档证据，无法回答该问题。"
 _QUARANTINE_ROOT_ENV = "FILENEST_QUARANTINE_ROOT"
+_AGENT_PROMPT_VERSION = "agent-system-v1"
 
 
 class AgentRunRequest(BaseModel):
@@ -353,6 +355,7 @@ class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
             RecordedRunStatus,
             int,
             str | None,
+            AgentRunMetrics | None,
         ] | None = None
 
     run_id: int | None = None
@@ -372,10 +375,11 @@ class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
         status: RecordedRunStatus,
         model_turns: int,
         error_code: str | None,
+        metrics: AgentRunMetrics | None = None,
     ) -> None:
         """暂存终态，避免公开结果写入前被轮询观察到。"""
 
-        self._pending_finish = (status, model_turns, error_code)
+        self._pending_finish = (status, model_turns, error_code, metrics)
 
     def finalize_result(self, result: AgentRunResponse) -> None:
         """先写结果字段，再提交 Agent Run 终态。"""
@@ -388,13 +392,14 @@ class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
             run_id=self.run_id,
             result=result,
         )
-        status, model_turns, error_code = self._pending_finish
+        status, model_turns, error_code, metrics = self._pending_finish
         SqlAlchemyAgentRunRecorder.finish_run(
             self,
             agent_run_id=self.run_id,
             status=status,
             model_turns=model_turns,
             error_code=error_code,
+            metrics=metrics,
         )
 
 
@@ -458,6 +463,7 @@ class ReadOnlyAgentRunExecutor:
                     agent_run_id,
                 ),
                 recorder=recorder,
+                prompt_version=_AGENT_PROMPT_VERSION,
             )
             result = loop.run(
                 messages,

@@ -130,6 +130,8 @@ def test_client_converts_messages_tools_and_text_response() -> None:
 
     assert response.message.content == "找到报告。"
     assert response.finish_reason == "stop"
+    assert response.model_provider == "deepseek"
+    assert response.model_name == "example-model"
     assert response.metrics is not None
     assert response.metrics.token_usage is not None
     assert response.metrics.estimated_cost_usd is None
