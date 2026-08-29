@@ -3,6 +3,8 @@
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from functools import partial
 import json
 import os
@@ -12,7 +14,7 @@ from time import sleep
 from typing import Protocol
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import (
@@ -43,7 +45,7 @@ from .database import get_session
 from .events import build_agent_run_event_stream
 from .model_client import ModelClient, ModelMessage
 from .model_settings import ModelSettings
-from .models import AgentToolCall, OperationPlanRecord
+from .models import AgentRun, AgentToolCall, OperationPlanRecord
 from .openai_compatible_model_client import (
     OpenAICompatibleModelClient,
     UnsupportedModelProviderError,
@@ -58,7 +60,11 @@ from .proposal_tools import (
     build_propose_quarantine_tool,
     build_propose_rename_tool,
 )
-from .repositories import get_agent_run_by_id
+from .repositories import (
+    count_agent_runs,
+    find_agent_runs,
+    get_agent_run_by_id,
+)
 from .services import get_workspace as get_workspace_service
 from .services import validate_operation_plan
 from .tool_contracts import ToolResult
@@ -193,6 +199,48 @@ class AgentRunStateResponse(BaseModel):
     error_code: str | None = None
 
 
+class AgentRunMetricsResponse(BaseModel):
+    """详情页可解释的 Agent Run 模型指标。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_provider: str | None = None
+    model_name: str | None = None
+    prompt_version: str | None = None
+    latency_ms: float | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    estimated_cost_usd: Decimal | None = Field(default=None, ge=0)
+
+
+class AgentRunSummaryResponse(BaseModel):
+    """历史列表中的单条摘要，不包含答案、引用或操作提案。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: int = Field(ge=1)
+    workspace_id: int = Field(ge=1)
+    request_text: str | None = None
+    status: AgentRunLifecycleStatus
+    model_turns: int = Field(ge=0)
+    started_at: datetime
+    finished_at: datetime | None = None
+    model_provider: str | None = None
+    model_name: str | None = None
+
+
+class AgentRunListResponse(BaseModel):
+    """按工作区分页返回 Agent Run 摘要。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    items: tuple[AgentRunSummaryResponse, ...]
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=100)
+    total: int = Field(ge=0)
+    has_next: bool
+
+
 class AgentRunResultResponse(AgentRunStateResponse):
     """GET 返回的稳定 Agent Run 状态与终态结果合同。"""
 
@@ -200,6 +248,7 @@ class AgentRunResultResponse(AgentRunStateResponse):
     sources: tuple[AgentSourceReference, ...] = ()
     proposals: tuple[AgentRunProposalResponse, ...] = ()
     error: AgentRunResponseError | None = None
+    metrics: AgentRunMetricsResponse | None = None
 
 
 class AgentRunExecutor(Protocol):
@@ -591,6 +640,55 @@ def _source_references(
     return tuple(references)
 
 
+def _agent_run_summary(agent_run: AgentRun) -> AgentRunSummaryResponse:
+    return AgentRunSummaryResponse(
+        run_id=agent_run.id,
+        workspace_id=agent_run.workspace_id,
+        request_text=agent_run.request_text,
+        status=agent_run.status,
+        model_turns=agent_run.model_turns,
+        started_at=_as_utc(agent_run.started_at),
+        finished_at=(
+            _as_utc(agent_run.finished_at)
+            if agent_run.finished_at is not None
+            else None
+        ),
+        model_provider=agent_run.model_provider,
+        model_name=agent_run.model_name,
+    )
+
+
+def _agent_run_metrics_response(
+    agent_run: AgentRun,
+) -> AgentRunMetricsResponse | None:
+    values = (
+        agent_run.model_provider,
+        agent_run.model_name,
+        agent_run.prompt_version,
+        agent_run.latency_ms,
+        agent_run.input_tokens,
+        agent_run.output_tokens,
+        agent_run.estimated_cost_usd,
+    )
+    if all(value is None for value in values):
+        return None
+    return AgentRunMetricsResponse(
+        model_provider=agent_run.model_provider,
+        model_name=agent_run.model_name,
+        prompt_version=agent_run.prompt_version,
+        latency_ms=agent_run.latency_ms,
+        input_tokens=agent_run.input_tokens,
+        output_tokens=agent_run.output_tokens,
+        estimated_cost_usd=agent_run.estimated_cost_usd,
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _load_persisted_sources(
     sources_json: str | None,
 ) -> tuple[AgentSourceReference, ...]:
@@ -908,6 +1006,43 @@ def create_agent_run(
     return AgentRunAcceptedResponse(run_id=run_id)
 
 
+@router.get("/agent-runs", response_model=AgentRunListResponse)
+def list_agent_runs(
+    workspace_id: int = Query(ge=1),
+    status: AgentRunLifecycleStatus | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> AgentRunListResponse:
+    """按授权工作区稳定分页读取 Agent Run 摘要。"""
+
+    if get_workspace_service(session, workspace_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "工作区不存在。",
+            },
+        )
+
+    offset = (page - 1) * page_size
+    runs = find_agent_runs(
+        session,
+        workspace_id,
+        status=status,
+        offset=offset,
+        limit=page_size,
+    )
+    total = count_agent_runs(session, workspace_id, status=status)
+    return AgentRunListResponse(
+        items=tuple(_agent_run_summary(agent_run) for agent_run in runs),
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_next=offset + len(runs) < total,
+    )
+
+
 @router.post(
     "/agent-runs/{run_id}/resume",
     status_code=202,
@@ -1047,15 +1182,28 @@ def cancel_agent_run(
     )
 
 
-@router.get("/agent-runs/{run_id}", response_model=AgentRunResultResponse)
+@router.get(
+    "/agent-runs/{run_id}",
+    response_model=AgentRunResultResponse,
+    response_model_exclude_unset=True,
+)
 def get_agent_run_state(
     run_id: int,
+    workspace_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> AgentRunResultResponse:
     """读取 Agent Run 的状态和当前可用结果，不介入任务执行。"""
 
     agent_run = get_agent_run_by_id(session, run_id)
     if agent_run is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "agent_run_not_found",
+                "message": "Agent 运行记录不存在。",
+            },
+        )
+    if workspace_id is not None and agent_run.workspace_id != workspace_id:
         raise HTTPException(
             status_code=404,
             detail={
@@ -1085,7 +1233,7 @@ def get_agent_run_state(
             ) from error
         final_answer = agent_run.final_answer
 
-    return AgentRunResultResponse(
+    response = AgentRunResultResponse(
         run_id=agent_run.id,
         status=agent_run.status,
         model_turns=agent_run.model_turns,
@@ -1094,11 +1242,19 @@ def get_agent_run_state(
         sources=sources,
         proposals=proposals,
         error=(
-            AgentRunResponseError(code=agent_run.error_code)
+            AgentRunResponseError(
+                code=agent_run.error_code,
+                retryable=None,
+                attempts=None,
+            )
             if agent_run.error_code is not None
             else None
         ),
     )
+    metrics = _agent_run_metrics_response(agent_run)
+    if metrics is not None:
+        response = response.model_copy(update={"metrics": metrics})
+    return response
 
 
 @router.get("/agent-runs/{run_id}/events")

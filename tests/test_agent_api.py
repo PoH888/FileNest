@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 from threading import Event
@@ -253,6 +254,201 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
         persisted_run = session.get(AgentRun, run_id)
         assert persisted_run is not None
         assert persisted_run.status == "completed"
+
+
+def test_agent_run_history_lists_only_workspace_runs_with_stable_pagination(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(session_factory, name="历史工作区一")
+    other_workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="历史工作区二",
+    )
+    first_started_at = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    second_started_at = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    with session_factory() as session:
+        first_run = AgentRun(
+            workspace_id=workspace_id,
+            request_text="第一条历史",
+            status="completed",
+            model_turns=1,
+            started_at=first_started_at,
+        )
+        second_run = AgentRun(
+            workspace_id=workspace_id,
+            request_text="第二条历史",
+            status="completed",
+            model_turns=2,
+            started_at=second_started_at,
+        )
+        third_run = AgentRun(
+            workspace_id=workspace_id,
+            request_text="第三条失败历史",
+            status="failed",
+            model_turns=1,
+            started_at=second_started_at,
+        )
+        other_run = AgentRun(
+            workspace_id=other_workspace_id,
+            request_text="其他工作区历史",
+            status="completed",
+            model_turns=1,
+            started_at=second_started_at,
+        )
+        session.add_all([first_run, second_run, third_run, other_run])
+        session.commit()
+
+    first_page = client.get(
+        "/api/v1/agent-runs",
+        params={
+            "workspace_id": workspace_id,
+            "page": 1,
+            "page_size": 2,
+        },
+    )
+    second_page = client.get(
+        "/api/v1/agent-runs",
+        params={
+            "workspace_id": workspace_id,
+            "page": 2,
+            "page_size": 2,
+        },
+    )
+    failed_runs = client.get(
+        "/api/v1/agent-runs",
+        params={
+            "workspace_id": workspace_id,
+            "status": "failed",
+        },
+    )
+
+    assert first_page.status_code == 200
+    assert first_page.json() == {
+        "items": [
+            {
+                "run_id": third_run.id,
+                "workspace_id": workspace_id,
+                "request_text": "第三条失败历史",
+                "status": "failed",
+                "model_turns": 1,
+                "started_at": "2026-09-02T12:00:00Z",
+                "finished_at": None,
+                "model_provider": None,
+                "model_name": None,
+            },
+            {
+                "run_id": second_run.id,
+                "workspace_id": workspace_id,
+                "request_text": "第二条历史",
+                "status": "completed",
+                "model_turns": 2,
+                "started_at": "2026-09-02T12:00:00Z",
+                "finished_at": None,
+                "model_provider": None,
+                "model_name": None,
+            },
+        ],
+        "page": 1,
+        "page_size": 2,
+        "total": 3,
+        "has_next": True,
+    }
+    assert second_page.status_code == 200
+    assert [item["run_id"] for item in second_page.json()["items"]] == [
+        first_run.id
+    ]
+    assert second_page.json()["has_next"] is False
+    assert failed_runs.status_code == 200
+    assert [item["run_id"] for item in failed_runs.json()["items"]] == [
+        third_run.id
+    ]
+    assert failed_runs.json()["total"] == 1
+    assert other_run.id not in {
+        item["run_id"] for item in first_page.json()["items"]
+    }
+
+
+def test_agent_run_history_rejects_unknown_workspace_and_bad_page_size(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, _ = agent_client
+
+    missing_workspace = client.get(
+        "/api/v1/agent-runs",
+        params={"workspace_id": 999},
+    )
+    bad_page_size = client.get(
+        "/api/v1/agent-runs",
+        params={"workspace_id": 999, "page_size": 101},
+    )
+
+    assert missing_workspace.status_code == 404
+    assert missing_workspace.json()["detail"]["code"] == "workspace_not_found"
+    assert bad_page_size.status_code == 422
+
+
+def test_agent_run_detail_checks_workspace_and_returns_metrics(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _ = _seed_workspace(session_factory, name="历史详情工作区")
+    other_workspace_id, _ = _seed_workspace(
+        session_factory,
+        name="历史详情其他工作区",
+    )
+    started_at = datetime(2026, 9, 3, 1, 2, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 9, 3, 1, 3, tzinfo=timezone.utc)
+    with session_factory() as session:
+        agent_run = AgentRun(
+            workspace_id=workspace_id,
+            request_text="查看历史详情",
+            status="completed",
+            model_turns=2,
+            started_at=started_at,
+            finished_at=finished_at,
+            final_answer="已完成历史查询。",
+            sources_json=(
+                '[{"workspace_id":1,"file_id":1,"name":"report.txt",'
+                '"relative_path":"report.txt"}]'
+            ),
+            model_provider="fake",
+            model_name="deterministic-model",
+            prompt_version="agent-system-v1",
+            latency_ms=37.5,
+            input_tokens=40,
+            output_tokens=10,
+            estimated_cost_usd=Decimal("0.003"),
+        )
+        session.add(agent_run)
+        session.commit()
+        run_id = agent_run.id
+
+    detail = client.get(
+        f"/api/v1/agent-runs/{run_id}",
+        params={"workspace_id": workspace_id},
+    )
+    wrong_workspace = client.get(
+        f"/api/v1/agent-runs/{run_id}",
+        params={"workspace_id": other_workspace_id},
+    )
+
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["run_id"] == run_id
+    assert payload["final_answer"] == "已完成历史查询。"
+    assert payload["sources"][0]["relative_path"] == "report.txt"
+    assert payload["metrics"] == {
+        "model_provider": "fake",
+        "model_name": "deterministic-model",
+        "prompt_version": "agent-system-v1",
+        "latency_ms": 37.5,
+        "input_tokens": 40,
+        "output_tokens": 10,
+        "estimated_cost_usd": "0.0030000000",
+    }
+    assert wrong_workspace.status_code == 404
+    assert wrong_workspace.json()["detail"]["code"] == "agent_run_not_found"
 
 
 def test_agent_run_api_returns_before_background_executor_finishes(

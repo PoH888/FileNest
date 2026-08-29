@@ -312,6 +312,47 @@ def get_agent_run_by_id(
     return session.get(AgentRun, agent_run_id)
 
 
+def find_agent_runs(
+    session: Session,
+    workspace_id: int,
+    *,
+    status: str | None = None,
+    offset: int = 0,
+    limit: int = 20,
+) -> list[AgentRun]:
+    """按工作区查询 Agent Run，使用时间和 ID 保证稳定倒序分页。"""
+
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    if limit < 1:
+        raise ValueError("limit must be positive")
+
+    statement = select(AgentRun).where(AgentRun.workspace_id == workspace_id)
+    if status is not None:
+        statement = statement.where(AgentRun.status == status)
+    statement = statement.order_by(
+        AgentRun.started_at.desc(),
+        AgentRun.id.desc(),
+    ).offset(offset).limit(limit)
+    return list(session.scalars(statement).all())
+
+
+def count_agent_runs(
+    session: Session,
+    workspace_id: int,
+    *,
+    status: str | None = None,
+) -> int:
+    """统计指定工作区和状态的 Agent Run 数量。"""
+
+    statement = select(func.count()).select_from(AgentRun).where(
+        AgentRun.workspace_id == workspace_id
+    )
+    if status is not None:
+        statement = statement.where(AgentRun.status == status)
+    return int(session.scalar(statement) or 0)
+
+
 def add_agent_tool_call(
     session: Session,
     tool_call: AgentToolCall,

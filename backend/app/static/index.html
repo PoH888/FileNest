@@ -36,6 +36,22 @@
       border-top: 1px solid #d1d5db;
       padding-top: 1rem;
     }
+    #recent-runs-panel {
+      margin-top: 1.5rem;
+      border-top: 1px solid #d1d5db;
+      padding-top: 1rem;
+    }
+    #recent-runs-list {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+    #recent-runs-list li + li {
+      margin-top: 0.5rem;
+    }
+    .recent-run-button {
+      width: 100%;
+      text-align: left;
+    }
     #result-answer {
       white-space: pre-wrap;
     }
@@ -126,6 +142,14 @@
       <button id="submit-request" type="submit" disabled>提交只读请求</button>
     </form>
 
+    <section id="recent-runs-panel" aria-labelledby="recent-runs-heading">
+      <h2 id="recent-runs-heading">最近运行</h2>
+      <p id="recent-runs-status" role="status" aria-live="polite">
+        选择工作区后加载。
+      </p>
+      <ul id="recent-runs-list"></ul>
+    </section>
+
     <section id="run-result" aria-labelledby="result-heading">
       <h2 id="result-heading">运行结果</h2>
       <p id="result-status" role="status" aria-live="polite">等待提交。</p>
@@ -169,6 +193,8 @@
     const workspaceSelect = document.querySelector("#workspace-select");
     const requestText = document.querySelector("#request-text");
     const submitButton = document.querySelector("#submit-request");
+    const recentRunsStatus = document.querySelector("#recent-runs-status");
+    const recentRunsList = document.querySelector("#recent-runs-list");
     const resultStatus = document.querySelector("#result-status");
     const resultAnswer = document.querySelector("#result-answer");
     const timelinePanel = document.querySelector("#timeline-panel");
@@ -198,6 +224,7 @@
     let activeRunResultRequestId = null;
     let currentWorkspaceName = "";
     let proposalRenderToken = 0;
+    let recentRunsRequestToken = 0;
     const ACTIVE_RUN_STORAGE_KEY = "filenest.active_agent_run_id";
 
     const TERMINAL_RUN_STATUSES = new Set([
@@ -208,6 +235,7 @@
       "failed",
     ]);
     const RUN_STATUS_LABELS = Object.freeze({
+      completed: "已完成",
       max_steps_reached: "达到最大步数",
       timed_out: "超时",
       cancelled: "已取消",
@@ -282,6 +310,98 @@
       }
     }
 
+    function recentRunStatusLabel(status) {
+      return RUN_STATUS_LABELS[status] ?? "处理中";
+    }
+
+    function renderRecentRuns(payload, requestToken) {
+      if (requestToken !== recentRunsRequestToken) {
+        return;
+      }
+
+      recentRunsList.replaceChildren();
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      if (items.length === 0) {
+        recentRunsStatus.textContent = "当前工作区暂无运行记录。";
+        return;
+      }
+
+      recentRunsStatus.textContent =
+        `共 ${String(payload.total ?? items.length)} 条记录。`;
+      for (const run of items) {
+        if (!run || typeof run !== "object" || !Number.isInteger(run.run_id)) {
+          continue;
+        }
+
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "recent-run-button";
+        const request =
+          typeof run.request_text === "string" && run.request_text
+            ? run.request_text
+            : "未命名请求";
+        button.textContent =
+          `#${String(run.run_id)} · ${recentRunStatusLabel(run.status)} · ${request}`;
+        button.addEventListener("click", () => {
+          const workspaceId = workspaceSelect.value;
+          if (!workspaceId) {
+            return;
+          }
+
+          resetRunTimeline();
+          showSources([]);
+          showAgentProposals([]);
+          showPlanPreview([]);
+          currentWorkspaceName =
+            workspaceSelect.selectedOptions[0]?.textContent ?? "";
+          saveActiveRun(run.run_id);
+          resultStatus.textContent = `运行 #${String(run.run_id)} 正在加载…`;
+          void loadRunResult(run.run_id, currentWorkspaceName).then(
+            (loadedRun) => {
+              if (
+                loadedRun !== null &&
+                !TERMINAL_RUN_STATUSES.has(loadedRun.status)
+              ) {
+                startRunEventStream(run.run_id, currentWorkspaceName);
+              }
+            },
+          );
+        });
+        item.append(button);
+        recentRunsList.append(item);
+      }
+    }
+
+    async function loadRecentRuns() {
+      const workspaceId = workspaceSelect.value;
+      const requestToken = ++recentRunsRequestToken;
+      recentRunsList.replaceChildren();
+      if (!workspaceId) {
+        recentRunsStatus.textContent = "选择工作区后加载。";
+        return;
+      }
+
+      recentRunsStatus.textContent = "历史运行加载中…";
+      try {
+        const query = new URLSearchParams({
+          workspace_id: workspaceId,
+          page: "1",
+          page_size: "10",
+        });
+        const response = await fetch(`/api/v1/agent-runs?${query}`);
+        const payload = await response.json();
+        if (!response.ok || !payload || typeof payload !== "object") {
+          throw new Error("recent runs request failed");
+        }
+        renderRecentRuns(payload, requestToken);
+      } catch {
+        if (requestToken === recentRunsRequestToken) {
+          recentRunsStatus.textContent = "历史运行加载失败，请稍后重试。";
+        }
+      }
+    }
+
     function resetRunTimeline() {
       closeRunEventStream();
       closeWorkflowEventStream();
@@ -334,8 +454,11 @@
       }
 
       const request = (async () => {
+        const query = new URLSearchParams({
+          workspace_id: workspaceSelect.value,
+        });
         const response = await fetch(
-          `/api/v1/agent-runs/${encodeURIComponent(normalizedRunId)}`,
+          `/api/v1/agent-runs/${encodeURIComponent(normalizedRunId)}?${query}`,
         );
         const payload = await response.json();
         if (
@@ -405,6 +528,7 @@
             eventSource.close();
             activeRunEventSource = null;
           }
+          void loadRecentRuns();
         } else if (timelinePrefix) {
           addRunTimelineItem(`实时连接恢复中：${describeRunEvent(payload)}`);
           resultStatus.textContent = `运行 #${runId} 实时连接恢复中…`;
@@ -1275,6 +1399,7 @@
         }
         workspaceSelect.disabled = false;
         submitButton.disabled = false;
+        void loadRecentRuns();
       } catch {
         workspaceSelect.replaceChildren();
         const option = document.createElement("option");
@@ -1315,12 +1440,17 @@
         }
 
         saveActiveRun(payload.run_id);
+        void loadRecentRuns();
         startRunEventStream(payload.run_id, selectedWorkspaceName);
       } catch {
         showStatus("无法连接 FileNest API，请稍后重试。");
       } finally {
         submitButton.disabled = false;
       }
+    });
+
+    workspaceSelect.addEventListener("change", () => {
+      void loadRecentRuns();
     });
 
     planForm.addEventListener("submit", async (event) => {

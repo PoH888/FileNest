@@ -16,12 +16,17 @@ def test_minimal_ui_serves_safe_read_only_request_form() -> None:
     assert 'id="result-answer"' in html
     assert 'id="timeline-panel"' in html
     assert 'id="timeline-list"' in html
+    assert 'id="recent-runs-panel"' in html
+    assert 'id="recent-runs-status"' in html
+    assert 'id="recent-runs-list"' in html
     assert 'id="plan-form"' in html
     assert 'id="plan-status"' in html
     assert 'id="approve-plan"' in html
     assert 'id="reject-plan"' in html
     assert 'fetch("/api/v1/workspaces")' in html
     assert 'fetch("/api/v1/agent-runs"' in html
+    assert "loadRecentRuns" in html
+    assert "workspace_id: workspaceId" in html
     assert "new EventSource" in html
     assert 'fetch("/api/v1/workflows"' in html
     assert "/decisions" in html
@@ -49,3 +54,8 @@ def test_minimal_ui_wires_plan_preview_and_decision_path() -> None:
     assert 'addEventListener(\n        "agent_tool_call.status_changed"' in html
     assert "eventSource.close()" in html
     assert "eventSource.onerror" in html
+    assert "renderRecentRuns" in html
+    assert "recentRunStatusLabel" in html
+    assert 'workspaceSelect.addEventListener("change"' in html
+    assert "new URLSearchParams" in html
+    assert "recent-run-button" in html

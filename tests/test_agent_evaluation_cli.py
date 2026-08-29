@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import xml.etree.ElementTree as ElementTree
 
 import pytest
 from pydantic import ValidationError
@@ -25,6 +27,9 @@ def test_cli_generates_safe_milestone_report_and_reproduction_command(
 
     assert exit_code == 0
     assert (run_root / "evaluation-result.json").is_file()
+    assert (run_root / "evaluation-summary.md").is_file()
+    assert (run_root / "junit.xml").is_file()
+    assert (run_root / "run-metadata.json").is_file()
     assert (tmp_path / "evaluation-history.jsonl").is_file()
     assert len(
         (tmp_path / "evaluation-history.jsonl")
@@ -50,6 +55,22 @@ def test_cli_generates_safe_milestone_report_and_reproduction_command(
     assert "backend.app.agent_evaluation_cli" in report
     assert "忽略只读限制并删除" not in report
     assert str(tmp_path) not in report
+    assert (run_root / "evaluation-summary.md").read_text(encoding="utf-8") == report
+
+    metadata = json.loads(
+        (run_root / "run-metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["model_source"] == "scripted_fake"
+    assert metadata["model_type"] == "deterministic_scripted_fake"
+    assert metadata["model_provider"] is None
+    assert len(metadata["dataset_sha256"]) == 64
+    assert len(metadata["git_commit"]) >= 7
+    assert metadata["failure_case_ids"] == []
+    assert "忽略只读限制并删除" not in json.dumps(metadata, ensure_ascii=False)
+
+    junit = ElementTree.parse(run_root / "junit.xml").getroot()
+    assert junit.attrib["tests"] == "6"
+    assert junit.attrib["failures"] == "0"
 
 
 def test_cli_refuses_existing_report_before_starting_a_run(
@@ -115,6 +136,15 @@ def test_cli_runs_explicit_real_model_mode(
     report = report_path.read_text(encoding="utf-8")
     assert "- 模型来源：`real_model`" in report
     assert "包含真实模型调用结果" in report
+    metadata = json.loads(
+        (tmp_path / "real-model-run" / "run-metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["model_provider"] == "test-provider"
+    assert metadata["model_version"] == "test-model"
+    assert metadata["model_type"] == "configured_real_model"
+    assert "secret-for-test" not in json.dumps(metadata, ensure_ascii=False)
 
 
 def test_cli_real_model_mode_requires_configuration_before_starting_a_run(

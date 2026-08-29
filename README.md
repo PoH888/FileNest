@@ -17,13 +17,15 @@ The V2 backend currently provides:
 
 - authorized workspace registration, explicit workspace scanning, file search, and file metadata retrieval;
 - document loading, traceable chunks, keyword knowledge search, and an offline experimental vector path. Document loading alone does not mean that PDF, DOCX, MD, and TXT have all entered a complete product knowledge chain;
-- a read-only Agent run with persisted run/tool state and SSE state projection;
+- a workspace-bound Agent run with persisted run/tool state, read-only evidence tools, and proposal tools that stop at human approval;
 - operation-plan preview, persisted approval decisions, safe execution, execution history, and guarded undo;
 - a local-stdio MCP server exposing `search_files`, `knowledge_search`, and `create_operation_proposal`.
 
 The main V2 safety chain is deliberately explicit. Approval changes workflow state but does not write files. Execution reloads the approved checkpoint and revalidates authorization, the plan, and file preconditions. Undo relies on recorded execution history and current file metadata rather than unconditionally overwriting a path.
 
-The operation workflow above is not, by itself, a claim of a complete Agent file-organization chain. That claim requires the natural-language → Proposal → Approval → Execute path to be connected end to end. The current Agent/MCP description remains bounded to read-only querying and pending operation proposals.
+The Agent can query indexed evidence and create a server-side operation proposal,
+but it cannot approve, execute, or undo a plan. Human approval and the normal
+HTTP safe-execution boundary remain mandatory for every file-system side effect.
 
 ## V2 Agent / V2 API Security Boundary
 
@@ -35,12 +37,12 @@ no repository-wide security guarantee.
 
 The V2 security declaration is bounded by these conditions:
 
-- [ ] Agent only Proposal
-- [ ] Human Approval
-- [ ] Server-side validation
-- [ ] Execution history
-- [ ] Undo
-- [ ] V1/V2 boundary
+- [x] Agent only Proposal
+- [x] Human Approval
+- [x] Server-side validation
+- [x] Execution history
+- [x] Undo
+- [x] V1/V2 boundary
 
 ## Existing desktop demo media
 
@@ -79,6 +81,29 @@ UNDONE
 ```
 
 The existing run record checks that the source file returns after undo and that its SHA-256 is unchanged. The deterministic API path uses indexed file search and does not require an external model. The browser Agent query path requires valid local model settings; it is not treated as evidence of model quality.
+
+## Actual V2 architecture and safety chain
+
+The current architecture is documented in
+[`docs/E39-01-实际架构图、关键时序与威胁模型.md`](docs/E39-01-实际架构图、关键时序与威胁模型.md).
+The central chain is:
+
+```mermaid
+flowchart LR
+    U[User / Web UI] --> A[Agent Run]
+    A --> T[Workspace-bound Tool Registry]
+    T -->|evidence| R[Search / Metadata / Knowledge]
+    T -->|proposal only| P[Operation Plan + Workflow]
+    P --> H[Human Approval]
+    H --> S[Safe Execution + Path Policy]
+    S --> F[Authorized File System]
+    S --> AU[Audit / Execution History]
+    AU --> UN[Guarded Undo]
+```
+
+Model output, document text, MCP requests, and browser parameters are inputs to
+this chain, not permission grants. The Agent and MCP paths do not expose an
+approval, execute, or undo tool.
 
 ## Requirements
 
@@ -142,11 +167,35 @@ The expected health response is `status: ok`. Open
 <http://127.0.0.1:8000/> for the current minimal V2 UI, or
 <http://127.0.0.1:8000/docs> for the OpenAPI UI.
 
-The UI can select a workspace, submit a read-only Agent request, inspect
+The UI can select a workspace, submit an Agent request, inspect
 sources, create a plan, approve or reject it, execute an approved plan, and
 undo a completed execution. A valid model configuration is required for the
 Agent request. Without a model configuration, use the deterministic HTTP chain
 in the E39-03 local video script.
+
+### Agent contract evaluation
+
+The fixed `agent_contract_v1` dataset contains 20 cases across tool selection,
+argument validity, proposal validity, security boundaries, and RAG citations.
+It runs in a fresh temporary workspace and writes four isolated artifacts:
+`evaluation-result.json`, `evaluation-summary.md`, `junit.xml`, and
+`run-metadata.json`. The output directory must not already exist.
+
+```powershell
+$runDir = Join-Path .\backend\backups ("agent-contract-run-" + (Get-Date -Format yyyyMMdd-HHmmss))
+& .\.venv\Scripts\python.exe -m backend.app.agent_contract_runner `
+  --output-dir $runDir
+```
+
+| Mode | Scope | Interpretation |
+|------|-------|----------------|
+| `scripted_fake` | All 20 cases | Deterministic program-boundary and safety regression; not LLM quality |
+| `real_model` | 5–8 selected cases | Provider/model-dependent observation; API key stays in environment variables |
+
+For a real-model run, set the local `FILENEST_MODEL_PROVIDER`,
+`FILENEST_MODEL_NAME`, and `FILENEST_MODEL_API_KEY` variables and pass
+`--model-source real_model`. Do not put credentials in the command, fixture,
+report, or repository.
 
 ### V2 API with Docker Compose
 
@@ -312,6 +361,22 @@ pull requests, and manual dispatch. This README does not claim a `complete
 curated` run until all tests have actually completed successfully. The workflow
 does not require a coverage threshold.
 
+## Design choices and upgrade triggers
+
+- SQLite remains the current persistence choice because the measured local
+  workload is single-user and the existing scale evidence has not shown a lock,
+  query-plan, deployment, or maintenance trigger that requires PostgreSQL.
+  Reconsider it when reproducible concurrent writes, query latency, backup, or
+  deployment requirements exceed the SQLite boundary.
+- Keyword retrieval remains the default because it is explainable and is the
+  current tested path. Vector retrieval is an offline experiment; adopt real
+  embeddings or an external vector store only after a fixed query set shows a
+  repeatable quality benefit and the deployment workload justifies it.
+- Job/Attempt and the single-process runner provide a persistence and recovery
+  baseline, but are not yet the HTTP scan/index scheduler. Introduce a queue or
+  distributed workers only when measured long-task concurrency, queueing,
+  multi-process recovery, or multi-host deployment requires them.
+
 ## How It Works
 
 ### Legacy desktop matching strategy
@@ -332,11 +397,12 @@ does not require a coverage threshold.
 ## Current V2 boundaries
 
 - The legacy desktop monitor is not integrated into the V2 Job/Attempt or document-indexing path.
-- V2 Agent POST execution is currently synchronous; SSE projects persisted Agent state and does not itself execute or cancel business work.
+- V2 Agent POST returns `202` with a `run_id`; an in-process background pool executes the run, while SSE projects persisted Agent state and does not itself execute or cancel business work.
 - Large workspace scans and document indexing have local long-task evidence, but the Job/Attempt baseline is not fully connected to HTTP, scanning, or document indexing.
 - Keyword retrieval remains the default; vector retrieval is experimental and no external vector database is adopted.
 - Redis, Celery, distributed workers, user authentication, multi-tenant isolation, and a remote MCP transport are not current V2 capabilities.
-- This repository contains no verified production deployment, production user count, QPS, SLA, real-model accuracy, or real-embedding quality claim.
+- Docker/Compose files are configuration references only; this environment has no verified container build or run.
+- This repository contains no verified production deployment, production user count, QPS, SLA, or real-model accuracy claim.
 
 ## License
 

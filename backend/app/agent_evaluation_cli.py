@@ -4,9 +4,11 @@ import argparse
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from hashlib import sha256
+import json
 from pathlib import Path
 import re
 import subprocess
+import xml.etree.ElementTree as ElementTree
 
 from .agent_evaluation import EvaluationVersionInfo, load_evaluation_dataset
 from .agent_evaluation_runner import (
@@ -116,11 +118,10 @@ def render_milestone_report(
     """把不含提示词和工具载荷的安全结果渲染为报告。"""
 
     metrics = summary.metrics
-    reproduction_command = REPRODUCTION_COMMAND
+    reproduction_command = _reproduction_command(summary.model_source)
     boundary_note = "- 本报告评测确定性的程序边界，不代表真实模型质量。"
     cost_note = "- Fake Model 不产生外部费用。"
     if summary.model_source == "real_model":
-        reproduction_command += " --model-source real_model"
         boundary_note = "- 本报告包含真实模型调用结果，结果受模型版本和服务状态影响。"
         cost_note = "- 真实模型费用仅在供应商用量和价格信息完整时估算。"
     lines = [
@@ -233,6 +234,92 @@ def render_milestone_report(
     return "\n".join(lines)
 
 
+def _reproduction_command(model_source: str) -> str:
+    command = REPRODUCTION_COMMAND
+    if model_source == "real_model":
+        command += " --model-source real_model"
+    return command
+
+
+def _write_exclusive_text(path: Path, content: str) -> None:
+    with path.open("x", encoding="utf-8", newline="\n") as output_file:
+        output_file.write(content)
+
+
+def _write_run_metadata(
+    summary: EvaluationSummary,
+    path: Path,
+    *,
+    dataset_sha256: str,
+    model_provider: str | None,
+) -> None:
+    metadata = {
+        "schema_version": "1.0",
+        "dataset_sha256": dataset_sha256,
+        "dataset_version": summary.version_info.evaluation_dataset_version,
+        "git_commit": summary.version_info.git_commit,
+        "execution_command": _reproduction_command(summary.model_source),
+        "model_source": summary.model_source,
+        "model_type": (
+            "deterministic_scripted_fake"
+            if summary.model_source == "scripted_fake"
+            else "configured_real_model"
+        ),
+        "model_provider": model_provider,
+        "model_version": summary.version_info.model_version,
+        "prompt_version": summary.version_info.prompt_version,
+        "timestamp": summary.version_info.timestamp.isoformat(),
+        "case_count": len(summary.cases),
+        "failure_case_ids": [
+            case.case_id for case in summary.cases if not case.task_success
+        ],
+    }
+    _write_exclusive_text(
+        path,
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def _write_junit_report(summary: EvaluationSummary, path: Path) -> None:
+    failed_cases = [case for case in summary.cases if not case.task_success]
+    suite = ElementTree.Element(
+        "testsuite",
+        {
+            "name": "FileNest Agent Evaluation",
+            "tests": str(len(summary.cases)),
+            "failures": str(len(failed_cases)),
+        },
+    )
+    for case in summary.cases:
+        testcase = ElementTree.SubElement(
+            suite,
+            "testcase",
+            {
+                "classname": case.category,
+                "name": case.case_id,
+                "time": f"{case.run_latency_ms / 1000:.6f}",
+            },
+        )
+        if not case.task_success:
+            failure = ElementTree.SubElement(
+                testcase,
+                "failure",
+                {"message": "evaluation case failed"},
+            )
+            failure.text = (
+                f"actual_run_status={case.actual_run_status}; "
+                f"tool_results_match={case.tool_results_match}"
+            )
+
+    ElementTree.indent(suite, space="  ")
+    with path.open("x", encoding="utf-8", newline="\n") as output_file:
+        ElementTree.ElementTree(suite).write(
+            output_file,
+            encoding="unicode",
+            xml_declaration=True,
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.report_path.exists() or args.report_path.is_symlink():
@@ -253,9 +340,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset = load_evaluation_dataset(args.dataset)
     model_client_factory = None
     model_version = "scripted_fake"
+    model_provider = None
     if args.model_source == "real_model":
         settings = ModelSettings()
         real_model_client = OpenAICompatibleModelClient(settings)
+        model_provider = settings.provider
         model_version = settings.name
 
         def create_model_client() -> OpenAICompatibleModelClient:
@@ -280,17 +369,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_source=args.model_source,
         version_info=version_info,
     )
+    dataset_sha256 = sha256(dataset_bytes).hexdigest()
     report = render_milestone_report(
         summary,
-        dataset_sha256=sha256(dataset_bytes).hexdigest(),
+        dataset_sha256=dataset_sha256,
     )
-
-    with args.report_path.open(
-        "x",
-        encoding="utf-8",
-        newline="\n",
-    ) as report_file:
-        report_file.write(report)
+    run_summary_path = args.output_dir / "evaluation-summary.md"
+    _write_exclusive_text(run_summary_path, report)
+    if run_summary_path.resolve() != args.report_path.resolve():
+        _write_exclusive_text(args.report_path, report)
+    _write_run_metadata(
+        summary,
+        args.output_dir / "run-metadata.json",
+        dataset_sha256=dataset_sha256,
+        model_provider=model_provider,
+    )
+    _write_junit_report(summary, args.output_dir / "junit.xml")
     append_evaluation_history(summary, history_path)
 
     print(f"评测结果：{args.output_dir / 'evaluation-result.json'}")
