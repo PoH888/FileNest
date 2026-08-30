@@ -262,6 +262,16 @@ class AgentLoop:
         tool_sequence_no = initial_tool_sequence_no
         for additional_turn in range(1, max_steps + 1):
             model_turns = initial_model_turns + additional_turn
+            agent_step_id = self._start_agent_step(
+                agent_run_id=agent_run_id,
+                step_index=model_turns - 1,
+                messages=current_messages,
+            )
+            message_sequence_no = self._record_step_input(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                messages=current_messages,
+            )
             turn_or_result = self._request_model_turn_with_retries(
                 current_messages,
                 completed_model_turns=model_turns - 1,
@@ -271,6 +281,17 @@ class AgentLoop:
                 retry_base_delay_seconds=retry_base_delay_seconds,
             )
             if isinstance(turn_or_result, AgentRunResult):
+                self._finish_agent_step(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    status=turn_or_result.status,
+                    messages=turn_or_result.messages,
+                    error_code=(
+                        turn_or_result.error.code
+                        if turn_or_result.error is not None
+                        else None
+                    ),
+                )
                 return self._finish_recorded_run(
                     turn_or_result,
                     agent_run_id=agent_run_id,
@@ -279,6 +300,12 @@ class AgentLoop:
 
             turn = turn_or_result
             run_metrics.add(turn)
+            message_sequence_no = self._record_model_response(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                sequence_no=message_sequence_no,
+                turn=turn,
+            )
             current_messages = turn.messages
             self._checkpoint_run(
                 agent_run_id=agent_run_id,
@@ -291,6 +318,13 @@ class AgentLoop:
                 cancel_event=cancel_event,
             )
             if boundary_status is not None:
+                self._finish_agent_step(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    status=boundary_status,
+                    messages=current_messages,
+                    error_code=None,
+                )
                 return self._finish_recorded_run(
                     AgentRunResult(
                         status=boundary_status,
@@ -302,6 +336,13 @@ class AgentLoop:
                 )
 
             if turn.finish_reason == "stop":
+                self._finish_agent_step(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    status="completed",
+                    messages=current_messages,
+                    error_code=None,
+                )
                 return self._finish_recorded_run(
                     AgentRunResult(
                         status="completed",
@@ -314,6 +355,13 @@ class AgentLoop:
                 )
 
             if additional_turn == max_steps:
+                self._finish_agent_step(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    status="max_steps_reached",
+                    messages=current_messages,
+                    error_code=None,
+                )
                 return self._finish_recorded_run(
                     AgentRunResult(
                         status="max_steps_reached",
@@ -330,6 +378,13 @@ class AgentLoop:
                     cancel_event=cancel_event,
                 )
                 if boundary_status is not None:
+                    self._finish_agent_step(
+                        agent_run_id=agent_run_id,
+                        agent_step_id=agent_step_id,
+                        status=boundary_status,
+                        messages=current_messages,
+                        error_code=None,
+                    )
                     return self._finish_recorded_run(
                         AgentRunResult(
                             status=boundary_status,
@@ -340,6 +395,12 @@ class AgentLoop:
                         metrics=run_metrics.snapshot(),
                     )
 
+                message_sequence_no = self._record_tool_call_message(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    sequence_no=message_sequence_no,
+                    tool_call=tool_call,
+                )
                 tool_sequence_no += 1
                 tool_record_id = (
                     self._recorder.start_tool_call(
@@ -351,6 +412,7 @@ class AgentLoop:
                             if tool_call.name in self._tool_registry.names
                             else "unknown_tool"
                         ),
+                        agent_step_id=agent_step_id,
                     )
                     if self._recorder is not None
                     and agent_run_id is not None
@@ -363,6 +425,12 @@ class AgentLoop:
                 ) = self._execute_tool_call_with_observation(
                     current_messages,
                     tool_call,
+                )
+                message_sequence_no = self._record_step_message(
+                    agent_run_id=agent_run_id,
+                    agent_step_id=agent_step_id,
+                    sequence_no=message_sequence_no,
+                    message=current_messages[-1],
                 )
                 self._checkpoint_run(
                     agent_run_id=agent_run_id,
@@ -386,6 +454,13 @@ class AgentLoop:
                     cancel_event=cancel_event,
                 )
                 if boundary_status is not None:
+                    self._finish_agent_step(
+                        agent_run_id=agent_run_id,
+                        agent_step_id=agent_step_id,
+                        status=boundary_status,
+                        messages=current_messages,
+                        error_code=None,
+                    )
                     return self._finish_recorded_run(
                         AgentRunResult(
                             status=boundary_status,
@@ -396,7 +471,164 @@ class AgentLoop:
                         metrics=run_metrics.snapshot(),
                     )
 
+            self._finish_agent_step(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                status="completed",
+                messages=current_messages,
+                error_code=None,
+            )
+
         raise RuntimeError("Agent Loop reached an unreachable state")
+
+    def _start_agent_step(
+        self,
+        *,
+        agent_run_id: int | None,
+        step_index: int,
+        messages: Sequence[ModelMessage],
+    ) -> int | None:
+        if self._recorder is None or agent_run_id is None:
+            return None
+        start_step = getattr(self._recorder, "start_step", None)
+        if not callable(start_step):
+            return None
+        return start_step(
+            agent_run_id=agent_run_id,
+            step_index=step_index,
+            step_type="model_turn",
+            messages=messages,
+        )
+
+    def _record_step_input(
+        self,
+        *,
+        agent_run_id: int | None,
+        agent_step_id: int | None,
+        messages: Sequence[ModelMessage],
+    ) -> int:
+        if self._recorder is None or agent_run_id is None or agent_step_id is None:
+            return 0
+        message = next(
+            (candidate for candidate in reversed(messages) if candidate.role != "system"),
+            None,
+        )
+        if message is None:
+            return 0
+        next_sequence = getattr(
+            self._recorder,
+            "next_message_sequence",
+            None,
+        )
+        sequence_no = (
+            next_sequence(agent_step_id=agent_step_id)
+            if callable(next_sequence)
+            else 0
+        )
+        return self._record_step_message(
+            agent_run_id=agent_run_id,
+            agent_step_id=agent_step_id,
+            sequence_no=sequence_no,
+            message=message,
+        )
+
+    def _record_model_response(
+        self,
+        *,
+        agent_run_id: int | None,
+        agent_step_id: int | None,
+        sequence_no: int,
+        turn: AgentModelTurn,
+    ) -> int:
+        if self._recorder is None or agent_run_id is None or agent_step_id is None:
+            return sequence_no
+        record_model_run = getattr(self._recorder, "record_model_run", None)
+        if callable(record_model_run):
+            record_model_run(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                model=turn.model_name,
+                model_provider=turn.model_provider,
+                prompt_version=self._prompt_version,
+                metrics=turn.metrics,
+            )
+        return self._record_step_message(
+            agent_run_id=agent_run_id,
+            agent_step_id=agent_step_id,
+            sequence_no=sequence_no,
+            message=turn.messages[-1],
+        )
+
+    def _record_tool_call_message(
+        self,
+        *,
+        agent_run_id: int | None,
+        agent_step_id: int | None,
+        sequence_no: int,
+        tool_call: ModelToolCall,
+    ) -> int:
+        if self._recorder is None or agent_run_id is None or agent_step_id is None:
+            return sequence_no
+        record_tool_call_message = getattr(
+            self._recorder,
+            "record_tool_call_message",
+            None,
+        )
+        if callable(record_tool_call_message):
+            record_tool_call_message(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                sequence_no=sequence_no,
+                tool_call=tool_call,
+            )
+            return sequence_no + 1
+        return sequence_no
+
+    def _record_step_message(
+        self,
+        *,
+        agent_run_id: int | None,
+        agent_step_id: int | None,
+        sequence_no: int,
+        message: ModelMessage,
+    ) -> int:
+        if self._recorder is None or agent_run_id is None or agent_step_id is None:
+            return sequence_no
+        record_model_message = getattr(
+            self._recorder,
+            "record_model_message",
+            None,
+        )
+        if callable(record_model_message):
+            record_model_message(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                sequence_no=sequence_no,
+                message=message,
+            )
+            return sequence_no + 1
+        return sequence_no
+
+    def _finish_agent_step(
+        self,
+        *,
+        agent_run_id: int | None,
+        agent_step_id: int | None,
+        status: str,
+        messages: Sequence[ModelMessage],
+        error_code: str | None,
+    ) -> None:
+        if self._recorder is None or agent_run_id is None or agent_step_id is None:
+            return
+        finish_step = getattr(self._recorder, "finish_step", None)
+        if callable(finish_step):
+            finish_step(
+                agent_run_id=agent_run_id,
+                agent_step_id=agent_step_id,
+                status=status,
+                messages=messages,
+                error_code=error_code,
+            )
 
     def _checkpoint_run(
         self,

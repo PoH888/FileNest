@@ -396,8 +396,14 @@ class _WorkspaceScopedToolRegistry(ToolRegistry):
 class _CapturingAgentRunRecorder(SqlAlchemyAgentRunRecorder):
     """保留现有安全记录行为，同时把本次 run_id 交给 API。"""
 
-    def __init__(self, session: Session, *, run_id: int | None = None) -> None:
-        super().__init__(session)
+    def __init__(
+        self,
+        session: Session,
+        *,
+        run_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> None:
+        super().__init__(session, workspace_id=workspace_id)
         self.run_id = run_id
         self._run_started = False
         self._pending_finish: tuple[
@@ -475,7 +481,11 @@ class ReadOnlyAgentRunExecutor:
         run_id: int | None = None,
         cancel_event: Event | None = None,
     ) -> AgentRunResponse:
-        recorder = _CapturingAgentRunRecorder(session, run_id=run_id)
+        recorder = _CapturingAgentRunRecorder(
+            session,
+            run_id=run_id,
+            workspace_id=workspace_id,
+        )
         initial_model_turns = 0
         initial_tool_sequence_no = 0
         if run_id is not None:

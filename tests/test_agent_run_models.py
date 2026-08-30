@@ -16,6 +16,7 @@ from backend.app.models import (
     AgentSession,
     AgentStep,
     AgentToolCall,
+    agent_run_sessions,
 )
 
 
@@ -722,6 +723,88 @@ def test_agent_run_rejects_invalid_metadata_values(
         engine.dispose()
 
 
+def test_agent_run_session_graph_is_queryable_without_cascading_history(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, "agent-lifecycle-graph.db")
+    Base.metadata.create_all(bind=engine)
+
+    try:
+        schema = inspect(engine)
+        assert [
+            column["name"] for column in schema.get_columns("agent_run_sessions")
+        ] == ["agent_run_id", "agent_session_id"]
+        assert [
+            column["name"] for column in schema.get_columns("agent_tool_calls")
+        ][1:3] == ["agent_run_id", "agent_step_id"]
+
+        with Session(engine) as session:
+            agent_run = AgentRun()
+            agent_session = AgentSession()
+            session.add_all([agent_run, agent_session])
+            session.flush()
+            agent_step = AgentStep(
+                agent_session=agent_session,
+                step_index=0,
+                step_type="model_turn",
+                input="request summary",
+            )
+            agent_message = AgentMessage(
+                agent_step=agent_step,
+                sequence_no=0,
+                message_type="assistant",
+                payload_json='{"summary":"safe"}',
+            )
+            model_run = AgentModelRun(
+                agent_step=agent_step,
+                model="example-model",
+                latency_ms=1.0,
+            )
+            metric = AgentMetric(
+                agent_session=agent_session,
+                agent_step=agent_step,
+                agent_model_run=model_run,
+                metric_name="step_latency",
+                value_json="1.0",
+                unit="ms",
+            )
+            tool_call = AgentToolCall(
+                agent_run=agent_run,
+                agent_step=agent_step,
+                sequence_no=1,
+                model_call_id="call_1",
+                tool_name="search_files",
+            )
+            session.add_all([agent_step, agent_message, model_run, metric, tool_call])
+            agent_run.sessions.append(agent_session)
+            session.commit()
+            run_id = agent_run.id
+            session_id = agent_session.id
+            model_run_id = model_run.id
+
+        with Session(engine) as session:
+            saved_run = session.get(AgentRun, run_id)
+
+            assert saved_run is not None
+            assert [linked.id for linked in saved_run.sessions] == [session_id]
+            assert [step.step_index for step in saved_run.sessions[0].steps] == [0]
+            assert saved_run.sessions[0].steps[0].messages[0].message_type == (
+                "assistant"
+            )
+            assert saved_run.sessions[0].steps[0].model_runs[0].model == (
+                "example-model"
+            )
+            assert saved_run.sessions[0].metrics[0].agent_model_run_id == (
+                model_run_id
+            )
+            assert saved_run.sessions[0].steps[0].tool_calls[0].sequence_no == 1
+
+        assert "agent_run_sessions" in Base.metadata.tables
+        assert agent_run_sessions.name == "agent_run_sessions"
+    finally:
+        engine.dispose()
+
+
 def test_agent_runs_store_resume_context_without_tool_payload_columns(
     tmp_path: Path,
 ) -> None:
@@ -761,6 +844,7 @@ def test_agent_runs_store_resume_context_without_tool_payload_columns(
         assert tool_call_columns == {
             "id",
             "agent_run_id",
+            "agent_step_id",
             "sequence_no",
             "model_call_id",
             "tool_name",

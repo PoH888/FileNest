@@ -7,11 +7,13 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Column,
     DateTime,
     Float,
     ForeignKey,
     Numeric,
     String,
+    Table,
     Text,
     UniqueConstraint,
     func,
@@ -33,6 +35,23 @@ from .embedding_client import (
     validate_embedding_vector,
 )
 from .operation_status import OperationStatus
+
+
+agent_run_sessions = Table(
+    "agent_run_sessions",
+    Base.metadata,
+    Column(
+        "agent_run_id",
+        ForeignKey("agent_runs.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "agent_session_id",
+        ForeignKey("agent_sessions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+)
+
 
 class Workspace(Base): # 继承 FileNest 的 ORM 基类
     """告诉 SQLAlchemy：
@@ -592,6 +611,22 @@ class AgentSession(Base):
         server_default=func.current_timestamp(),
         onupdate=func.current_timestamp(),
     )
+    runs: Mapped[list["AgentRun"]] = relationship(
+        "AgentRun",
+        secondary=agent_run_sessions,
+        back_populates="sessions",
+        order_by="AgentRun.started_at",
+    )
+    steps: Mapped[list["AgentStep"]] = relationship(
+        "AgentStep",
+        back_populates="agent_session",
+        order_by="AgentStep.step_index",
+    )
+    metrics: Mapped[list["AgentMetric"]] = relationship(
+        "AgentMetric",
+        back_populates="agent_session",
+        order_by="AgentMetric.created_at",
+    )
 
 
 class AgentStep(Base):
@@ -642,6 +677,30 @@ class AgentStep(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    agent_session: Mapped[AgentSession] = relationship(
+        "AgentSession",
+        back_populates="steps",
+    )
+    messages: Mapped[list["AgentMessage"]] = relationship(
+        "AgentMessage",
+        back_populates="agent_step",
+        order_by="AgentMessage.sequence_no",
+    )
+    model_runs: Mapped[list["AgentModelRun"]] = relationship(
+        "AgentModelRun",
+        back_populates="agent_step",
+        order_by="AgentModelRun.created_at",
+    )
+    metrics: Mapped[list["AgentMetric"]] = relationship(
+        "AgentMetric",
+        back_populates="agent_step",
+        order_by="AgentMetric.created_at",
+    )
+    tool_calls: Mapped[list["AgentToolCall"]] = relationship(
+        "AgentToolCall",
+        back_populates="agent_step",
+        order_by="AgentToolCall.sequence_no",
+    )
 
 
 class AgentMessage(Base):
@@ -680,6 +739,10 @@ class AgentMessage(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.current_timestamp(),
+    )
+    agent_step: Mapped[AgentStep] = relationship(
+        "AgentStep",
+        back_populates="messages",
     )
 
 
@@ -741,6 +804,15 @@ class AgentModelRun(Base):
         nullable=False,
         server_default=func.current_timestamp(),
     )
+    agent_step: Mapped[AgentStep] = relationship(
+        "AgentStep",
+        back_populates="model_runs",
+    )
+    metrics: Mapped[list["AgentMetric"]] = relationship(
+        "AgentMetric",
+        back_populates="agent_model_run",
+        order_by="AgentMetric.created_at",
+    )
 
 
 class AgentMetric(Base):
@@ -782,6 +854,18 @@ class AgentMetric(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.current_timestamp(),
+    )
+    agent_session: Mapped[AgentSession] = relationship(
+        "AgentSession",
+        back_populates="metrics",
+    )
+    agent_step: Mapped[AgentStep | None] = relationship(
+        "AgentStep",
+        back_populates="metrics",
+    )
+    agent_model_run: Mapped[AgentModelRun | None] = relationship(
+        "AgentModelRun",
+        back_populates="metrics",
     )
 
 
@@ -896,6 +980,17 @@ class AgentRun(Base):
         Numeric(20, 10),
         nullable=True,
     )
+    sessions: Mapped[list[AgentSession]] = relationship(
+        "AgentSession",
+        secondary=agent_run_sessions,
+        back_populates="runs",
+        order_by="AgentSession.created_at",
+    )
+    tool_calls: Mapped[list["AgentToolCall"]] = relationship(
+        "AgentToolCall",
+        back_populates="agent_run",
+        order_by="AgentToolCall.sequence_no",
+    )
     operation_plans: Mapped[list["OperationPlanRecord"]] = relationship(
         back_populates="agent_run",
         order_by="OperationPlanRecord.created_at",
@@ -932,6 +1027,10 @@ class AgentToolCall(Base):
         ForeignKey("agent_runs.id"),
         nullable=False,
     )
+    agent_step_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_steps.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     sequence_no: Mapped[int] = mapped_column(nullable=False)
     model_call_id: Mapped[str] = mapped_column(String, nullable=False)
     tool_name: Mapped[str] = mapped_column(String, nullable=False)
@@ -951,6 +1050,14 @@ class AgentToolCall(Base):
         nullable=True,
     )
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_run: Mapped[AgentRun] = relationship(
+        "AgentRun",
+        back_populates="tool_calls",
+    )
+    agent_step: Mapped[AgentStep | None] = relationship(
+        "AgentStep",
+        back_populates="tool_calls",
+    )
 
 
 class OperationPlanRecord(Base):
