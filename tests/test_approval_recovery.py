@@ -10,9 +10,10 @@ from backend.app.approval_recovery import (
     ApprovalRecoveryError,
     ApprovalRecoveryErrorCode,
     recover_waiting_approval_tasks,
+    scan_waiting_approval_tasks,
 )
 from backend.app.database import Base
-from backend.app.models import ApprovalRequest
+from backend.app.models import ApprovalRequest, Workspace
 from backend.app.operation_plan import (
     FilePrecondition,
     OperationPlan,
@@ -219,3 +220,70 @@ def test_restart_rejects_checkpoint_not_waiting_for_human_approval(
         error.value.code
         == ApprovalRecoveryErrorCode.NOT_WAITING_FOR_APPROVAL
     )
+
+
+def test_startup_scan_keeps_valid_snapshot_and_counts_policy_blockers(
+    tmp_path: Path,
+) -> None:
+    business_path = tmp_path / "startup-scan.db"
+    checkpoint_path = tmp_path / "startup-scan-checkpoint.sqlite"
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    _create_business_database(business_path)
+
+    engine = create_engine(f"sqlite:///{business_path.as_posix()}")
+    try:
+        with Session(engine) as session:
+            session.add(
+                Workspace(
+                    id=3,
+                    name="启动恢复工作区",
+                    root_path=str(workspace_root),
+                )
+            )
+            session.commit()
+    finally:
+        engine.dispose()
+
+    approval_id = _add_approval(business_path)
+    _write_waiting_checkpoint(checkpoint_path)
+
+    restarted_engine = create_engine(f"sqlite:///{business_path.as_posix()}")
+    try:
+        with (
+            Session(restarted_engine) as session,
+            open_checkpointed_workflow_graph(checkpoint_path) as graph,
+        ):
+            scan = scan_waiting_approval_tasks(session, graph)
+    finally:
+        restarted_engine.dispose()
+
+    assert [task.approval_id for task in scan.recovered_tasks] == [approval_id]
+    assert scan.issues == ()
+
+
+def test_startup_scan_reports_missing_workspace_without_mutating_approval(
+    tmp_path: Path,
+) -> None:
+    business_path = tmp_path / "startup-policy-blocked.db"
+    checkpoint_path = tmp_path / "startup-policy-blocked-checkpoint.sqlite"
+    _create_business_database(business_path)
+    approval_id = _add_approval(business_path)
+    _write_waiting_checkpoint(checkpoint_path)
+
+    restarted_engine = create_engine(f"sqlite:///{business_path.as_posix()}")
+    try:
+        with (
+            Session(restarted_engine) as session,
+            open_checkpointed_workflow_graph(checkpoint_path) as graph,
+        ):
+            scan = scan_waiting_approval_tasks(session, graph)
+            approval = session.get(ApprovalRequest, approval_id)
+    finally:
+        restarted_engine.dispose()
+
+    assert scan.recovered_tasks == ()
+    assert len(scan.issues) == 1
+    assert scan.issues[0].code == ApprovalRecoveryErrorCode.WORKSPACE_NOT_FOUND
+    assert approval is not None
+    assert approval.status == "WAITING_APPROVAL"

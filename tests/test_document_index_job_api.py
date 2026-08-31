@@ -12,12 +12,15 @@ from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.database import Base, get_session
-from backend.app.main import app
+from backend.app.job_runner import JobTaskError
+from backend.app.main import _job_runtime_for_session, app
 from backend.app.models import (
     ChunkEmbeddingRecord,
     ChunkRecord,
     DocumentRecord,
     FileEntry,
+    JobAttemptRecord,
+    JobRecord,
 )
 
 
@@ -53,10 +56,14 @@ def _wait_for_job(
     client: TestClient,
     job_id: str,
     expected_status: str,
+    workspace_id: int,
 ) -> dict[str, object]:
     deadline = monotonic() + 2
     while monotonic() < deadline:
-        response = client.get(f"/api/v1/jobs/{job_id}")
+        response = client.get(
+            f"/api/v1/jobs/{job_id}",
+            params={"workspace_id": workspace_id},
+        )
         assert response.status_code == 200
         payload = response.json()
         if payload["status"] == expected_status:
@@ -88,7 +95,12 @@ def test_document_index_job_parses_chunks_and_persists(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
@@ -98,6 +110,7 @@ def test_document_index_job_parses_chunks_and_persists(
         client,
         index_response.json()["job_id"],
         "completed",
+        workspace_id,
     )
     assert index_job["error_code"] is None
 
@@ -146,7 +159,12 @@ def test_document_index_job_supports_txt(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
@@ -156,6 +174,7 @@ def test_document_index_job_supports_txt(
         client,
         index_response.json()["job_id"],
         "completed",
+        workspace_id,
     )
     assert index_job["error_code"] is None
 
@@ -193,7 +212,12 @@ def test_document_index_job_supports_pdf(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
@@ -203,6 +227,7 @@ def test_document_index_job_supports_pdf(
         client,
         index_response.json()["job_id"],
         "completed",
+        workspace_id,
     )
     assert index_job["error_code"] is None
 
@@ -244,13 +269,23 @@ def test_document_index_job_rejects_malformed_pdf(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
     )
     assert index_response.status_code == 202
-    failed = _wait_for_job(client, index_response.json()["job_id"], "failed")
+    failed = _wait_for_job(
+        client,
+        index_response.json()["job_id"],
+        "failed",
+        workspace_id,
+    )
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
@@ -286,7 +321,12 @@ def test_document_index_job_supports_docx(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
@@ -296,6 +336,7 @@ def test_document_index_job_supports_docx(
         client,
         index_response.json()["job_id"],
         "completed",
+        workspace_id,
     )
     assert index_job["error_code"] is None
 
@@ -336,13 +377,23 @@ def test_document_index_job_rejects_malformed_docx(
         f"/api/v1/workspaces/{workspace_id}/scan",
     )
     assert scan_response.status_code == 202
-    _wait_for_job(client, scan_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        scan_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     index_response = client.post(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
     )
     assert index_response.status_code == 202
-    failed = _wait_for_job(client, index_response.json()["job_id"], "failed")
+    failed = _wait_for_job(
+        client,
+        index_response.json()["job_id"],
+        "failed",
+        workspace_id,
+    )
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
@@ -387,7 +438,12 @@ def test_document_index_job_failure_rolls_back_partial_index(
         f"/api/v1/workspaces/{workspace_id}/documents/index",
     )
     assert response.status_code == 202
-    failed = _wait_for_job(client, response.json()["job_id"], "failed")
+    failed = _wait_for_job(
+        client,
+        response.json()["job_id"],
+        "failed",
+        workspace_id,
+    )
     assert failed["error_code"] == "document_index_failed"
 
     with Session(engine) as session:
@@ -421,7 +477,12 @@ def test_knowledge_index_endpoint_creates_background_job(
     )
 
     assert response.status_code == 202
-    job = _wait_for_job(client, response.json()["job_id"], "completed")
+    job = _wait_for_job(
+        client,
+        response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
     assert job["error_code"] is None
 
 
@@ -743,3 +804,205 @@ def test_knowledge_document_delete_rejects_unknown_document(
 
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "document_not_found"
+
+
+def test_scan_job_reuses_one_job_and_attempt_for_the_same_idempotency_key(
+    document_index_client: tuple[TestClient, Engine],
+    tmp_path: Path,
+) -> None:
+    client, engine = document_index_client
+    workspace_root = tmp_path / "idempotent-scan-workspace"
+    workspace_root.mkdir()
+    workspace_id = client.post(
+        "/api/v1/workspaces",
+        json={
+            "name": "幂等扫描测试",
+            "root_path": str(workspace_root),
+        },
+    ).json()["id"]
+    headers = {"Idempotency-Key": "scan-retry-001"}
+
+    first = client.post(
+        f"/api/v1/workspaces/{workspace_id}/scan",
+        headers=headers,
+    )
+    second = client.post(
+        f"/api/v1/workspaces/{workspace_id}/scan",
+        headers=headers,
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["job_id"] == first.json()["job_id"]
+    _wait_for_job(
+        client,
+        first.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
+
+    with Session(engine) as session:
+        jobs = session.scalars(
+            select(JobRecord).where(
+                JobRecord.idempotency_key == "scan-retry-001"
+            )
+        ).all()
+        attempts = session.scalars(
+            select(JobAttemptRecord).where(
+                JobAttemptRecord.job_id == first.json()["job_id"]
+            )
+        ).all()
+
+    assert len(jobs) == 1
+    assert len(attempts) == 1
+
+
+def test_scan_job_rejects_reusing_a_key_for_another_workspace(
+    document_index_client: tuple[TestClient, Engine],
+    tmp_path: Path,
+) -> None:
+    client, _engine = document_index_client
+    first_root = tmp_path / "first-idempotency-workspace"
+    second_root = tmp_path / "second-idempotency-workspace"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_id = client.post(
+        "/api/v1/workspaces",
+        json={"name": "幂等工作区一", "root_path": str(first_root)},
+    ).json()["id"]
+    second_id = client.post(
+        "/api/v1/workspaces",
+        json={"name": "幂等工作区二", "root_path": str(second_root)},
+    ).json()["id"]
+    headers = {"Idempotency-Key": "same-key-different-workspace"}
+
+    first = client.post(
+        f"/api/v1/workspaces/{first_id}/scan",
+        headers=headers,
+    )
+    conflict = client.post(
+        f"/api/v1/workspaces/{second_id}/scan",
+        headers=headers,
+    )
+
+    assert first.status_code == 202
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "job_identity_conflict"
+
+
+def test_job_detail_and_list_are_workspace_scoped(
+    document_index_client: tuple[TestClient, Engine],
+    tmp_path: Path,
+) -> None:
+    client, _engine = document_index_client
+    first_root = tmp_path / "job-detail-first"
+    second_root = tmp_path / "job-detail-second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_id = client.post(
+        "/api/v1/workspaces",
+        json={"name": "Job 详情一", "root_path": str(first_root)},
+    ).json()["id"]
+    second_id = client.post(
+        "/api/v1/workspaces",
+        json={"name": "Job 详情二", "root_path": str(second_root)},
+    ).json()["id"]
+
+    submitted = client.post(
+        f"/api/v1/workspaces/{first_id}/scan",
+        headers={"Idempotency-Key": "job-detail-scoped"},
+    )
+    job_id = submitted.json()["job_id"]
+    detail = _wait_for_job(client, job_id, "completed", first_id)
+
+    assert detail["workspace_id"] == first_id
+    assert detail["task_version"] == "v1"
+    assert detail["attempts"][0]["phase_code"] == "starting"
+    assert client.get(
+        f"/api/v1/jobs/{job_id}",
+        params={"workspace_id": second_id},
+    ).status_code == 404
+
+    first_jobs = client.get(
+        "/api/v1/jobs",
+        params={"workspace_id": first_id},
+    )
+    second_jobs = client.get(
+        "/api/v1/jobs",
+        params={"workspace_id": second_id},
+    )
+    assert first_jobs.status_code == 200
+    assert [item["job_id"] for item in first_jobs.json()] == [job_id]
+    assert second_jobs.status_code == 200
+    assert second_jobs.json() == []
+
+    cancel = client.post(
+        f"/api/v1/jobs/{job_id}/cancel",
+        params={"workspace_id": first_id},
+    )
+    assert cancel.status_code == 409
+    assert cancel.json()["detail"]["code"] == "job_cancel_not_allowed"
+
+
+def test_job_retry_endpoint_appends_a_new_attempt_without_stack_trace(
+    document_index_client: tuple[TestClient, Engine],
+    tmp_path: Path,
+) -> None:
+    client, engine = document_index_client
+    workspace_root = tmp_path / "retry-job-workspace"
+    workspace_root.mkdir()
+    workspace_id = client.post(
+        "/api/v1/workspaces",
+        json={"name": "Job 重试测试", "root_path": str(workspace_root)},
+    ).json()["id"]
+
+    calls = 0
+
+    def flaky_task(_context) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise JobTaskError("temporary_failure", retryable=True)
+
+    with Session(engine) as session:
+        runtime = _job_runtime_for_session(session)
+        submitted = runtime.runner.submit(
+            kind="workspace_scan",
+            workspace_id=workspace_id,
+            idempotency_key="retry-api-job",
+            task=flaky_task,
+            max_attempts=2,
+        )
+
+    failed = _wait_for_job(
+        client,
+        str(submitted.job_id),
+        "failed",
+        workspace_id,
+    )
+    assert failed["attempts"][0]["retryable"] is True
+
+    retry = client.post(
+        f"/api/v1/jobs/{submitted.job_id}/retry",
+        params={"workspace_id": workspace_id},
+    )
+    assert retry.status_code == 200
+    completed = _wait_for_job(
+        client,
+        str(submitted.job_id),
+        "completed",
+        workspace_id,
+    )
+    assert [attempt["status"] for attempt in completed["attempts"]] == [
+        "failed",
+        "succeeded",
+    ]
+    assert len(completed["attempts"]) == 2
+    assert "traceback" not in str(completed).lower()
+
+    repeated_retry = client.post(
+        f"/api/v1/jobs/{submitted.job_id}/retry",
+        params={"workspace_id": workspace_id},
+    )
+    assert repeated_retry.status_code == 409
+    assert repeated_retry.json()["detail"]["code"] == "job_retry_not_allowed"

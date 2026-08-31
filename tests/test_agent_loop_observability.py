@@ -23,7 +23,14 @@ from backend.app.model_client import (
     ModelTokenUsage,
     ModelToolCall,
 )
-from backend.app.models import AgentRun, AgentToolCall
+from backend.app.models import (
+    AgentMessage,
+    AgentMetric,
+    AgentModelRun,
+    AgentRun,
+    AgentStep,
+    AgentToolCall,
+)
 from backend.app.tool_contracts import Tool, ToolResult
 from backend.app.tool_registry import ToolRegistry
 
@@ -412,6 +419,123 @@ def test_agent_loop_records_unknown_tool_as_safe_rejection(
         engine.dispose()
 
 
+def test_agent_loop_persists_complete_lifecycle_graph_with_safe_summaries(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'complete-lifecycle-graph.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+    sensitive_prompt = "private prompt must not be in lifecycle summaries"
+    sensitive_keyword = "private keyword must not be in lifecycle summaries"
+
+    def handle(arguments: BaseModel) -> ToolResult:
+        parsed = SearchArguments.model_validate(arguments)
+        assert parsed.keyword == sensitive_keyword
+        return ToolResult.success({"items": [{"relative_path": "report.txt"}]})
+
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            loop = AgentLoop(
+                model_client=FakeModelClient(
+                    [
+                        _tool_response(
+                            ModelToolCall(
+                                id="call_lifecycle_1",
+                                name="search_files",
+                                arguments={
+                                    "workspace_id": 1,
+                                    "keyword": sensitive_keyword,
+                                },
+                            ),
+                            content="private assistant text",
+                            model_provider="fake",
+                            model_name="deterministic-model",
+                            metrics=ModelCallMetrics(
+                                latency_ms=4.0,
+                                requested_max_output_tokens=128,
+                            ),
+                        ),
+                        _final_response(
+                            content="private final answer",
+                            model_provider="fake",
+                            model_name="deterministic-model",
+                            metrics=ModelCallMetrics(
+                                latency_ms=5.0,
+                                requested_max_output_tokens=128,
+                            ),
+                        ),
+                    ]
+                ),
+                tool_registry=_registry(handle),
+                recorder=SqlAlchemyAgentRunRecorder(session),
+                prompt_version="agent-system-v1",
+            )
+
+            result = loop.run(
+                [ModelMessage(role="user", content=sensitive_prompt)]
+            )
+
+            saved_run = session.scalar(select(AgentRun))
+            assert result.status == "completed"
+            assert saved_run is not None
+            assert len(saved_run.sessions) == 1
+            saved_session = saved_run.sessions[0]
+            saved_steps = list(
+                session.scalars(
+                    select(AgentStep)
+                    .where(AgentStep.agent_session_id == saved_session.id)
+                    .order_by(AgentStep.step_index)
+                )
+            )
+            saved_messages = list(
+                session.scalars(
+                    select(AgentMessage)
+                    .join(AgentStep)
+                    .where(AgentStep.agent_session_id == saved_session.id)
+                    .order_by(AgentMessage.id)
+                )
+            )
+            saved_model_runs = list(session.scalars(select(AgentModelRun)))
+            saved_metrics = list(session.scalars(select(AgentMetric)))
+            saved_tool_calls = list(session.scalars(select(AgentToolCall)))
+
+            assert [step.step_index for step in saved_steps] == [0, 1]
+            assert [step.status for step in saved_steps] == [
+                "completed",
+                "completed",
+            ]
+            assert [message.message_type for message in saved_messages] == [
+                "user",
+                "assistant",
+                "tool_call",
+                "tool_result",
+                "tool_result",
+                "assistant",
+            ]
+            assert len(saved_model_runs) == 2
+            assert {metric.metric_name for metric in saved_metrics} >= {
+                "model_turn",
+                "latency_ms",
+            }
+            assert len(saved_tool_calls) == 1
+            assert saved_tool_calls[0].agent_step_id == saved_steps[0].id
+            lifecycle_payload = repr(
+                [
+                    step.input
+                    for step in saved_steps
+                ]
+                + [step.output_summary for step in saved_steps]
+                + [message.payload_json for message in saved_messages]
+            )
+            assert sensitive_prompt not in lifecycle_payload
+            assert sensitive_keyword not in lifecycle_payload
+            assert "private assistant text" not in lifecycle_payload
+            assert "private final answer" not in lifecycle_payload
+    finally:
+        engine.dispose()
+
+
 def test_agent_loop_records_tool_execution_failure(tmp_path: Path) -> None:
     engine = create_engine(
         f"sqlite:///{(tmp_path / 'tool-failure-trace.db').as_posix()}"
@@ -560,6 +684,54 @@ def test_agent_loop_does_not_execute_tool_when_requested_record_fails() -> None:
         ),
         tool_registry=_registry(handle),
         recorder=FailingRecorder(),
+    )
+
+    with pytest.raises(
+        AgentObservabilityError,
+        match="Agent 可观察记录写入失败",
+    ):
+        loop.run([ModelMessage(role="user", content="查询")])
+
+    assert handler_calls == []
+
+
+def test_agent_loop_does_not_call_model_tool_after_step_message_write_fails() -> None:
+    handler_calls: list[bool] = []
+
+    def handle(_: BaseModel) -> ToolResult:
+        handler_calls.append(True)
+        return ToolResult.success()
+
+    class FailingLifecycleRecorder:
+        def start_run(self) -> int:
+            return 1
+
+        def start_step(self, **_: object) -> int:
+            return 1
+
+        def next_message_sequence(self, **_: object) -> int:
+            return 0
+
+        def record_model_message(self, **_: object) -> None:
+            raise AgentObservabilityError("Agent 可观察记录写入失败")
+
+        def record_model_run(self, **_: object) -> int:
+            raise AssertionError("assistant message must be recorded first")
+
+    loop = AgentLoop(
+        model_client=FakeModelClient(
+            [
+                _tool_response(
+                    ModelToolCall(
+                        id="call_fail_lifecycle_1",
+                        name="search_files",
+                        arguments={"workspace_id": 1, "keyword": "report"},
+                    )
+                )
+            ]
+        ),
+        tool_registry=_registry(handle),
+        recorder=FailingLifecycleRecorder(),
     )
 
     with pytest.raises(

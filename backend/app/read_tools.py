@@ -15,6 +15,7 @@ from pydantic import (
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .document_contracts import DocumentPosition, RetrievedChunk
 from .models import ChunkRecord, DocumentRecord, FileEntry
 from .path_policy import PathPolicyError
 from .services import (
@@ -24,6 +25,11 @@ from .services import (
     get_workspace as get_workspace_service,
     list_workspaces as list_workspaces_service,
     search_files as search_files_service,
+)
+from .retrieval_context import (
+    RetrievalContextError,
+    build_retrieval_context_from_records,
+    retrieval_chunk_to_mapping,
 )
 from .tool_contracts import Tool, ToolResult
 
@@ -157,9 +163,11 @@ class KnowledgeSearchToolItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     file_id: int = Field(ge=1)
+    workspace_id: int = Field(ge=1)
     name: str = Field(min_length=1)
     chunk_id: str = Field(min_length=1)
     document_id: str = Field(min_length=1)
+    citation_id: str = Field(min_length=1)
     source_relative_path: str = Field(min_length=1)
     chunk_index: int = Field(ge=0)
     text: str = Field(min_length=1)
@@ -169,6 +177,10 @@ class KnowledgeSearchToolItem(BaseModel):
     end_line: int = Field(ge=1)
     page_start: int | None = Field(default=None, ge=1)
     page_end: int | None = Field(default=None, ge=1)
+    source_version: str | None = None
+    source_updated_at: AwareDatetime | None = None
+    indexed_at: AwareDatetime | None = None
+    source_positions: tuple[DocumentPosition, ...] = ()
     score: int = Field(ge=1)
 
     @model_validator(mode="after")
@@ -194,6 +206,8 @@ class KnowledgeSearchData(BaseModel):
     total: int = Field(ge=0)
     top_k: int = Field(ge=1, le=10)
     has_more: bool
+    retrieved_at: AwareDatetime
+    snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class GetFileMetadataArguments(BaseModel):
@@ -293,7 +307,7 @@ def build_knowledge_search_tool(session: Session) -> Tool:
                 )
 
             statement = (
-                select(ChunkRecord)
+                select(ChunkRecord, DocumentRecord)
                 .join(
                     FileEntry,
                     FileEntry.id == ChunkRecord.file_entry_id,
@@ -321,11 +335,13 @@ def build_knowledge_search_tool(session: Session) -> Tool:
                     ChunkRecord.chunk_id.asc(),
                 )
             )
-            chunks = list(session.scalars(statement).all())
+            rows = list(session.execute(statement).all())
 
         normalized_query = options.query.casefold()
-        ranked_chunks: list[tuple[int, str, int, str, ChunkRecord]] = []
-        for chunk in chunks:
+        ranked_chunks: list[
+            tuple[int, str, int, str, ChunkRecord, DocumentRecord]
+        ] = []
+        for chunk, document in rows:
             score = chunk.text.casefold().count(normalized_query)
             if score > 0:
                 ranked_chunks.append(
@@ -335,36 +351,42 @@ def build_knowledge_search_tool(session: Session) -> Tool:
                         chunk.chunk_index,
                         chunk.chunk_id,
                         chunk,
+                        document,
                     )
                 )
 
         ranked_chunks.sort(key=lambda item: item[:4])
+        selected = ranked_chunks[: options.top_k]
+        try:
+            retrieval_context = build_retrieval_context_from_records(
+                workspace_id=options.workspace_id,
+                query=options.query,
+                rows=[
+                    (chunk, document, -negative_score)
+                    for negative_score, _, _, _, chunk, document in selected
+                ],
+                total=len(ranked_chunks),
+                top_k=options.top_k,
+                has_more=len(ranked_chunks) > options.top_k,
+            )
+        except RetrievalContextError:
+            return ToolResult.failure(
+                code="invalid_retrieval_provenance",
+                message="检索结果来源证据无效",
+                details={"workspace_id": options.workspace_id},
+            )
+
         data = KnowledgeSearchData(
             query=options.query,
             items=[
-                KnowledgeSearchToolItem(
-                    file_id=chunk.file_entry_id,
-                    name=PurePosixPath(chunk.source_relative_path).name,
-                    chunk_id=chunk.chunk_id,
-                    document_id=chunk.document_id,
-                    source_relative_path=chunk.source_relative_path,
-                    chunk_index=chunk.chunk_index,
-                    text=chunk.text,
-                    start_offset=chunk.start_offset,
-                    end_offset=chunk.end_offset,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                    score=-negative_score,
-                )
-                for negative_score, _, _, _, chunk in ranked_chunks[
-                    : options.top_k
-                ]
+                _knowledge_search_tool_item(chunk)
+                for chunk in retrieval_context.chunks
             ],
             total=len(ranked_chunks),
             top_k=options.top_k,
             has_more=len(ranked_chunks) > options.top_k,
+            retrieved_at=retrieval_context.retrieved_at,
+            snapshot_hash=retrieval_context.snapshot_hash,
         )
         return ToolResult.success(data.model_dump(mode="json"))
 
@@ -449,3 +471,13 @@ def _file_tool_item(file_entry: FileEntry) -> SearchFileToolItem:
         size_bytes=file_entry.size_bytes,
         modified_at=modified_at,
     )
+
+
+def _knowledge_search_tool_item(
+    chunk: RetrievedChunk,
+) -> KnowledgeSearchToolItem:
+    """仅从已验证的 RetrievalContext 投影知识工具结果。"""
+
+    data = retrieval_chunk_to_mapping(chunk)
+    data["name"] = PurePosixPath(chunk.source_relative_path).name
+    return KnowledgeSearchToolItem.model_validate(data)

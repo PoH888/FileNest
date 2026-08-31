@@ -1,6 +1,7 @@
+import hashlib
 import json
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -18,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.engine.default import DefaultExecutionContext
 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 # Mapped 用来标记：这个类属性不是普通属性，而是需要映射到数据库字段的 ORM 属性。
@@ -156,6 +158,10 @@ class DocumentRecord(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    indexed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     ingest_error: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -190,6 +196,7 @@ class DocumentRecord(Base):
             normalized_text=document.normalized_text,
             source_version=document.source_version,
             source_updated_at=document.source_updated_at,
+            indexed_at=datetime.now(timezone.utc),
         )
         record.pages = [
             DocumentPageRecord.from_contract(
@@ -611,6 +618,7 @@ class AgentSession(Base):
         server_default=func.current_timestamp(),
         onupdate=func.current_timestamp(),
     )
+
     runs: Mapped[list["AgentRun"]] = relationship(
         "AgentRun",
         secondary=agent_run_sessions,
@@ -627,6 +635,29 @@ class AgentSession(Base):
         back_populates="agent_session",
         order_by="AgentMetric.created_at",
     )
+
+
+def _default_job_payload(context: DefaultExecutionContext) -> str:
+    """兼容旧 ORM 写入，同时只从同一行的 workspace_id 生成参数。"""
+
+    workspace_id = context.get_current_parameters().get("workspace_id")
+    if isinstance(workspace_id, bool) or not isinstance(workspace_id, int):
+        raise ValueError("JobRecord workspace_id is required for its payload")
+    return json.dumps(
+        {"workspace_id": workspace_id},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _default_job_payload_hash(context: DefaultExecutionContext) -> str:
+    """让旧的 ORM 直接写入也能产生与 payload 对应的摘要。"""
+
+    payload_json = context.get_current_parameters().get("payload_json")
+    if not isinstance(payload_json, str):
+        payload_json = _default_job_payload(context)
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
 
 class AgentStep(Base):
@@ -1568,6 +1599,19 @@ class JobRecord(Base):
             name="ck_background_jobs_schema_version",
         ),
         CheckConstraint(
+            "length(task_version) BETWEEN 1 AND 32 "
+            "AND task_version = trim(task_version)",
+            name="ck_background_jobs_task_version",
+        ),
+        CheckConstraint(
+            "length(payload_json) > 0",
+            name="ck_background_jobs_payload_json",
+        ),
+        CheckConstraint(
+            "length(payload_hash) = 64 AND payload_hash = lower(payload_hash)",
+            name="ck_background_jobs_payload_hash",
+        ),
+        CheckConstraint(
             "kind IN ('workspace_scan', 'document_index')",
             name="ck_background_jobs_kind",
         ),
@@ -1615,10 +1659,26 @@ class JobRecord(Base):
         server_default="1",
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    task_version: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="v1",
+        server_default="v1",
+    )
     workspace_id: Mapped[int] = mapped_column(
         ForeignKey("workspaces.id"),
         nullable=False,
         index=True,
+    )
+    payload_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default=_default_job_payload,
+    )
+    payload_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default=_default_job_payload_hash,
     )
     idempotency_key: Mapped[str] = mapped_column(
         String(128),

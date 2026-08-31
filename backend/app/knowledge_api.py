@@ -5,12 +5,17 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .database import get_session
+from .document_contracts import DocumentPosition
 from .models import ChunkEmbeddingRecord, ChunkRecord, DocumentRecord, FileEntry
+from .retrieval_context import (
+    RetrievalContextError,
+    build_retrieval_context_from_records,
+)
 from .services import get_workspace as get_workspace_service
 
 
@@ -83,6 +88,10 @@ class KnowledgeSearchChunk(BaseModel):
     document_id: UUID
     text: str
     chunk_index: int
+    citation_id: str
+    source_version: str | None = None
+    source_updated_at: AwareDatetime | None = None
+    indexed_at: AwareDatetime | None = None
 
 
 class KnowledgeSearchDocument(BaseModel):
@@ -107,13 +116,18 @@ class KnowledgeSearchProvenance(BaseModel):
 
     chunk_id: str
     document_id: UUID
+    citation_id: str
     source_relative_path: str
+    source_version: str | None = None
+    source_updated_at: AwareDatetime | None = None
+    indexed_at: AwareDatetime | None = None
     start_offset: int
     end_offset: int
     start_line: int
     end_line: int
     page_start: int | None = None
     page_end: int | None = None
+    source_positions: tuple[DocumentPosition, ...] = ()
 
 
 class KnowledgeSearchResponse(BaseModel):
@@ -127,6 +141,8 @@ class KnowledgeSearchResponse(BaseModel):
     documents: list[KnowledgeSearchDocument]
     relevance: list[KnowledgeSearchRelevance]
     provenance: list[KnowledgeSearchProvenance]
+    retrieved_at: AwareDatetime
+    snapshot_hash: str
 
 
 @router.get("/documents", response_model=list[KnowledgeDocumentListItem])
@@ -241,42 +257,77 @@ def search_knowledge(
     ranked.sort(key=lambda item: item[:4])
 
     selected = ranked[: request.top_k]
+    try:
+        retrieval_context = build_retrieval_context_from_records(
+            workspace_id=request.workspace_id,
+            query=request.query,
+            rows=[
+                (chunk, document, -negative_score)
+                for negative_score, _, _, _, chunk, document in selected
+            ],
+            total=len(ranked),
+            top_k=request.top_k,
+            has_more=len(ranked) > request.top_k,
+        )
+    except RetrievalContextError as error:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "invalid_retrieval_provenance",
+                "message": "检索结果来源证据无效。",
+            },
+        ) from error
+
     documents: dict[str, KnowledgeSearchDocument] = {}
+    selected_documents = {
+        document.document_id: document
+        for _, _, _, _, _, document in selected
+    }
     chunks: list[KnowledgeSearchChunk] = []
     relevance: list[KnowledgeSearchRelevance] = []
     provenance: list[KnowledgeSearchProvenance] = []
-    for negative_score, _, _, _, chunk, document in selected:
+    for chunk in retrieval_context.chunks:
+        document = selected_documents[chunk.document_id]
         chunks.append(
             KnowledgeSearchChunk(
                 chunk_id=chunk.chunk_id,
-                document_id=document.document_id,
+                document_id=UUID(chunk.document_id),
                 text=chunk.text,
                 chunk_index=chunk.chunk_index,
+                citation_id=chunk.citation_id,
+                source_version=chunk.source_version,
+                source_updated_at=chunk.source_updated_at,
+                indexed_at=chunk.indexed_at,
             )
         )
         relevance.append(
             KnowledgeSearchRelevance(
                 chunk_id=chunk.chunk_id,
-                score=-negative_score,
+                score=chunk.score,
             )
         )
         provenance.append(
             KnowledgeSearchProvenance(
                 chunk_id=chunk.chunk_id,
-                document_id=document.document_id,
+                document_id=UUID(chunk.document_id),
+                citation_id=chunk.citation_id,
                 source_relative_path=chunk.source_relative_path,
+                source_version=chunk.source_version,
+                source_updated_at=chunk.source_updated_at,
+                indexed_at=chunk.indexed_at,
                 start_offset=chunk.start_offset,
                 end_offset=chunk.end_offset,
                 start_line=chunk.start_line,
                 end_line=chunk.end_line,
                 page_start=chunk.page_start,
                 page_end=chunk.page_end,
+                source_positions=chunk.source_positions,
             )
         )
         documents.setdefault(
-            document.document_id,
+            str(document.document_id),
             KnowledgeSearchDocument(
-                document_id=document.document_id,
+                document_id=UUID(str(document.document_id)),
                 workspace_id=document.workspace_id,
                 source_relative_path=document.source_relative_path,
                 source_format=document.source_format,
@@ -293,6 +344,8 @@ def search_knowledge(
         documents=list(documents.values()),
         relevance=relevance,
         provenance=provenance,
+        retrieved_at=retrieval_context.retrieved_at,
+        snapshot_hash=retrieval_context.snapshot_hash,
     )
 
 

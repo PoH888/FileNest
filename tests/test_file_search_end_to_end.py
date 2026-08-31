@@ -42,10 +42,14 @@ def _wait_for_job(
     client: TestClient,
     job_id: str,
     expected_status: str,
+    workspace_id: int,
 ) -> dict[str, object]:
     deadline = monotonic() + 2
     while monotonic() < deadline:
-        response = client.get(f"/api/v1/jobs/{job_id}")
+        response = client.get(
+            f"/api/v1/jobs/{job_id}",
+            params={"workspace_id": workspace_id},
+        )
         assert response.status_code == 200
         payload = response.json()
         if payload["status"] == expected_status:
@@ -85,6 +89,7 @@ def test_create_scan_search_and_read_file_detail(
         client,
         scan_response.json()["job_id"],
         "completed",
+        workspace_id,
     )
     assert scan_job["error_code"] is None
 

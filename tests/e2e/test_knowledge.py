@@ -46,10 +46,14 @@ def _wait_for_job(
     client: TestClient,
     job_id: str,
     expected_status: str,
+    workspace_id: int,
 ) -> dict[str, object]:
     deadline = monotonic() + 5
     while monotonic() < deadline:
-        response = client.get(f"/api/v1/jobs/{job_id}")
+        response = client.get(
+            f"/api/v1/jobs/{job_id}",
+            params={"workspace_id": workspace_id},
+        )
         assert response.status_code == 200
         payload = response.json()
         if payload["status"] == expected_status:
@@ -177,6 +181,7 @@ def test_four_document_formats_index_retrieve_answer_with_citations(
         client,
         scan_response.json()["job_id"],
         "completed",
+        workspace_id,
     )["error_code"] is None
 
     index_response = client.post(
@@ -188,6 +193,7 @@ def test_four_document_formats_index_retrieve_answer_with_citations(
         client,
         index_response.json()["job_id"],
         "completed",
+        workspace_id,
     )["error_code"] is None
 
     documents_response = client.get(

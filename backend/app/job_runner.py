@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -11,7 +11,9 @@ from threading import Event, RLock
 from uuid import UUID, uuid4
 
 from .job_store import (
+    JobStoreAttemptConflictError,
     JobStoreIdentityConflictError,
+    JobStoreRevisionConflictError,
     SqlAlchemyJobStore,
 )
 from .job_system import (
@@ -19,13 +21,20 @@ from .job_system import (
     JobEventKind,
     JobKind,
     JobState,
+    JobTaskPayload,
+    JobTaskVersion,
+    TASK_VERSION_PATTERN,
+    JobTransitionError,
     transition_job,
 )
 
 
 JobTask = Callable[["JobContext"], None]
+JobHandler = Callable[["JobContext", JobTaskPayload], None]
 JobClock = Callable[[], datetime]
+JobRecoveryValidator = Callable[[JobState], bool]
 _ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
+_TASK_VERSION_PATTERN = re.compile(TASK_VERSION_PATTERN)
 
 
 class JobRunnerClosedError(RuntimeError):
@@ -53,6 +62,65 @@ class JobTaskError(Exception):
         super().__init__(error_code)
         self.error_code = error_code
         self.retryable = retryable
+
+
+class JobActionConflictError(ValueError):
+    """取消或重试与当前 Job 终态/能力不兼容。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class JobHandlerUnavailableError(LookupError):
+    """任务描述没有对应的显式版本化 Handler。"""
+
+
+class JobHandlerRegistry:
+    """有限的 kind/version 到可重建 Handler 映射。"""
+
+    def __init__(
+        self,
+        handlers: Mapping[tuple[JobKind, JobTaskVersion], JobHandler]
+        | None = None,
+    ) -> None:
+        self._handlers: dict[tuple[JobKind, JobTaskVersion], JobHandler] = {}
+        for (kind, task_version), handler in (handlers or {}).items():
+            self.register(
+                kind=kind,
+                task_version=task_version,
+                handler=handler,
+            )
+
+    def register(
+        self,
+        *,
+        kind: JobKind,
+        task_version: JobTaskVersion,
+        handler: JobHandler,
+    ) -> None:
+        """注册一个明确的任务版本；不允许模糊 fallback。"""
+
+        if kind not in {"workspace_scan", "document_index"}:
+            raise ValueError("unsupported Job kind")
+        if not _TASK_VERSION_PATTERN.fullmatch(task_version):
+            raise ValueError("invalid task version")
+        if not callable(handler):
+            raise TypeError("handler must be callable")
+        self._handlers[(kind, task_version)] = handler
+
+    def resolve(
+        self,
+        *,
+        kind: JobKind,
+        task_version: JobTaskVersion,
+    ) -> JobHandler:
+        try:
+            return self._handlers[(kind, task_version)]
+        except KeyError as error:
+            raise JobHandlerUnavailableError(
+                f"no handler for {kind}:{task_version}"
+            ) from error
 
 
 @dataclass
@@ -106,9 +174,11 @@ class SingleProcessJobRunner:
         *,
         clock: JobClock | None = None,
         store: SqlAlchemyJobStore | None = None,
+        handler_registry: JobHandlerRegistry | None = None,
     ) -> None:
         self._clock = clock or _utc_now
         self._store = store
+        self._handler_registry = handler_registry
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="filenest-job",
@@ -124,20 +194,33 @@ class SingleProcessJobRunner:
         kind: JobKind,
         workspace_id: int,
         idempotency_key: str,
-        task: JobTask,
+        task: JobTask | None = None,
+        payload: JobTaskPayload | Mapping[str, object] | None = None,
+        task_version: JobTaskVersion = "v1",
         max_attempts: int = 1,
     ) -> JobState:
         """登记并异步提交一个 Job；重复逻辑提交返回原 Job。"""
 
-        if not callable(task):
+        if task is not None and not callable(task):
             raise TypeError("task must be callable")
+        task_payload = (
+            payload
+            if isinstance(payload, JobTaskPayload)
+            else JobTaskPayload.model_validate(
+                payload
+                if payload is not None
+                else {"workspace_id": workspace_id}
+            )
+        )
 
         with self._lock:
             self._ensure_open()
             candidate = JobState(
                 job_id=uuid4(),
                 kind=kind,
+                task_version=task_version,
                 workspace_id=workspace_id,
+                payload=task_payload,
                 idempotency_key=idempotency_key,
                 max_attempts=max_attempts,
                 created_at=self._clock(),
@@ -148,6 +231,8 @@ class SingleProcessJobRunner:
                 if (
                     existing.kind != candidate.kind
                     or existing.workspace_id != candidate.workspace_id
+                    or existing.task_version != candidate.task_version
+                    or existing.payload != candidate.payload
                 ):
                     raise JobIdentityConflictError(
                         "idempotency_key is bound to another job identity"
@@ -166,7 +251,8 @@ class SingleProcessJobRunner:
                 if state.status != "pending":
                     return state
 
-            record = _JobRecord(state=state, task=task)
+            runtime_task = self._resolve_task(task, state)
+            record = _JobRecord(state=state, task=runtime_task)
             self._jobs[state.job_id] = record
             self._idempotency_index[state.idempotency_key] = state.job_id
             try:
@@ -190,16 +276,78 @@ class SingleProcessJobRunner:
                     return state
             raise JobNotFoundError(job_id)
 
+    def list_jobs(
+        self,
+        *,
+        workspace_id: int,
+        kind: JobKind | None = None,
+        status: str | None = None,
+    ) -> list[JobState]:
+        """按 workspace 读取 Job；持久化 Runner 以 Store 为准。"""
+
+        with self._lock:
+            if self._store is not None:
+                return self._store.list_jobs(
+                    workspace_id=workspace_id,
+                    kind=kind,
+                    status=status,  # type: ignore[arg-type]
+                )
+            return sorted(
+                (
+                    record.state
+                    for record in self._jobs.values()
+                    if record.state.workspace_id == workspace_id
+                    and (kind is None or record.state.kind == kind)
+                    and (status is None or record.state.status == status)
+                ),
+                key=lambda state: (state.created_at, str(state.job_id)),
+                reverse=True,
+            )
+
     def cancel(self, job_id: UUID) -> JobState:
         """发出取消请求；运行中的任务必须自行观察并停止。"""
 
         with self._lock:
-            record = self._get_record(job_id)
-            state = self._apply_event(
-                record,
-                "cancellation_requested",
-            )
+            record = self._get_action_record(job_id)
+            if record.state.status in {"succeeded", "failed", "cancelled"}:
+                raise JobActionConflictError("job_cancel_not_allowed")
+            if record.state.status == "cancel_requested":
+                return record.state
+            try:
+                state = self._apply_event(
+                    record,
+                    "cancellation_requested",
+                )
+            except (
+                JobStoreAttemptConflictError,
+                JobStoreRevisionConflictError,
+                JobTransitionError,
+            ) as error:
+                raise JobActionConflictError("job_state_changed") from error
             record.cancel_event.set()
+            return state
+
+    def retry(self, job_id: UUID) -> JobState:
+        """为可重试失败 Job 创建新的 Attempt，不覆盖旧历史。"""
+
+        with self._lock:
+            record = self._get_action_record(job_id)
+            latest_attempt = record.state.attempts[-1] if record.state.attempts else None
+            if (
+                record.state.status != "failed"
+                or latest_attempt is None
+                or not latest_attempt.retryable
+                or len(record.state.attempts) >= record.state.max_attempts
+            ):
+                raise JobActionConflictError("job_retry_not_allowed")
+            try:
+                state = self._apply_event(record, "retry_requested")
+            except (
+                JobStoreAttemptConflictError,
+                JobStoreRevisionConflictError,
+            ) as error:
+                raise JobActionConflictError("job_state_changed") from error
+            self._schedule_record(record)
             return state
 
     def shutdown(self, *, wait: bool = True) -> None:
@@ -211,17 +359,99 @@ class SingleProcessJobRunner:
             self._closed = True
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
 
+    def recover_persisted_jobs(
+        self,
+        *,
+        can_run: JobRecoveryValidator | None = None,
+    ) -> tuple[JobState, ...]:
+        """扫描并以 CAS 收敛或重新排队上次进程留下的 Job。"""
+
+        if self._store is None:
+            return ()
+
+        with self._lock:
+            self._ensure_open()
+            recovered: list[JobState] = []
+            for initial_state in self._store.list_unfinished():
+                if initial_state.job_id in self._jobs:
+                    continue
+
+                state = initial_state
+                if state.status == "cancel_requested":
+                    try:
+                        state = self._apply_event_to_state(
+                            state,
+                            "attempt_cancelled",
+                            attempt_id=state.attempts[-1].attempt_id,
+                        )
+                    except (
+                        JobStoreAttemptConflictError,
+                        JobStoreRevisionConflictError,
+                    ):
+                        latest = self._store.get(state.job_id)
+                        state = latest if latest is not None else state
+                    if state is not None:
+                        recovered.append(state)
+                    continue
+
+                can_requeue = True
+                if can_run is not None:
+                    try:
+                        can_requeue = can_run(state)
+                    except Exception:
+                        can_requeue = False
+                if not can_requeue:
+                    try:
+                        state = self._fail_recovery(state)
+                    except (
+                        JobStoreAttemptConflictError,
+                        JobStoreRevisionConflictError,
+                    ):
+                        latest = self._store.get(state.job_id)
+                        state = latest if latest is not None else state
+                    if state is not None:
+                        recovered.append(state)
+                    continue
+
+                try:
+                    state = self._recover_persisted_state(state)
+                except (
+                    JobStoreAttemptConflictError,
+                    JobStoreRevisionConflictError,
+                ):
+                    latest = self._store.get(state.job_id)
+                    if latest is None or latest.status == "running":
+                        if latest is not None:
+                            recovered.append(latest)
+                        continue
+                    state = latest
+
+                if state.status == "pending":
+                    self._enqueue_persisted_state(state)
+                recovered.append(state)
+            return tuple(recovered)
+
     def _run(self, job_id: UUID) -> None:
         with self._lock:
             record = self._get_record(job_id)
             if record.state.status != "pending":
                 return
             attempt_id = uuid4()
-            self._apply_event(
-                record,
-                "attempt_started",
-                attempt_id=attempt_id,
-            )
+            try:
+                self._apply_event(
+                    record,
+                    "attempt_started",
+                    attempt_id=attempt_id,
+                )
+            except (
+                JobStoreAttemptConflictError,
+                JobStoreRevisionConflictError,
+            ):
+                if self._store is not None:
+                    latest = self._store.get(job_id)
+                    if latest is not None:
+                        record.state = latest
+                return
 
         context = JobContext(self, job_id, attempt_id)
         try:
@@ -368,6 +598,95 @@ class SingleProcessJobRunner:
             return self._apply_event_to_state(state, "retry_requested")
         return state
 
+    def _fail_recovery(self, state: JobState) -> JobState:
+        """在 workspace/Policy 失效时留下失败证据，不触发任务 Handler。"""
+
+        if state.status == "running":
+            return self._apply_event_to_state(
+                state,
+                "attempt_failed",
+                attempt_id=state.attempts[-1].attempt_id,
+                error_code="recovery_required",
+                retryable=False,
+            )
+
+        if state.status == "pending":
+            attempt_id = uuid4()
+            state = self._apply_event_to_state(
+                state,
+                "attempt_started",
+                attempt_id=attempt_id,
+            )
+            return self._apply_event_to_state(
+                state,
+                "attempt_failed",
+                attempt_id=attempt_id,
+                error_code="recovery_required",
+                retryable=False,
+            )
+
+        raise ValueError("only active Jobs can require recovery failure")
+
+    def _enqueue_persisted_state(self, state: JobState) -> None:
+        if state.status != "pending" or state.job_id in self._jobs:
+            return
+
+        record = _JobRecord(
+            state=state,
+            task=self._resolve_task(None, state),
+        )
+        self._jobs[state.job_id] = record
+        self._idempotency_index[state.idempotency_key] = state.job_id
+        self._schedule_record(record)
+
+    def _schedule_record(self, record: _JobRecord) -> None:
+        if record.state.status != "pending":
+            return
+        try:
+            self._executor.submit(self._run, record.state.job_id)
+        except BaseException:
+            if self._jobs.get(record.state.job_id) is record:
+                del self._jobs[record.state.job_id]
+                del self._idempotency_index[record.state.idempotency_key]
+            raise
+
+    def _get_action_record(self, job_id: UUID) -> _JobRecord:
+        record = self._jobs.get(job_id)
+        if record is not None:
+            return record
+        if self._store is None:
+            raise JobNotFoundError(job_id)
+        state = self._store.get(job_id)
+        if state is None:
+            raise JobNotFoundError(job_id)
+        record = _JobRecord(
+            state=state,
+            task=self._resolve_task(None, state),
+        )
+        self._jobs[state.job_id] = record
+        self._idempotency_index[state.idempotency_key] = state.job_id
+        return record
+
+    def _resolve_task(
+        self,
+        task: JobTask | None,
+        state: JobState,
+    ) -> JobTask:
+        """优先兼容旧直接调用；可重建任务必须经过注册表解析。"""
+
+        if task is not None:
+            return task
+        if self._handler_registry is None:
+            return _handler_unavailable_task
+        try:
+            handler = self._handler_registry.resolve(
+                kind=state.kind,
+                task_version=state.task_version,
+            )
+        except JobHandlerUnavailableError:
+            return _handler_unavailable_task
+        return _bound_handler_task(handler, state.payload)
+
     def _get_record(self, job_id: UUID) -> _JobRecord:
         try:
             return self._jobs[job_id]
@@ -381,3 +700,17 @@ class SingleProcessJobRunner:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _bound_handler_task(
+    handler: JobHandler,
+    payload: JobTaskPayload,
+) -> JobTask:
+    def run(context: JobContext) -> None:
+        handler(context, payload)
+
+    return run
+
+
+def _handler_unavailable_task(_context: JobContext) -> None:
+    raise JobTaskError("recovery_required", retryable=False)

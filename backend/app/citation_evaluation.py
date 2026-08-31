@@ -1,5 +1,7 @@
 """Citation 评测数据契约。"""
 
+from collections.abc import Mapping, Sequence
+import hashlib
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +13,13 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from .citation_runtime import (
+    CITATION_PARSER_VERSION,
+    CitationClaim,
+    bind_citations,
+)
+from .document_contracts import RetrievedChunk, RetrievalContext
 
 
 class CitationDatasetError(ValueError):
@@ -265,6 +274,271 @@ class CitationCorrectnessResult(BaseModel):
         if len(self.incorrect_fact_ids) != self.incorrect_facts:
             raise ValueError("incorrect fact id count must match incorrect facts")
         return self
+
+
+CitationObservationStatus = Literal["valid", "invalid_observation"]
+
+
+class CitationObservation(BaseModel):
+    """一次真实 Agent Run 的可审计 Citation 评测观察。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: int = Field(ge=1)
+    workspace_id: int = Field(ge=1)
+    workspace_fixture: str = Field(min_length=1)
+    request_text: str = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+    source_snapshot_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    parser_version: str = Field(min_length=1)
+    prompt_version: str | None = None
+    status: CitationObservationStatus
+    invalid_reasons: tuple[str, ...] = ()
+    sources: tuple[RetrievedChunk, ...] = ()
+    claims: tuple[CitationClaim, ...] = ()
+    source_relevance: CitationDimensionResult
+    faithfulness: CitationDimensionResult
+    correctness: CitationCorrectnessResult
+
+    @model_validator(mode="after")
+    def validate_observation_state(self) -> "CitationObservation":
+        if self.status == "valid" and self.invalid_reasons:
+            raise ValueError("valid observation must not contain invalid reasons")
+        if self.status == "valid" and self.source_snapshot_hash is None:
+            raise ValueError("valid observation requires a source snapshot hash")
+        return self
+
+
+def evaluate_agent_citation_observation(
+    *,
+    run_id: int,
+    workspace_id: int,
+    workspace_fixture: str,
+    request_text: str,
+    final_answer: str,
+    retrieval_context: RetrievalContext
+    | Sequence[RetrievalContext]
+    | None,
+    prompt_version: str | None,
+    current_source_versions: Mapping[str, str | None] | None = None,
+    navigation_only: bool = False,
+) -> CitationObservation:
+    """把真实 Agent 回答和检索快照适配到既有 Citation 评测规则核。"""
+
+    contexts = _as_contexts(retrieval_context)
+    binding = bind_citations(
+        final_answer,
+        contexts,
+        workspace_id=workspace_id,
+        current_source_versions=current_source_versions,
+        require_citations=not navigation_only,
+        navigation_only=navigation_only,
+    )
+    reasons = list(binding.invalid_reasons)
+    if not prompt_version or not prompt_version.strip():
+        reasons.append("prompt_version_missing")
+    snapshot_hash = _observation_snapshot_hash(contexts)
+    if snapshot_hash is None:
+        reasons.append("source_snapshot_missing")
+
+    chunks = _unique_chunks(contexts)
+    chunks_by_citation = {
+        chunk.citation_id: chunk for chunk in chunks
+    }
+    if binding.citation_ids and not binding.claims:
+        reasons.append("citation_claim_text_missing")
+
+    for citation_id in binding.citation_ids:
+        chunk = chunks_by_citation.get(citation_id)
+        if chunk is None:
+            continue
+        suffix = Path(chunk.source_relative_path).suffix.casefold()
+        if suffix == ".pdf" and (
+            chunk.page_start is None or chunk.page_end is None
+        ):
+            reasons.append("pdf_citation_without_page")
+        if suffix == ".docx" and not chunk.source_positions:
+            reasons.append("docx_citation_without_structure")
+
+    citation_refs = tuple(
+        CitationRef(
+            citation_id=citation_id,
+            source_id=citation_id,
+            relevant_to_question=(
+                citation_id in chunks_by_citation
+                and _is_relevant(
+                    contexts,
+                    chunks_by_citation[citation_id],
+                )
+            ),
+        )
+        for citation_id in binding.citation_ids
+        if citation_id in chunks_by_citation
+    )
+    facts = tuple(
+        CitationFact(
+            fact_id=claim.claim_id,
+            claim=claim.text,
+            citation_ids=tuple(
+                citation_id
+                for citation_id in claim.citation_ids
+                if citation_id in chunks_by_citation
+            ),
+            supported_by_source=_claim_is_supported(
+                claim,
+                chunks_by_citation,
+            ),
+        )
+        for claim in binding.claims
+        if any(
+            citation_id in chunks_by_citation
+            for citation_id in claim.citation_ids
+        )
+    )
+
+    case_id = f"agent_run_{run_id}"
+    if citation_refs and facts:
+        case = CitationCase(
+            case_id=case_id,
+            question=request_text,
+            answer=final_answer,
+            sources=tuple(
+                CitationSource(
+                    source_id=citation_id,
+                    title=chunks_by_citation[citation_id].source_relative_path,
+                    content=chunks_by_citation[citation_id].text,
+                )
+                for citation_id in binding.citation_ids
+                if citation_id in chunks_by_citation
+            ),
+            citations=citation_refs,
+            facts=facts,
+        )
+        source_relevance = evaluate_source_relevance(case)
+        faithfulness = evaluate_faithfulness(case)
+        correctness = evaluate_citation_correctness(case)
+    else:
+        source_relevance = _empty_dimension(
+            "source_relevance",
+            case_id,
+        )
+        faithfulness = _empty_dimension("faithfulness", case_id)
+        correctness = CitationCorrectnessResult(
+            case_id=case_id,
+            total_facts=0,
+            correct_facts=0,
+            incorrect_facts=0,
+            fact_results=(),
+        )
+
+    unique_reasons = _unique_strings(reasons)
+    return CitationObservation(
+        run_id=run_id,
+        workspace_id=workspace_id,
+        workspace_fixture=workspace_fixture,
+        request_text=request_text,
+        final_answer=final_answer,
+        source_snapshot_hash=snapshot_hash,
+        parser_version=CITATION_PARSER_VERSION,
+        prompt_version=prompt_version,
+        status=("invalid_observation" if unique_reasons else "valid"),
+        invalid_reasons=unique_reasons,
+        sources=chunks,
+        claims=binding.claims,
+        source_relevance=source_relevance,
+        faithfulness=faithfulness,
+        correctness=correctness,
+    )
+
+
+def _as_contexts(
+    retrieval_context: RetrievalContext
+    | Sequence[RetrievalContext]
+    | None,
+) -> tuple[RetrievalContext, ...]:
+    if retrieval_context is None:
+        return ()
+    if isinstance(retrieval_context, RetrievalContext):
+        return (retrieval_context,)
+    return tuple(retrieval_context)
+
+
+def _observation_snapshot_hash(
+    contexts: tuple[RetrievalContext, ...],
+) -> str | None:
+    hashes = [context.snapshot_hash for context in contexts]
+    if not hashes or any(value is None for value in hashes):
+        return None
+    if len(hashes) == 1:
+        return hashes[0]
+    canonical = "|".join(sorted(value for value in hashes if value))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _unique_chunks(
+    contexts: tuple[RetrievalContext, ...],
+) -> tuple[RetrievedChunk, ...]:
+    chunks: list[RetrievedChunk] = []
+    seen: set[str] = set()
+    for context in contexts:
+        for chunk in context.chunks:
+            if chunk.citation_id in seen:
+                continue
+            seen.add(chunk.citation_id)
+            chunks.append(chunk)
+    return tuple(chunks)
+
+
+def _is_relevant(
+    contexts: tuple[RetrievalContext, ...],
+    chunk: RetrievedChunk,
+) -> bool:
+    return any(
+        context.query.casefold() in chunk.text.casefold()
+        for context in contexts
+        if context.workspace_id == chunk.workspace_id
+    )
+
+
+def _claim_is_supported(
+    claim: CitationClaim,
+    chunks_by_citation: Mapping[str, RetrievedChunk],
+) -> bool:
+    normalized_claim = " ".join(claim.text.casefold().split())
+    return any(
+        normalized_claim in " ".join(
+            chunks_by_citation[citation_id].text.casefold().split()
+        )
+        for citation_id in claim.citation_ids
+        if citation_id in chunks_by_citation
+    )
+
+
+def _empty_dimension(
+    dimension: Literal["source_relevance", "faithfulness"],
+    case_id: str,
+) -> CitationDimensionResult:
+    return CitationDimensionResult(
+        dimension=dimension,
+        case_id=case_id,
+        total=0,
+        passed=0,
+        failed=0,
+        failed_ids=(),
+    )
+
+
+def _unique_strings(values: Sequence[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return tuple(result)
 
 
 def evaluate_citation_correctness(

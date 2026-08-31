@@ -29,7 +29,6 @@ from .models import (
     AgentSession,
     AgentStep,
     AgentToolCall,
-    agent_run_sessions,
 )
 from .repositories import (
     add_agent_run,
@@ -224,6 +223,47 @@ def _tool_call_summary(tool_call: ModelToolCall) -> Mapping[str, object]:
     ).model_dump()
 
 
+def validate_persisted_agent_message_payload(
+    message_type: str,
+    payload_json: str,
+) -> None:
+    """校验数据库中的脱敏消息结构，不把其内容重新解释成权限输入。"""
+
+    try:
+        payload = json.loads(payload_json)
+        if not isinstance(payload, dict):
+            raise ValueError("message payload must be an object")
+        if message_type in {"user", "assistant"}:
+            _TextMessageSummary.model_validate(payload)
+        elif message_type == "tool_call":
+            _ToolCallMessageSummary.model_validate(payload)
+        elif message_type == "tool_result":
+            validated_result = _ToolResultMessageSummary.model_validate(payload)
+            if (
+                validated_result.error_code is not None
+                and validated_result.error_code not in _SAFE_TOOL_ERROR_CODES
+            ):
+                raise ValueError("tool result error code is not safe")
+        else:
+            raise ValueError("message type is not allowed")
+    except (TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        raise AgentObservabilityError("Agent 消息载荷不可恢复") from error
+
+
+def validate_persisted_agent_step_summary(
+    input_summary: str,
+    output_summary: str | None,
+) -> None:
+    """校验步骤摘要结构，拒绝旧上下文伪装成新的恢复证据。"""
+
+    try:
+        _StepInputSummary.model_validate_json(input_summary)
+        if output_summary is not None:
+            _StepOutputSummary.model_validate_json(output_summary)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise AgentObservabilityError("Agent 步骤摘要不可恢复") from error
+
+
 @runtime_checkable
 class AgentRunRecorder(Protocol):
     """Agent Loop 可调用的生命周期与已验证上下文记录契约。"""
@@ -397,13 +437,18 @@ class SqlAlchemyAgentRunRecorder:
     ) -> int:
         """持久化排队状态，供 HTTP 请求返回前取得稳定的 run_id。"""
 
+        validated_messages = (
+            _validated_messages(messages) if messages is not None else None
+        )
         agent_run = AgentRun(
             status="pending",
             started_at=self._now(),
             workspace_id=workspace_id,
             request_text=request_text,
             context_json=(
-                _serialize_messages(messages) if messages is not None else None
+                _serialize_messages(validated_messages)
+                if validated_messages is not None
+                else None
             ),
         )
         add_agent_run(self._session, agent_run)
@@ -485,6 +530,13 @@ class SqlAlchemyAgentRunRecorder:
         )
         if existing is not None:
             if existing.status == "pending":
+                self._promote_step_to_running(existing.id)
+            elif existing.status == "failed":
+                # Resume 重试的是未产生模型响应的失败回合，必须复用其唯一索引。
+                existing.status = "pending"
+                existing.output_summary = None
+                existing.completed_at = None
+                self._commit()
                 self._promote_step_to_running(existing.id)
             elif existing.status != "running":
                 raise AgentObservabilityError("Agent 步骤身份已完成，不能重复写入")
@@ -799,10 +851,11 @@ class SqlAlchemyAgentRunRecorder:
 
         if model_turns < 0:
             raise ValueError("model_turns must be non-negative")
+        validated_messages = _validated_messages(messages)
         agent_run = get_agent_run_by_id(self._session, agent_run_id)
         if agent_run is None:
             raise AgentObservabilityError("Agent 运行记录不存在")
-        agent_run.context_json = _serialize_messages(messages)
+        agent_run.context_json = _serialize_messages(validated_messages)
         agent_run.model_turns = model_turns
         self._commit()
 
@@ -919,6 +972,16 @@ class SqlAlchemyAgentRunRecorder:
             self._session.rollback()
             raise AgentObservabilityError("Agent 消息载荷不可持久化") from error
         self._commit()
+
+    def validate_persisted_message(
+        self,
+        *,
+        message_type: str,
+        payload_json: str,
+    ) -> None:
+        """重新校验生命周期消息载荷，损坏时不允许恢复。"""
+
+        validate_persisted_agent_message_payload(message_type, payload_json)
 
     def _add_model_metrics(
         self,

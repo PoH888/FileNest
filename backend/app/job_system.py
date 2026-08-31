@@ -1,5 +1,8 @@
 """长任务的框架无关 Job、Attempt、进度、取消和重试语义。"""
 
+import json
+import hashlib
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Never
@@ -9,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 JobKind = Literal["workspace_scan", "document_index"]
+JobTaskVersion = str
+TASK_VERSION_PATTERN = r"^[a-z][a-z0-9_.-]{0,31}$"
 JobStatus = Literal[
     "pending",
     "running",
@@ -81,6 +86,34 @@ class JobProgress(BaseModel):
         return self
 
 
+class JobTaskPayload(BaseModel):
+    """可在进程重启后重新解析的任务参数。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_id: int = Field(ge=1, strict=True)
+    # 当前索引入口只支持整个工作区；保留显式字段，避免未来把路径对象
+    # 或临时文件名直接塞进持久化任务描述。
+    index_scope: Literal["workspace"] | None = None
+
+
+def serialize_job_payload(payload: JobTaskPayload) -> str:
+    """生成稳定 JSON；只序列化已通过 schema 的重建参数。"""
+
+    return json.dumps(
+        payload.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def hash_job_payload(payload: JobTaskPayload) -> str:
+    """为幂等身份生成不含运行时对象的稳定摘要。"""
+
+    return hashlib.sha256(serialize_job_payload(payload).encode("utf-8")).hexdigest()
+
+
 class JobAttempt(BaseModel):
     """一个 Job 的单次执行记录；重试必须创建新的 Attempt。"""
 
@@ -146,7 +179,18 @@ class JobState(BaseModel):
     schema_version: Literal[1] = 1
     job_id: UUID
     kind: JobKind
+    task_version: JobTaskVersion = Field(
+        default="v1",
+        min_length=1,
+        max_length=32,
+        pattern=TASK_VERSION_PATTERN,
+    )
     workspace_id: int = Field(ge=1)
+    payload: JobTaskPayload
+    payload_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     idempotency_key: str = Field(min_length=1, max_length=128)
     status: JobStatus = "pending"
     max_attempts: int = Field(ge=1, le=10)
@@ -159,6 +203,20 @@ class JobState(BaseModel):
         pattern=r"^[a-z][a-z0-9_]{0,99}$",
     )
     attempts: tuple[JobAttempt, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_payload(cls, values: object) -> object:
+        """兼容旧调用方，同时让新 Job 始终携带完整任务描述。"""
+
+        if not isinstance(values, Mapping):
+            return values
+        normalized = dict(values)
+        if normalized.get("payload") is None:
+            workspace_id = normalized.get("workspace_id")
+            if workspace_id is not None:
+                normalized["payload"] = {"workspace_id": workspace_id}
+        return normalized
 
     @field_validator("idempotency_key")
     @classmethod
@@ -178,6 +236,16 @@ class JobState(BaseModel):
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> "JobState":
+        if self.payload.workspace_id != self.workspace_id:
+            raise ValueError("task payload workspace must match the Job workspace")
+        computed_payload_hash = hash_job_payload(self.payload)
+        if (
+            self.payload_hash is not None
+            and self.payload_hash != computed_payload_hash
+        ):
+            raise ValueError("payload_hash must match the task payload")
+        object.__setattr__(self, "payload_hash", computed_payload_hash)
+
         if len(self.attempts) > self.max_attempts:
             raise ValueError("attempt count must not exceed max_attempts")
 

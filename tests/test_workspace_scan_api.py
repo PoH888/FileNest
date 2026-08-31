@@ -43,10 +43,14 @@ def _wait_for_job(
     client: TestClient,
     job_id: str,
     expected_status: str,
+    workspace_id: int,
 ) -> dict[str, object]:
     deadline = monotonic() + 2
     while monotonic() < deadline:
-        response = client.get(f"/api/v1/jobs/{job_id}")
+        response = client.get(
+            f"/api/v1/jobs/{job_id}",
+            params={"workspace_id": workspace_id},
+        )
         assert response.status_code == 200
         payload = response.json()
         if payload["status"] == expected_status:
@@ -82,7 +86,7 @@ def test_scan_workspace_api_indexes_files(
 
     assert scan_response.status_code == 202
     job_id = scan_response.json()["job_id"]
-    completed = _wait_for_job(client, job_id, "completed")
+    completed = _wait_for_job(client, job_id, "completed", workspace_id)
     assert completed["job_id"] == job_id
     assert completed["error_code"] is None
 
@@ -121,7 +125,12 @@ def test_repeated_scan_tracks_real_file_changes(
     first_response = client.post(scan_url)
 
     assert first_response.status_code == 202
-    _wait_for_job(client, first_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        first_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     with Session(engine) as session:
         initial_entries = {
@@ -131,20 +140,36 @@ def test_repeated_scan_tracks_real_file_changes(
         changed_entry_id = initial_entries["changed.txt"].id
         keep_entry_id = initial_entries["keep.txt"].id
 
-    repeated_response = client.post(scan_url)
+    repeated_response = client.post(
+        scan_url,
+        headers={"Idempotency-Key": "changing-scan-002"},
+    )
 
     assert repeated_response.status_code == 202
-    _wait_for_job(client, repeated_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        repeated_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     changed_file.write_text("new content is longer", encoding="utf-8")
     new_file = workspace_root / "new.pdf"
     new_file.write_bytes(b"new file")
     deleted_file.unlink()
 
-    changed_response = client.post(scan_url)
+    changed_response = client.post(
+        scan_url,
+        headers={"Idempotency-Key": "changing-scan-003"},
+    )
 
     assert changed_response.status_code == 202
-    _wait_for_job(client, changed_response.json()["job_id"], "completed")
+    _wait_for_job(
+        client,
+        changed_response.json()["job_id"],
+        "completed",
+        workspace_id,
+    )
 
     with Session(engine) as session:
         final_entries = {
@@ -215,7 +240,12 @@ def test_unavailable_workspace_does_not_delete_existing_index(
     )
 
     assert response.status_code == 202
-    failed = _wait_for_job(client, response.json()["job_id"], "failed")
+    failed = _wait_for_job(
+        client,
+        response.json()["job_id"],
+        "failed",
+        workspace_id,
+    )
     assert failed["error_code"] == "workspace_scan_unavailable"
 
     with Session(engine) as session:
@@ -230,6 +260,7 @@ def test_job_status_returns_not_found(scan_client: tuple[TestClient, Engine]) ->
 
     response = client.get(
         "/api/v1/jobs/00000000-0000-0000-0000-000000000000",
+        params={"workspace_id": 1},
     )
 
     assert response.status_code == 404

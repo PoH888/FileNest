@@ -620,6 +620,65 @@ def find_waiting_approval_requests(
     return list(session.scalars(statement).all())
 
 
+def find_pending_approval_requests(
+    session: Session,
+    workspace_id: int,
+    *,
+    offset: int = 0,
+    limit: int = 20,
+) -> list[tuple[ApprovalRequest, OperationPlanRecord]]:
+    """按工作区和稳定创建顺序读取待审批及其当前计划。"""
+
+    if workspace_id < 1:
+        raise ValueError("workspace_id must be positive")
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    statement = (
+        select(ApprovalRequest, OperationPlanRecord)
+        .join(
+            OperationPlanRecord,
+            OperationPlanRecord.plan_id == ApprovalRequest.plan_id,
+        )
+        .where(
+            ApprovalRequest.status == "WAITING_APPROVAL",
+            OperationPlanRecord.workspace_id == workspace_id,
+        )
+        .order_by(
+            ApprovalRequest.created_at.asc(),
+            ApprovalRequest.id.asc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(session.execute(statement).all())
+
+
+def count_pending_approval_requests(
+    session: Session,
+    workspace_id: int,
+) -> int:
+    """返回指定工作区当前待审批任务数量。"""
+
+    if workspace_id < 1:
+        raise ValueError("workspace_id must be positive")
+
+    statement = (
+        select(func.count(ApprovalRequest.id))
+        .join(
+            OperationPlanRecord,
+            OperationPlanRecord.plan_id == ApprovalRequest.plan_id,
+        )
+        .where(
+            ApprovalRequest.status == "WAITING_APPROVAL",
+            OperationPlanRecord.workspace_id == workspace_id,
+        )
+    )
+    return session.scalar(statement) or 0
+
+
 def compare_and_set_approval_request(
     session: Session,
     workflow_id: str,

@@ -7,8 +7,18 @@ from uuid import UUID
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
-from .job_system import JobAttempt, JobProgress, JobState
+from .job_system import (
+    JobAttempt,
+    JobKind,
+    JobProgress,
+    JobState,
+    JobStatus,
+    JobTaskPayload,
+    hash_job_payload,
+    serialize_job_payload,
+)
 from .models import JobAttemptRecord, JobRecord
 
 
@@ -30,6 +40,10 @@ class JobStoreAttemptConflictError(JobStoreError):
 
 class JobStoreNotFoundError(JobStoreError):
     """指定 Job 不存在。"""
+
+
+class JobStorePayloadError(JobStoreError):
+    """数据库中的任务描述无法安全还原。"""
 
 
 class SqlAlchemyJobStore:
@@ -85,6 +99,62 @@ class SqlAlchemyJobStore:
                 record,
                 self._get_attempts(session, job_id),
             )
+
+    def list_unfinished(self) -> list[JobState]:
+        """读取启动恢复所需的全部未终态 Job 快照。"""
+
+        with self._session_factory() as session:
+            records = list(
+                session.scalars(
+                    select(JobRecord)
+                    .where(
+                        JobRecord.status.in_(
+                            ("pending", "running", "cancel_requested")
+                        )
+                    )
+                    .order_by(JobRecord.created_at.asc(), JobRecord.job_id.asc())
+                ).all()
+            )
+            return [
+                self._state_from_records(
+                    record,
+                    self._get_attempts(session, UUID(record.job_id)),
+                )
+                for record in records
+            ]
+
+    def list_jobs(
+        self,
+        *,
+        workspace_id: int,
+        kind: JobKind | None = None,
+        status: JobStatus | None = None,
+    ) -> list[JobState]:
+        """按工作区读取 Job；可选条件只在数据库查询边界生效。"""
+
+        with self._session_factory() as session:
+            statement = select(JobRecord).where(
+                JobRecord.workspace_id == workspace_id
+            )
+            if kind is not None:
+                statement = statement.where(JobRecord.kind == kind)
+            if status is not None:
+                statement = statement.where(JobRecord.status == status)
+            records = list(
+                session.scalars(
+                    statement.order_by(
+                        JobRecord.created_at.desc(),
+                        JobRecord.job_id.desc(),
+                    )
+                ).all()
+            )
+            return [
+                self._state_from_records(
+                    record,
+                    self._get_attempts(session, UUID(record.job_id)),
+                )
+                for record in records
+            ]
 
     def save_transition(
         self,
@@ -148,7 +218,10 @@ class SqlAlchemyJobStore:
             job_id=str(state.job_id),
             schema_version=state.schema_version,
             kind=state.kind,
+            task_version=state.task_version,
             workspace_id=state.workspace_id,
+            payload_json=serialize_job_payload(state.payload),
+            payload_hash=state.payload_hash or hash_job_payload(state.payload),
             idempotency_key=state.idempotency_key,
             status=state.status,
             max_attempts=state.max_attempts,
@@ -198,9 +271,14 @@ class SqlAlchemyJobStore:
         record: JobRecord,
         state: JobState,
     ) -> None:
+        persisted_payload = _parse_job_payload(record.payload_json)
         if (
             record.kind != state.kind
+            or record.task_version != state.task_version
             or record.workspace_id != state.workspace_id
+            or record.payload_hash != state.payload_hash
+            or serialize_job_payload(persisted_payload)
+            != serialize_job_payload(state.payload)
             or record.idempotency_key != state.idempotency_key
         ):
             raise JobStoreIdentityConflictError(state.idempotency_key)
@@ -281,41 +359,57 @@ class SqlAlchemyJobStore:
         record: JobRecord,
         attempts: list[JobAttemptRecord],
     ) -> JobState:
-        return JobState(
-            schema_version=record.schema_version,
-            job_id=UUID(record.job_id),
-            kind=record.kind,
-            workspace_id=record.workspace_id,
-            idempotency_key=record.idempotency_key,
-            status=record.status,
-            max_attempts=record.max_attempts,
-            revision=record.revision,
-            created_at=_as_utc(record.created_at),
-            cancel_requested_at=_as_optional_utc(
-                record.cancel_requested_at
-            ),
-            finished_at=_as_optional_utc(record.finished_at),
-            error_code=record.error_code,
-            attempts=tuple(
-                JobAttempt(
-                    schema_version=attempt.schema_version,
-                    attempt_id=UUID(attempt.attempt_id),
-                    job_id=UUID(attempt.job_id),
-                    attempt_no=attempt.attempt_no,
-                    status=attempt.status,
-                    progress=JobProgress(
-                        completed_units=attempt.completed_units,
-                        total_units=attempt.total_units,
-                        phase_code=attempt.phase_code,
-                    ),
-                    started_at=_as_utc(attempt.started_at),
-                    finished_at=_as_optional_utc(attempt.finished_at),
-                    error_code=attempt.error_code,
-                    retryable=attempt.retryable,
-                )
-                for attempt in attempts
-            ),
-        )
+        payload = _parse_job_payload(record.payload_json)
+        try:
+            return JobState(
+                schema_version=record.schema_version,
+                job_id=UUID(record.job_id),
+                kind=record.kind,
+                task_version=record.task_version,
+                workspace_id=record.workspace_id,
+                payload=payload,
+                payload_hash=record.payload_hash,
+                idempotency_key=record.idempotency_key,
+                status=record.status,
+                max_attempts=record.max_attempts,
+                revision=record.revision,
+                created_at=_as_utc(record.created_at),
+                cancel_requested_at=_as_optional_utc(
+                    record.cancel_requested_at
+                ),
+                finished_at=_as_optional_utc(record.finished_at),
+                error_code=record.error_code,
+                attempts=tuple(
+                    JobAttempt(
+                        schema_version=attempt.schema_version,
+                        attempt_id=UUID(attempt.attempt_id),
+                        job_id=UUID(attempt.job_id),
+                        attempt_no=attempt.attempt_no,
+                        status=attempt.status,
+                        progress=JobProgress(
+                            completed_units=attempt.completed_units,
+                            total_units=attempt.total_units,
+                            phase_code=attempt.phase_code,
+                        ),
+                        started_at=_as_utc(attempt.started_at),
+                        finished_at=_as_optional_utc(attempt.finished_at),
+                        error_code=attempt.error_code,
+                        retryable=attempt.retryable,
+                    )
+                    for attempt in attempts
+                ),
+            )
+        except ValidationError as error:
+            raise JobStorePayloadError(
+                f"invalid persisted Job definition: {record.job_id}"
+            ) from error
+
+
+def _parse_job_payload(payload_json: str) -> JobTaskPayload:
+    try:
+        return JobTaskPayload.model_validate_json(payload_json)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise JobStorePayloadError("invalid persisted Job payload") from error
 
 
 def _as_utc(value: datetime) -> datetime:

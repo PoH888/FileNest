@@ -8,11 +8,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend.app.agent_recovery import (
+    inspect_agent_run_recovery,
     recover_unfinished_agent_runs,
     scan_unfinished_agent_runs,
 )
+from backend.app.agent_observability import SqlAlchemyAgentRunRecorder
 from backend.app.database import Base
-from backend.app.models import AgentRun
+from backend.app.model_client import ModelMessage
+from backend.app.models import AgentMessage, AgentRun, AgentSession
 
 
 def test_startup_scan_identifies_unfinished_agent_runs_and_marks_interrupted(
@@ -64,6 +67,126 @@ def test_startup_scan_identifies_unfinished_agent_runs_and_marks_interrupted(
             assert completed.status == "completed"
             assert pending is not None
             assert pending.status == "pending"
+    finally:
+        engine.dispose()
+
+
+def test_recovery_snapshot_loads_completed_and_incomplete_lifecycle_steps(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'agent-recovery-snapshot.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+    initial_messages = (
+        ModelMessage(role="user", content="safe request"),
+    )
+    response_messages = (
+        *initial_messages,
+        ModelMessage(role="assistant", content="safe response"),
+    )
+
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            recorder = SqlAlchemyAgentRunRecorder(session, workspace_id=7)
+            run_id = recorder.start_pending_run(
+                workspace_id=7,
+                request_text="safe request",
+                messages=initial_messages,
+            )
+            recorder.start_existing_run(run_id)
+            first_step_id = recorder.start_step(
+                agent_run_id=run_id,
+                step_index=0,
+                step_type="model_turn",
+                messages=initial_messages,
+            )
+            recorder.record_model_message(
+                agent_run_id=run_id,
+                agent_step_id=first_step_id,
+                sequence_no=0,
+                message=initial_messages[0],
+            )
+            recorder.record_model_message(
+                agent_run_id=run_id,
+                agent_step_id=first_step_id,
+                sequence_no=1,
+                message=response_messages[-1],
+            )
+            recorder.record_model_run(
+                agent_run_id=run_id,
+                agent_step_id=first_step_id,
+                model="deterministic-model",
+                model_provider="fake",
+                prompt_version="agent-system-v1",
+                metrics=None,
+            )
+            recorder.finish_step(
+                agent_run_id=run_id,
+                agent_step_id=first_step_id,
+                status="completed",
+                messages=response_messages,
+                error_code=None,
+            )
+            recorder.checkpoint_run(
+                agent_run_id=run_id,
+                messages=response_messages,
+                model_turns=1,
+            )
+            second_step_id = recorder.start_step(
+                agent_run_id=run_id,
+                step_index=1,
+                step_type="model_turn",
+                messages=response_messages,
+            )
+
+            snapshot = inspect_agent_run_recovery(session, run_id)
+
+            assert snapshot.can_resume is True
+            assert snapshot.recovery_code is None
+            assert snapshot.agent_session_id is not None
+            assert snapshot.context_message_count == 2
+            assert snapshot.last_completed_step_index == 0
+            assert snapshot.incomplete_step_index == 1
+            assert snapshot.model_run_ids
+            assert second_step_id != first_step_id
+    finally:
+        engine.dispose()
+
+
+def test_recovery_snapshot_rejects_workspace_mismatch_without_file_access(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'agent-recovery-mismatch.db').as_posix()}"
+    )
+    Base.metadata.create_all(bind=engine)
+    sentinel = tmp_path / "must-not-be-touched.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            recorder = SqlAlchemyAgentRunRecorder(session, workspace_id=7)
+            run_id = recorder.start_pending_run(
+                workspace_id=7,
+                request_text="safe request",
+                messages=(ModelMessage(role="user", content="safe request"),),
+            )
+            linked_session = session.scalar(
+                session.query(AgentSession).where(
+                    AgentSession.workspace_id == 7
+                ).statement
+            )
+            assert linked_session is not None
+            linked_session.workspace_id = 8
+            session.commit()
+
+            snapshot = inspect_agent_run_recovery(session, run_id)
+
+            assert snapshot.can_resume is False
+            assert snapshot.recovery_code == "agent_workspace_mismatch"
+            assert sentinel.read_text(encoding="utf-8") == "unchanged"
+            assert session.query(AgentMessage).count() == 0
     finally:
         engine.dispose()
 
