@@ -69,6 +69,7 @@ from .services import (
     FileSearchResult,
     WorkspacePathConflictError,
     WorkspaceNotFoundError,
+    WorkspacePolicyError,
     WorkspaceScanUnavailableError,
     create_workspace as create_workspace_service,
     get_file_detail as get_file_detail_service,
@@ -76,6 +77,7 @@ from .services import (
     list_workspaces as list_workspaces_service,
     scan_workspace as scan_workspace_service,
     search_files as search_files_service,
+    require_workspace_read_policy,
 )
 from .schemas import (
     FileDetailResponse,
@@ -263,6 +265,8 @@ def _run_workspace_scan(
             scan_workspace_service(task_session, workspace_id)
         except WorkspaceNotFoundError as error:
             raise JobTaskError("workspace_not_found") from error
+        except WorkspacePolicyError as error:
+            raise JobTaskError(error.code.value) from error
         except WorkspaceScanUnavailableError as error:
             raise JobTaskError("workspace_scan_unavailable") from error
 
@@ -280,6 +284,8 @@ def _run_document_index(
             index_workspace_documents(task_session, workspace_id)
         except DocumentIndexWorkspaceNotFoundError as error:
             raise JobTaskError("workspace_not_found") from error
+        except WorkspacePolicyError as error:
+            raise JobTaskError(error.code.value) from error
         except Exception as error:
             raise JobTaskError("document_index_failed") from error
 
@@ -329,7 +335,8 @@ def _can_recover_job(
             return False
         try:
             validate_workspace_root(workspace.root_path)
-        except PathPolicyError:
+            require_workspace_read_policy(session, state.workspace_id)
+        except (PathPolicyError, WorkspacePolicyError):
             return False
     return True
 
@@ -464,6 +471,19 @@ def _job_identity_conflict(error: JobIdentityConflictError) -> HTTPException:
     )
 
 
+def _workspace_policy_http_error(error: WorkspacePolicyError) -> HTTPException:
+    """把读取策略拒绝转换成稳定的 HTTP 错误。"""
+
+    status_code = 403 if error.code.value.endswith("_disabled") else 409
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": error.code.value,
+            "message": str(error),
+        },
+    )
+
+
 def _submit_document_index_job(
     session: Session,
     workspace_id: int,
@@ -479,6 +499,10 @@ def _submit_document_index_job(
                 "message": "工作区不存在。",
             },
         )
+    try:
+        require_workspace_read_policy(session, workspace_id)
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
 
     runtime = _job_runtime_for_session(session)
     try:
@@ -645,6 +669,8 @@ def list_files(
                 "message": "工作区不存在。",
             },
         ) from error
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
 
     return _file_list_response(result)
 
@@ -677,6 +703,13 @@ def get_file_detail(
                 "code": "file_not_found",
                 "message": "文件索引不存在。",
             },
+        ) from error
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
+    except PathPolicyError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=error.as_detail(),
         ) from error
 
     item = _file_list_item_response(file_entry)
@@ -736,6 +769,10 @@ def scan_workspace(
                 "message": "工作区不存在。",
             },
         )
+    try:
+        require_workspace_read_policy(session, workspace_id)
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
 
     runtime = _job_runtime_for_session(session)
     try:
@@ -878,6 +915,10 @@ def retry_job(
 
     runtime = _job_runtime_for_session(session)
     _get_job_for_workspace(runtime, job_id, workspace_id)
+    try:
+        require_workspace_read_policy(session, workspace_id)
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
     try:
         state = runtime.runner.retry(job_id)
     except JobNotFoundError as error:

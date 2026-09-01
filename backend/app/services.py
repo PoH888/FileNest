@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import json
+import logging
 import os
 from pathlib import Path
 from typing import cast
@@ -27,6 +28,7 @@ from .models import (
     OperationItemRecord,
     OperationPlanRecord,
     Workspace,
+    WorkspacePolicyAuditEvent,
 )
 from .operation_preview import (
     OperationPreviewItem,
@@ -44,7 +46,11 @@ from .operation_plan import (
 )
 from .path_policy import (
     PathPolicyError,
+    WorkspacePolicy,
+    WorkspacePolicyPersistenceError,
     normalize_workspace_root,
+    parse_workspace_policy,
+    workspace_policy_rule_summary,
     validate_workspace_root,
 )
 from .quarantine import (
@@ -56,6 +62,7 @@ from .quarantine import (
 from .repositories import (
     add_file_entry,
     add_approval_audit_event,
+    add_workspace_policy_audit_event,
     add_workspace,
     ApprovalAction,
     ApprovalStatus,
@@ -63,7 +70,6 @@ from .repositories import (
     compare_and_set_approval_request,
     compare_and_set_operation_status,
     compare_and_set_operation_status_links,
-    count_file_entries,
     delete_file_entry,
     FileEntrySortField,
     find_file_entries,
@@ -75,11 +81,14 @@ from .repositories import (
     get_operation_plan_by_id,
     get_operation_status_by_workflow_id,
     get_workspace_by_id,
+    get_workspace_policy,
+    get_workspace_policy_record,
+    compare_and_set_workspace_policy,
     OperationPlanStatus,
     SortOrder,
 )
 from .operation_status import OperationStatus
-from .workspace_scanner import ScannedFile, scan_workspace_files
+from .workspace_scanner import IgnoredEntry, ScannedFile, scan_workspace_files
 
 
 class WorkspacePathConflictError(Exception):
@@ -88,6 +97,29 @@ class WorkspacePathConflictError(Exception):
 
 class WorkspaceNotFoundError(Exception):
     """文件索引操作所需的工作区不存在。"""
+
+
+class WorkspacePolicyErrorCode(StrEnum):
+    """Workspace Policy 服务层的稳定错误码。"""
+
+    NOT_FOUND = "workspace_policy_not_found"
+    INVALID = "workspace_policy_invalid"
+    REVISION_CONFLICT = "workspace_policy_revision_conflict"
+    AUDIT_WRITE_FAILED = "workspace_policy_audit_write_failed"
+    READ_DISABLED = "workspace_policy_read_disabled"
+    PROPOSAL_DISABLED = "workspace_policy_proposal_disabled"
+
+
+class WorkspacePolicyError(RuntimeError):
+    """拒绝缺失、损坏或并发过期的 Workspace Policy 变更。"""
+
+    def __init__(
+        self,
+        code: WorkspacePolicyErrorCode,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class FileEntryNotFoundError(Exception):
@@ -286,6 +318,42 @@ def get_operation_plan(
     except (TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
         raise OperationPlanPersistenceError(
             f"操作计划 {record.plan_id} 无法安全还原"
+        ) from error
+
+
+def load_operation_plan_policy_snapshot(
+    session: Session,
+    plan_id: UUID | str,
+) -> WorkspacePolicy:
+    """严格读取计划创建时保存的 Workspace Policy 快照。"""
+
+    record = get_operation_plan_by_id(session, str(plan_id))
+    if record is None:
+        raise OperationPlanPersistenceError(
+            f"操作计划 {plan_id} 不存在"
+        )
+    try:
+        metadata = json.loads(record.metadata_json)
+        snapshot = metadata["workspace_policy"]
+        if not isinstance(snapshot, dict):
+            raise ValueError("workspace_policy snapshot must be an object")
+        return parse_workspace_policy(
+            policy_revision=snapshot["policy_revision"],
+            read_enabled=snapshot["read_enabled"],
+            proposal_enabled=snapshot["proposal_enabled"],
+            safe_execution_enabled=snapshot["safe_execution_enabled"],
+            user_denylist_json=snapshot["user_denylist_json"],
+            ignore_patterns_json=snapshot["ignore_patterns_json"],
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        WorkspacePolicyPersistenceError,
+    ) as error:
+        raise OperationPlanPersistenceError(
+            f"操作计划 {record.plan_id} 的 Workspace Policy 快照损坏"
         ) from error
 
 
@@ -679,6 +747,155 @@ def _is_repeated_approval(
     ) and approval.plan_id == expected_plan_id
 
 
+def load_workspace_policy(
+    session: Session,
+    workspace_id: int,
+) -> WorkspacePolicy:
+    """严格加载持久化策略；缺失或 JSON 损坏都必须失败关闭。"""
+
+    if get_workspace_by_id(session, workspace_id) is None:
+        raise WorkspaceNotFoundError(workspace_id)
+    try:
+        return get_workspace_policy(session, workspace_id)
+    except WorkspacePolicyPersistenceError as error:
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.INVALID,
+            "Workspace Policy 缺失或损坏",
+        ) from error
+
+
+def require_workspace_read_policy(
+    session: Session,
+    workspace_id: int,
+) -> WorkspacePolicy:
+    """加载并确认工作区允许读取；关闭时所有读取入口统一失败关闭。"""
+
+    policy = load_workspace_policy(session, workspace_id)
+    if not policy.read_enabled:
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.READ_DISABLED,
+            "Workspace Policy 已禁用读取",
+        )
+    return policy
+
+
+def require_workspace_proposal_policy(
+    session: Session,
+    workspace_id: int,
+) -> WorkspacePolicy:
+    """加载并确认工作区允许提案；提案能力不能绕过读取开关。"""
+
+    policy = require_workspace_read_policy(session, workspace_id)
+    if not policy.proposal_enabled:
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.PROPOSAL_DISABLED,
+            "Workspace Policy 已禁用提案",
+        )
+    return policy
+
+
+def update_workspace_policy(
+    session: Session,
+    workspace_id: int,
+    policy: WorkspacePolicy,
+    *,
+    actor: str,
+    source: str,
+) -> WorkspacePolicy:
+    """以 revision CAS 更新策略，并把成功变更与审计放进同一事务。"""
+
+    if get_workspace_by_id(session, workspace_id) is None:
+        raise WorkspaceNotFoundError(workspace_id)
+    if (
+        not isinstance(actor, str)
+        or not actor
+        or actor != actor.strip()
+        or len(actor) > 128
+        or not isinstance(source, str)
+        or not source
+        or source != source.strip()
+        or len(source) > 128
+    ):
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.INVALID,
+            "Policy 变更 actor/source 不符合契约",
+        )
+
+    record = get_workspace_policy_record(session, workspace_id)
+    if record is None:
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.NOT_FOUND,
+            "Workspace Policy 记录不存在",
+        )
+    try:
+        current_policy = load_workspace_policy(session, workspace_id)
+    except WorkspacePolicyError:
+        raise
+    if policy.policy_revision != current_policy.policy_revision + 1:
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.REVISION_CONFLICT,
+            "Workspace Policy revision 已经过期",
+        )
+
+    current_summary = workspace_policy_rule_summary(current_policy)
+    next_summary = workspace_policy_rule_summary(policy)
+    added_rules = {
+        field_name: sorted(
+            set(next_summary[field_name]) - set(current_summary[field_name])
+        )
+        for field_name in current_summary
+    }
+    removed_rules = {
+        field_name: sorted(
+            set(current_summary[field_name]) - set(next_summary[field_name])
+        )
+        for field_name in current_summary
+    }
+    updated = compare_and_set_workspace_policy(
+        session,
+        workspace_id,
+        current_policy.policy_revision,
+        policy,
+    )
+    if not updated:
+        session.rollback()
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.REVISION_CONFLICT,
+            "Workspace Policy revision 已在提交前变化",
+        )
+
+    audit_event = WorkspacePolicyAuditEvent(
+        workspace_id=workspace_id,
+        actor=actor,
+        source=source,
+        previous_revision=current_policy.policy_revision,
+        next_revision=policy.policy_revision,
+        added_rules_json=json.dumps(
+            added_rules,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        removed_rules_json=json.dumps(
+            removed_rules,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        result="succeeded",
+    )
+    try:
+        # 审计 flush/commit 失败必须回滚前面的策略 UPDATE，不能放行新权限。
+        add_workspace_policy_audit_event(session, audit_event)
+        session.flush()
+        session.commit()
+    except Exception as error:
+        session.rollback()
+        raise WorkspacePolicyError(
+            WorkspacePolicyErrorCode.AUDIT_WRITE_FAILED,
+            "Workspace Policy 审计写入失败",
+        ) from error
+    return policy
+
+
 def create_workspace(
     session: Session,
     name: str,
@@ -737,13 +954,19 @@ def get_file_detail(
 ) -> FileEntry:
     """读取指定工作区内一个文件索引的详情。"""
 
-    if get_workspace_by_id(session, workspace_id) is None:
+    policy = require_workspace_read_policy(session, workspace_id)
+    workspace = get_workspace_by_id(session, workspace_id)
+    if workspace is None:
         raise WorkspaceNotFoundError(workspace_id)
 
     file_entry = get_file_entry_by_id(session, workspace_id, file_id)
     if file_entry is None:
         raise FileEntryNotFoundError(file_id)
 
+    FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    ).authorized_path(Path(file_entry.relative_path))
     return file_entry
 
 
@@ -764,7 +987,11 @@ def get_authorized_file_metadata(
 
     # 索引属于数据库数据，也可能因历史版本或人工修改而不可信。
     # 返回给 Agent 前重新经过 Path Policy，防止污染路径越过工作区。
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    policy = require_workspace_read_policy(session, workspace_id)
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
     adapter.authorized_path(Path(file_entry.relative_path))
     return file_entry
 
@@ -775,11 +1002,18 @@ def generate_operation_preview(
 ) -> OperationPreviewResponse:
     """根据当前索引和真实磁盘状态生成只读候选预览。"""
 
+    policy = require_workspace_proposal_policy(
+        session,
+        request.workspace_id,
+    )
     workspace = get_workspace_by_id(session, request.workspace_id)
     if workspace is None:
         raise WorkspaceNotFoundError(request.workspace_id)
 
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
     for directory in request.target_directories:
         try:
             is_directory = adapter.is_directory(Path(directory))
@@ -845,7 +1079,11 @@ def validate_operation_plan(
     if workspace is None:
         raise WorkspaceNotFoundError(plan.workspace_id)
 
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    policy = load_workspace_policy(session, plan.workspace_id)
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
     quarantine_adapter: FileSystemAdapter | None = None
     for operation in plan.operations:
         file_entry = get_file_entry_by_id(
@@ -948,7 +1186,9 @@ def search_files(
 ) -> FileSearchResult:
     """在一个已授权工作区的持久化索引中搜索文件。"""
 
-    if get_workspace_by_id(session, workspace_id) is None:
+    policy = require_workspace_read_policy(session, workspace_id)
+    workspace = get_workspace_by_id(session, workspace_id)
+    if workspace is None:
         raise WorkspaceNotFoundError(workspace_id)
     if page < 1:
         raise ValueError("page must be at least 1")
@@ -961,26 +1201,34 @@ def search_files(
     normalized_extension = _normalize_extension(extension)
     modified_from_ns = _datetime_to_epoch_ns(modified_from)
     modified_to_ns = _datetime_to_epoch_ns(modified_to)
-    total = count_file_entries(
-        session,
-        workspace_id,
-        keyword=normalized_keyword,
-        extension=normalized_extension,
-        modified_from_ns=modified_from_ns,
-        modified_to_ns=modified_to_ns,
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
     )
-    items = find_file_entries(
+    candidates = find_file_entries(
         session,
         workspace_id,
         sort_by=_FILE_SORT_FIELDS[sort_by],
         sort_order=cast(SortOrder, sort_order),
-        offset=(page - 1) * page_size,
-        limit=page_size,
+        offset=0,
+        limit=None,
         keyword=normalized_keyword,
         extension=normalized_extension,
         modified_from_ns=modified_from_ns,
         modified_to_ns=modified_to_ns,
     )
+    visible_items: list[FileEntry] = []
+    for file_entry in candidates:
+        try:
+            adapter.authorized_path(Path(file_entry.relative_path))
+        except PathPolicyError:
+            continue
+
+        visible_items.append(file_entry)
+
+    total = len(visible_items)
+    page_start = (page - 1) * page_size
+    items = visible_items[page_start : page_start + page_size]
 
     return FileSearchResult(
         items=items,
@@ -1124,20 +1372,38 @@ def scan_workspace(
         session.rollback()
         raise WorkspaceNotFoundError(workspace_id)
 
+    policy = require_workspace_read_policy(session, workspace_id)
     workspace_root = Path(workspace.root_path)
-    adapter = FileSystemAdapter(workspace_root)
+    adapter = FileSystemAdapter(
+        workspace_root,
+        workspace_policy=policy,
+    )
+    ignored_entries: list[IgnoredEntry] = []
 
     try:
         _require_scannable_workspace_root(adapter)
         scanned_files = scan_workspace_files(
             workspace_root,
             ignore_patterns=[],
+            ignored_entries=ignored_entries,
+            workspace_policy=policy,
         )
         # 扫描期间根目录失效时，空结果不能覆盖现有索引。
         _require_scannable_workspace_root(adapter)
     except WorkspaceScanUnavailableError:
         session.rollback()
         raise
+
+    logger = logging.getLogger("FileNest")
+    for ignored_entry in ignored_entries:
+        logger.info(
+            "工作区扫描排除条目",
+            extra={
+                "workspace_id": workspace_id,
+                "relative_path": ignored_entry.relative_path,
+                "ignored_reason": ignored_entry.ignored_reason,
+            },
+        )
 
     return sync_file_index(session, workspace_id, scanned_files)
 

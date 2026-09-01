@@ -40,9 +40,17 @@ from .quarantine import (
     QuarantineManager,
     resolve_quarantine_root,
 )
-from .path_policy import PathPolicyError
+from .path_policy import PathPolicyError, WorkspacePolicy
 from .operation_status import OperationStatus
-from .services import require_approved_operation_plan, validate_operation_plan
+from .services import (
+    OperationPlanPersistenceError,
+    WorkspaceNotFoundError,
+    WorkspacePolicyError,
+    load_operation_plan_policy_snapshot,
+    load_workspace_policy,
+    require_approved_operation_plan,
+    validate_operation_plan,
+)
 
 
 class SafeExecutionRequest(BaseModel):
@@ -70,6 +78,9 @@ class SafeExecutionErrorCode(StrEnum):
     HISTORY_WRITE_FAILED = "safe_execution_history_write_failed"
     UNSUPPORTED_OPERATION_TYPE = "safe_execution_operation_type_unsupported"
     QUARANTINE_UNAVAILABLE = "safe_execution_quarantine_unavailable"
+    POLICY_SNAPSHOT_INVALID = "safe_execution_policy_snapshot_invalid"
+    POLICY_CHANGED = "safe_execution_policy_changed"
+    POLICY_DISABLED = "safe_execution_policy_disabled"
 
 
 class SafeExecutionError(RuntimeError):
@@ -225,6 +236,56 @@ def _ensure_supported_operation_plan(plan: OperationPlan) -> None:
         )
 
 
+def _validate_workspace_policy_for_execution(
+    session: Session,
+    plan: OperationPlan,
+) -> WorkspacePolicy:
+    """执行前比较创建时快照与当前 Policy，缺失或变化均 fail closed。"""
+
+    return _load_valid_execution_policy(
+        session,
+        plan_id=plan.plan_id,
+        workspace_id=plan.workspace_id,
+    )
+
+
+def _load_valid_execution_policy(
+    session: Session,
+    *,
+    plan_id: UUID | str,
+    workspace_id: int,
+) -> WorkspacePolicy:
+    """为初始执行、重试、undo 和恢复复核同一份计划策略证据。"""
+
+    try:
+        snapshot = load_operation_plan_policy_snapshot(
+            session,
+            plan_id,
+        )
+        current = load_workspace_policy(session, workspace_id)
+    except (
+        OperationPlanPersistenceError,
+        WorkspaceNotFoundError,
+        WorkspacePolicyError,
+    ) as error:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.POLICY_SNAPSHOT_INVALID,
+            "执行计划的 Workspace Policy 证据不可用",
+        ) from error
+
+    if not current.safe_execution_enabled:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.POLICY_DISABLED,
+            "Workspace Policy 已禁止安全执行",
+        )
+    if current != snapshot:
+        raise SafeExecutionError(
+            SafeExecutionErrorCode.POLICY_CHANGED,
+            "Workspace Policy 已发生变化，需要重新生成计划",
+        )
+    return current
+
+
 def validate_safe_execution_request(
     session: Session,
     request: SafeExecutionRequest,
@@ -239,6 +300,7 @@ def validate_safe_execution_request(
         request.workflow_id,
         request.plan,
     )
+    _validate_workspace_policy_for_execution(session, request.plan)
     _ensure_supported_operation_plan(request.plan)
     if request.quarantine_root is None:
         validate_operation_plan(session, request.plan, now=now)
@@ -265,6 +327,10 @@ def execute_safe_operation_plan(
         request.workflow_id,
         request.plan,
     )
+    current_policy = _validate_workspace_policy_for_execution(
+        session,
+        request.plan,
+    )
     _ensure_supported_operation_plan(request.plan)
     existing_result = _get_idempotent_execution_result(session, request)
     if existing_result is not None:
@@ -285,7 +351,10 @@ def execute_safe_operation_plan(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行计划对应的工作区不存在",
         )
-    workspace_adapter = FileSystemAdapter(Path(workspace.root_path))
+    workspace_adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=current_policy,
+    )
     quarantine_manager: QuarantineManager | None = None
     quarantine_adapter: FileSystemAdapter | None = None
     if any(
@@ -616,7 +685,15 @@ def retry_failed_operation_execution(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行历史对应的工作区不存在",
         )
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    current_policy = _load_valid_execution_policy(
+        session,
+        plan_id=execution.plan_id,
+        workspace_id=execution.workspace_id,
+    )
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=current_policy,
+    )
     for item in failed_items:
         _validate_failed_item_for_retry(adapter, item)
 
@@ -947,7 +1024,15 @@ def _restore_operation_execution(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行历史对应的工作区不存在",
         )
-    workspace_adapter = FileSystemAdapter(Path(workspace.root_path))
+    current_policy = _load_valid_execution_policy(
+        session,
+        plan_id=execution.plan_id,
+        workspace_id=execution.workspace_id,
+    )
+    workspace_adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=current_policy,
+    )
     restore_contexts: list[tuple[OperationExecutionItem, _UndoContext]] = []
     for item in completed_items:
         context = _build_undo_context(
@@ -1115,7 +1200,15 @@ def recover_interrupted_operation_execution(
             SafeExecutionErrorCode.WORKSPACE_NOT_FOUND,
             "执行历史对应的工作区不存在",
         )
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    current_policy = _load_valid_execution_policy(
+        session,
+        plan_id=execution.plan_id,
+        workspace_id=execution.workspace_id,
+    )
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=current_policy,
+    )
 
     if execution.status == "EXECUTING":
         try:

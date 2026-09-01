@@ -45,9 +45,11 @@ from .services import (
     OperationPlanTargetConflictError,
     OperationPlanTargetUnavailableError,
     OperationPreviewPathUnavailableError,
+    WorkspacePolicyError,
     WorkspaceNotFoundError,
     get_authorized_file_metadata,
     get_workspace,
+    require_workspace_proposal_policy,
     validate_operation_plan,
 )
 from .tool_contracts import Tool, ToolResult
@@ -195,6 +197,12 @@ def build_propose_move_tool(
                     "source_file_id": options.source_file_id,
                 },
             )
+        except WorkspacePolicyError as error:
+            return ToolResult.failure(
+                code=error.code.value,
+                message=str(error),
+                details={"workspace_id": options.workspace_id},
+            )
         except _PLAN_VALIDATION_ERRORS:
             return ToolResult.failure(
                 code="proposal_unavailable",
@@ -245,12 +253,19 @@ def build_propose_rename_tool(
                     details={"workspace_id": options.workspace_id},
                 )
 
+            policy = require_workspace_proposal_policy(
+                session,
+                options.workspace_id,
+            )
             file_entry = get_authorized_file_metadata(
                 session,
                 options.workspace_id,
                 options.source_file_id,
             )
-            adapter = FileSystemAdapter(Path(workspace.root_path))
+            adapter = FileSystemAdapter(
+                Path(workspace.root_path),
+                workspace_policy=policy,
+            )
             source_path = Path(file_entry.relative_path)
             try:
                 source_metadata = adapter.get_file_metadata(source_path)
@@ -330,6 +345,12 @@ def build_propose_rename_tool(
                     "source_file_id": options.source_file_id,
                 },
             )
+        except WorkspacePolicyError as error:
+            return ToolResult.failure(
+                code=error.code.value,
+                message=str(error),
+                details={"workspace_id": options.workspace_id},
+            )
         except PathPolicyError as error:
             return ToolResult.failure(
                 code=error.code.value,
@@ -388,12 +409,19 @@ def build_propose_quarantine_tool(
                     details={"workspace_id": options.workspace_id},
                 )
 
+            policy = require_workspace_proposal_policy(
+                session,
+                options.workspace_id,
+            )
             file_entry = get_authorized_file_metadata(
                 session,
                 options.workspace_id,
                 options.source_file_id,
             )
-            workspace_adapter = FileSystemAdapter(Path(workspace.root_path))
+            workspace_adapter = FileSystemAdapter(
+                Path(workspace.root_path),
+                workspace_policy=policy,
+            )
             # 构造管理器只校验两个根目录互不包含，不调用会产生移动副作用的方法。
             QuarantineManager(workspace_adapter, quarantine_adapter)
 
@@ -471,6 +499,12 @@ def build_propose_quarantine_tool(
                     "workspace_id": options.workspace_id,
                     "source_file_id": options.source_file_id,
                 },
+            )
+        except WorkspacePolicyError as error:
+            return ToolResult.failure(
+                code=error.code.value,
+                message=str(error),
+                details={"workspace_id": options.workspace_id},
             )
         except (PathPolicyError, QuarantineError) as error:
             return ToolResult.failure(

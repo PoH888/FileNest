@@ -7,8 +7,10 @@ from pydantic import BaseModel, ConfigDict, JsonValue
 from sqlalchemy.orm import Session
 
 from .read_tools import (
+    build_find_similar_folders_tool,
     build_get_file_metadata_tool,
     build_knowledge_search_tool,
+    build_list_directory_tool,
     build_list_workspaces_tool,
     build_search_files_tool,
 )
@@ -87,6 +89,8 @@ def build_read_tool_registry(session: Session) -> ToolRegistry:
     return ToolRegistry(
         [
             build_list_workspaces_tool(session),
+            build_list_directory_tool(session),
+            build_find_similar_folders_tool(session),
             build_search_files_tool(session),
             build_get_file_metadata_tool(session),
             build_knowledge_search_tool(session),

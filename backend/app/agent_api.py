@@ -68,8 +68,10 @@ from .openai_compatible_model_client import (
     UnsupportedModelProviderError,
 )
 from .read_tools import (
+    build_find_similar_folders_tool,
     build_get_file_metadata_tool,
     build_knowledge_search_tool,
+    build_list_directory_tool,
     build_search_files_tool,
 )
 from .retrieval_context import (
@@ -328,7 +330,8 @@ def _build_agent_system_prompt(workspace_id: int) -> str:
     return (
         "你是 FileNest 工作区整理助手。"
         f"本次只允许处理已授权工作区 {workspace_id}。"
-        "先理解用户的整理意图；需要时使用 search_files、"
+        "先理解用户的整理意图；需要时使用 list_directory、"
+        "find_similar_folders、search_files、"
         "get_file_metadata 或 knowledge_search 检索证据。"
         "当意图明确且证据充分时，可以使用 propose_move、"
         "propose_rename 或 propose_quarantine 提出操作计划。"
@@ -384,6 +387,8 @@ class _WorkspaceScopedToolRegistry(ToolRegistry):
     ) -> None:
         super().__init__(
             [
+                build_list_directory_tool(session),
+                build_find_similar_folders_tool(session),
                 build_search_files_tool(session),
                 build_get_file_metadata_tool(session),
                 build_knowledge_search_tool(session),

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.database import Base, get_session
@@ -262,6 +262,315 @@ def test_get_unknown_organization_workflow_returns_safe_404(
 
     assert events_response.status_code == 404
     assert events_response.json() == response.json()
+
+
+def test_pending_approval_list_is_paginated_and_workspace_scoped(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "pending-list-workspace",
+    )
+    request = {
+        "workspace_id": workspace_id,
+        "target_directories": ["reports/quarterly"],
+        "selections": [
+            {
+                "source_file_id": file_id,
+                "target_directory": "reports/quarterly",
+            }
+        ],
+    }
+    first = client.post("/api/v1/workflows", json=request).json()
+    second = client.post("/api/v1/workflows", json=request).json()
+
+    first_page = client.get(
+        "/api/v1/approvals/pending",
+        params={"workspace_id": workspace_id, "page": 1, "page_size": 1},
+    )
+    second_page = client.get(
+        "/api/v1/approvals/pending",
+        params={"workspace_id": workspace_id, "page": 2, "page_size": 1},
+    )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert first_page.json()["total"] == 2
+    assert first_page.json()["has_more"] is True
+    assert second_page.json()["has_more"] is False
+    assert first_page.json()["items"][0]["workflow_id"] == first["workflow_id"]
+    assert second_page.json()["items"][0]["workflow_id"] == second["workflow_id"]
+    item = first_page.json()["items"][0]
+    assert item["workspace_id"] == workspace_id
+    assert item["approval_status"] == "WAITING_APPROVAL"
+    assert item["current_revision"] == 1
+    assert item["recovery_status"] == "available"
+    assert item["source_summary"][0]["target_relative_path"] == (
+        "reports/quarterly/quarterly-report.txt"
+    )
+
+    other_workspace_id, _ = _seed_workspace(
+        session_factory,
+        tmp_path / "pending-list-other-workspace",
+    )
+    other_page = client.get(
+        "/api/v1/approvals/pending",
+        params={"workspace_id": other_workspace_id},
+    )
+    assert other_page.status_code == 200
+    assert other_page.json()["total"] == 0
+
+
+def test_operation_plan_detail_revalidates_and_filters_workspace(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_root = tmp_path / "plan-detail-workspace"
+    workspace_id, file_id = _seed_workspace(session_factory, workspace_root)
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+    plan_id = created["operation_plan"]["plan_id"]
+
+    detail = client.get(f"/api/v1/operation-plans/{plan_id}")
+    assert detail.status_code == 200
+    assert detail.json()["current_revision"] == 1
+    assert detail.json()["validation_status"] == "valid"
+    assert detail.json()["recovery_status"] == "available"
+
+    source_path = workspace_root / "inbox" / "quarterly-report.txt"
+    source_path.write_bytes(b"changed after approval snapshot")
+    changed_detail = client.get(f"/api/v1/operation-plans/{plan_id}")
+    assert changed_detail.status_code == 200
+    assert changed_detail.json()["validation_status"] == "blocked"
+    assert changed_detail.json()["validation_error_code"] == (
+        "operation_plan_source_changed"
+    )
+    assert source_path.read_bytes() == b"changed after approval snapshot"
+
+    hidden_detail = client.get(
+        f"/api/v1/operation-plans/{plan_id}",
+        params={"workspace_id": workspace_id + 1},
+    )
+    hidden_workflow = client.get(
+        f"/api/v1/workflows/{created['workflow_id']}",
+        params={"workspace_id": workspace_id + 1},
+    )
+    assert hidden_detail.status_code == 404
+    assert hidden_workflow.status_code == 404
+
+
+def test_pending_approval_reports_missing_checkpoint_without_writing(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "pending-missing-checkpoint-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+    source_path = (
+        tmp_path
+        / "pending-missing-checkpoint-workspace"
+        / "inbox"
+        / "quarterly-report.txt"
+    )
+    checkpoint_path = tmp_path / "workflow-checkpoints.sqlite"
+    checkpoint_path.unlink()
+
+    response = client.get(
+        "/api/v1/approvals/pending",
+        params={"workspace_id": workspace_id},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["workflow_id"] == created["workflow_id"]
+    assert item["recovery_status"] == "blocked"
+    assert item["recovery_error_code"] == "approval_checkpoint_not_found"
+    assert source_path.exists()
+
+
+def test_decision_and_execution_reject_stale_revision(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "stale-revision-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+    plan_id = created["operation_plan"]["plan_id"]
+    workflow_id = created["workflow_id"]
+
+    stale_decision = client.post(
+        f"/api/v1/workflows/{workflow_id}/decisions",
+        json={
+            "action": "approve",
+            "expected_plan_id": plan_id,
+            "expected_revision": 0,
+        },
+    )
+    assert stale_decision.status_code == 409
+    assert stale_decision.json()["detail"]["code"] == (
+        "organization_workflow_revision_conflict"
+    )
+
+    approved = client.post(
+        f"/api/v1/workflows/{workflow_id}/decisions",
+        json={
+            "action": "approve",
+            "expected_plan_id": plan_id,
+        },
+    )
+    assert approved.status_code == 200
+    source_path = (
+        tmp_path / "stale-revision-workspace" / "inbox" / "quarterly-report.txt"
+    )
+    stale_execution = client.post(
+        f"/api/v1/workflows/{workflow_id}/execute",
+        params={
+            "expected_plan_id": plan_id,
+            "expected_revision": 1,
+        },
+    )
+    assert stale_execution.status_code == 409
+    assert stale_execution.json()["detail"]["code"] == (
+        "organization_workflow_revision_conflict"
+    )
+    assert source_path.exists()
+
+
+def test_operation_plan_list_filters_status_and_paginates_from_business_db(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "plan-list-workspace",
+    )
+    request = {
+        "workspace_id": workspace_id,
+        "target_directories": ["reports/quarterly"],
+        "selections": [
+            {
+                "source_file_id": file_id,
+                "target_directory": "reports/quarterly",
+            }
+        ],
+    }
+    first = client.post("/api/v1/workflows", json=request).json()
+    second = client.post("/api/v1/workflows", json=request).json()
+    approved = client.post(
+        f"/api/v1/workflows/{first['workflow_id']}/decisions",
+        json={
+            "action": "approve",
+            "expected_plan_id": first["operation_plan"]["plan_id"],
+        },
+    )
+    assert approved.status_code == 200
+
+    pending = client.get(
+        "/api/v1/operation-plans",
+        params={
+            "workspace_id": workspace_id,
+            "status": "WAITING_APPROVAL",
+            "page": 1,
+            "page_size": 1,
+        },
+    )
+    all_plans = client.get(
+        "/api/v1/operation-plans",
+        params={"workspace_id": workspace_id},
+    )
+
+    assert pending.status_code == 200
+    assert pending.json()["total"] == 1
+    assert pending.json()["items"][0]["plan_id"] == (
+        second["operation_plan"]["plan_id"]
+    )
+    assert pending.json()["items"][0]["status"] == "WAITING_APPROVAL"
+    assert all_plans.status_code == 200
+    assert all_plans.json()["total"] == 2
+    assert all_plans.json()["items"][0]["plan_id"] == (
+        first["operation_plan"]["plan_id"]
+    )
+
+
+def test_operation_plan_detail_rejects_approval_association_corruption(
+    organization_client: tuple[TestClient, sessionmaker[Session], Path],
+) -> None:
+    client, session_factory, tmp_path = organization_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        tmp_path / "plan-association-workspace",
+    )
+    created = client.post(
+        "/api/v1/workflows",
+        json={
+            "workspace_id": workspace_id,
+            "target_directories": ["reports/quarterly"],
+            "selections": [
+                {
+                    "source_file_id": file_id,
+                    "target_directory": "reports/quarterly",
+                }
+            ],
+        },
+    ).json()
+    with session_factory() as session:
+        approval = session.scalar(
+            select(ApprovalRequest).where(
+                ApprovalRequest.workflow_id == created["workflow_id"]
+            )
+        )
+        assert approval is not None
+        approval.plan_id = str(WORKFLOW_ID)
+        session.commit()
+
+    response = client.get(
+        f"/api/v1/operation-plans/{created['operation_plan']['plan_id']}"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "operation_plan_approval_mismatch"
+    )
 
 
 def test_approve_organization_workflow_via_api(

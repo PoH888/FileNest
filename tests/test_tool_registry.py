@@ -11,6 +11,10 @@ from backend.app.database import Base
 from backend.app.document_chunker import chunk_document
 from backend.app.document_contracts import Document, DocumentPage
 from backend.app.models import ChunkRecord, DocumentRecord, FileEntry, Workspace
+from backend.app.read_tools import (
+    build_find_similar_folders_tool,
+    build_list_directory_tool,
+)
 from backend.app.tool_contracts import Tool, ToolResult
 from backend.app.tool_registry import ToolRegistry, build_read_tool_registry
 
@@ -107,6 +111,8 @@ def test_read_tool_registry_contains_only_formal_read_tools() -> None:
 
     assert registry.names == (
         "list_workspaces",
+        "list_directory",
+        "find_similar_folders",
         "search_files",
         "get_file_metadata",
         "knowledge_search",
@@ -121,6 +127,8 @@ def test_registry_definitions_expose_schema_but_not_handlers() -> None:
 
     assert [definition["name"] for definition in definitions] == [
         "list_workspaces",
+        "list_directory",
+        "find_similar_folders",
         "search_files",
         "get_file_metadata",
         "knowledge_search",
@@ -153,6 +161,248 @@ def test_registry_dispatches_registered_list_workspaces_tool(
         "count": 1,
     }
     assert "root_path" not in result.model_dump_json()
+
+
+def test_list_directory_tool_returns_safe_metadata_and_ignore_reasons(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "directory-tool-workspace"
+    workspace_root.mkdir()
+    (workspace_root / "visible.txt").write_text("visible", encoding="utf-8")
+    (workspace_root / "nested").mkdir()
+    (workspace_root / ".env").write_text("secret", encoding="utf-8")
+    (workspace_root / "denied.txt").write_text("private", encoding="utf-8")
+
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="目录工具工作区",
+            root_path=str(workspace_root),
+        )
+        session.add(workspace)
+        session.commit()
+        result = build_list_directory_tool(
+            session,
+            user_denylist=(workspace_root / "denied.txt",),
+        ).invoke({"workspace_id": workspace.id})
+
+    assert result.ok is True
+    assert isinstance(result.data, dict)
+    items = result.data["items"]
+    by_path = {item["relative_path"]: item for item in items}
+    assert by_path["visible.txt"]["entry_type"] == "file"
+    assert by_path["visible.txt"]["size_bytes"] == len("visible")
+    assert by_path["nested"]["entry_type"] == "directory"
+    assert by_path[".env"] == {
+        "relative_path": ".env",
+        "entry_type": "ignored",
+        "size_bytes": None,
+        "modified_at": None,
+        "ignored_reason": "sensitive_path",
+    }
+    assert by_path["denied.txt"]["ignored_reason"] == "path_denylisted"
+    assert "secret" not in result.model_dump_json()
+    assert str(workspace_root) not in result.model_dump_json()
+
+
+def test_list_directory_tool_supports_bounded_cursor_and_stable_errors(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "directory-tool-paging-workspace"
+    workspace_root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (workspace_root / name).write_text(name, encoding="utf-8")
+
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="目录分页工作区",
+            root_path=str(workspace_root),
+        )
+        session.add(workspace)
+        session.commit()
+        tool = build_list_directory_tool(session)
+        first = tool.invoke(
+            {"workspace_id": workspace.id, "page_size": 2}
+        )
+        second = tool.invoke(
+            {
+                "workspace_id": workspace.id,
+                "page_size": 2,
+                "cursor": first.data["next_cursor"],
+            }
+        )
+        missing = tool.invoke(
+            {
+                "workspace_id": workspace.id,
+                "relative_directory": "missing",
+            }
+        )
+        invalid = tool.invoke(
+            {
+                "workspace_id": workspace.id,
+                "relative_directory": "../",
+            }
+        )
+
+    assert first.ok is True and second.ok is True
+    assert [item["relative_path"] for item in first.data["items"]] == [
+        "a.txt",
+        "b.txt",
+    ]
+    assert [item["relative_path"] for item in second.data["items"]] == [
+        "c.txt",
+    ]
+    assert first.data["has_more"] is True
+    assert second.data["has_more"] is False
+    assert missing.error is not None
+    assert missing.error.code == "directory_not_found"
+    assert invalid.error is not None
+    assert invalid.error.code == "invalid_arguments"
+
+
+def test_find_similar_folders_returns_explainable_index_candidates(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "similar-folders-workspace"
+    for relative_directory in (
+        "inbox",
+        "reports/quarterly",
+        "archive",
+    ):
+        (workspace_root / relative_directory).mkdir(parents=True)
+    source_path = workspace_root / "inbox" / "quarterly-report.txt"
+    source_path.write_text("keep unchanged", encoding="utf-8")
+    (workspace_root / "reports" / "quarterly" / "summary.txt").write_text(
+        "candidate",
+        encoding="utf-8",
+    )
+    (workspace_root / "archive" / "old.pdf").write_text(
+        "other candidate",
+        encoding="utf-8",
+    )
+
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="相似目录工作区",
+            root_path=str(workspace_root),
+        )
+        session.add(workspace)
+        session.flush()
+        source_metadata = source_path.stat()
+        candidate_metadata = (
+            workspace_root / "reports" / "quarterly" / "summary.txt"
+        ).stat()
+        archive_metadata = (workspace_root / "archive" / "old.pdf").stat()
+        source_entry = FileEntry(
+            workspace_id=workspace.id,
+            relative_path="inbox/quarterly-report.txt",
+            name="quarterly-report.txt",
+            extension=".txt",
+            size_bytes=source_metadata.st_size,
+            mtime_ns=source_metadata.st_mtime_ns,
+        )
+        session.add_all(
+            [
+                source_entry,
+                FileEntry(
+                    workspace_id=workspace.id,
+                    relative_path="reports/quarterly/summary.txt",
+                    name="summary.txt",
+                    extension=".txt",
+                    size_bytes=candidate_metadata.st_size,
+                    mtime_ns=candidate_metadata.st_mtime_ns,
+                ),
+                FileEntry(
+                    workspace_id=workspace.id,
+                    relative_path="archive/old.pdf",
+                    name="old.pdf",
+                    extension=".pdf",
+                    size_bytes=archive_metadata.st_size,
+                    mtime_ns=archive_metadata.st_mtime_ns,
+                ),
+            ]
+        )
+        session.commit()
+        result = build_find_similar_folders_tool(session).invoke(
+            {
+                "workspace_id": workspace.id,
+                "source_file_id": source_entry.id,
+            }
+        )
+
+    assert result.ok is True
+    assert isinstance(result.data, dict)
+    assert result.data["empty_reason"] is None
+    candidate = result.data["items"][0]
+    assert candidate["relative_directory"] == "reports/quarterly"
+    assert candidate["score"] == 65
+    assert candidate["reasons"] == [
+        "extension_match",
+        "directory_name_token_overlap",
+    ]
+    assert candidate["file_ids"] == [2]
+    assert source_path.read_text(encoding="utf-8") == "keep unchanged"
+    assert str(workspace_root) not in result.model_dump_json()
+
+
+def test_find_similar_folders_reports_insufficient_samples_and_scope_errors(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "similar-folders-empty-workspace"
+    workspace_root.mkdir()
+    source_path = workspace_root / "only.txt"
+    source_path.write_text("only", encoding="utf-8")
+
+    with Session(engine) as session:
+        workspace = Workspace(
+            name="无候选目录工作区",
+            root_path=str(workspace_root),
+        )
+        session.add(workspace)
+        session.flush()
+        metadata = source_path.stat()
+        source_entry = FileEntry(
+            workspace_id=workspace.id,
+            relative_path="only.txt",
+            name="only.txt",
+            extension=".txt",
+            size_bytes=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+        )
+        session.add(source_entry)
+        session.commit()
+        tool = build_find_similar_folders_tool(session)
+        empty = tool.invoke(
+            {
+                "workspace_id": workspace.id,
+                "source_file_id": source_entry.id,
+            }
+        )
+        missing_workspace = tool.invoke(
+            {"workspace_id": 999, "source_file_id": source_entry.id}
+        )
+        invalid = tool.invoke(
+            {
+                "workspace_id": workspace.id,
+                "source_file_id": source_entry.id,
+                "unexpected": True,
+            }
+        )
+
+    assert empty.ok is True
+    assert empty.data == {
+        "workspace_id": workspace.id,
+        "source_file_id": source_entry.id,
+        "items": [],
+        "empty_reason": "insufficient_directory_samples",
+    }
+    assert missing_workspace.error is not None
+    assert missing_workspace.error.code == "workspace_not_found"
+    assert invalid.error is not None
+    assert invalid.error.code == "invalid_arguments"
 
 
 def test_registry_dispatches_traceable_knowledge_search(

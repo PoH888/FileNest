@@ -1,5 +1,6 @@
 """将工作区文件条目解析、分块并持久化为文档索引。"""
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,11 @@ from .document_chunker import chunk_document
 from .document_parser import parse_document, source_format_for_path
 from .filesystem_adapter import FileSystemAdapter
 from .models import ChunkRecord, DocumentRecord, FileEntry, Workspace
+from .path_policy import PathPolicyError
+from .services import (
+    WorkspaceNotFoundError,
+    require_workspace_read_policy,
+)
 
 
 _PERSISTED_DOCUMENT_EXTENSIONS = frozenset(
@@ -43,8 +49,18 @@ def index_workspace_documents(
         session.rollback()
         raise DocumentIndexWorkspaceNotFoundError(workspace_id)
 
+    try:
+        policy = require_workspace_read_policy(session, workspace_id)
+    except WorkspaceNotFoundError as error:
+        session.rollback()
+        raise DocumentIndexWorkspaceNotFoundError(workspace_id) from error
+
     file_entries = _find_document_file_entries(session, workspace_id)
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
+    logger = logging.getLogger("FileNest")
     indexed_documents = 0
     indexed_chunks = 0
     skipped_documents = 0
@@ -53,6 +69,21 @@ def index_workspace_documents(
     try:
         for file_entry in file_entries:
             failed_file_entry = (file_entry.id, file_entry.relative_path)
+            try:
+                adapter.authorized_path(Path(file_entry.relative_path))
+            except PathPolicyError as error:
+                skipped_documents += 1
+                logger.info(
+                    "Knowledge 索引排除条目",
+                    extra={
+                        "workspace_id": workspace_id,
+                        "relative_path": file_entry.relative_path,
+                        "ignored_reason": error.code.value,
+                    },
+                )
+                failed_file_entry = None
+                continue
+
             document = parse_document(
                 adapter,
                 workspace_id=workspace_id,

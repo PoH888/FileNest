@@ -1,13 +1,14 @@
 """路径安全策略的输入、成功输出与结构化错误契约。"""
 
 import fnmatch
+import json
 import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TypedDict
 
 
@@ -156,6 +157,213 @@ class GlobalIgnorePolicy:
 DEFAULT_GLOBAL_IGNORE_POLICY = GlobalIgnorePolicy()
 
 
+def _normalize_workspace_relative_values(
+    values: Iterable[str],
+    value_name: str,
+    *,
+    allow_glob: bool,
+) -> tuple[str, ...]:
+    """固定 Workspace Policy 的相对路径/模式表示，供后续持久化复用。"""
+
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{value_name} 必须是字符串集合。")
+    try:
+        raw_values = tuple(values)
+    except TypeError as error:
+        raise ValueError(f"{value_name} 必须是字符串集合。") from error
+    if len(raw_values) > 200:
+        raise ValueError(f"{value_name} 不能超过 200 项。")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\\" in value
+            or len(value) > 500
+        ):
+            raise ValueError(f"{value_name} 必须是规范化 workspace 相对路径。")
+        if not allow_glob and any(marker in value for marker in "*?["):
+            raise ValueError(f"{value_name} 不能包含通配符。")
+
+        path = PurePosixPath(value)
+        if (
+            value == "."
+            or path.is_absolute()
+            or PureWindowsPath(value).drive
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or str(path) != value
+        ):
+            raise ValueError(f"{value_name} 必须是规范化 workspace 相对路径。")
+
+        folded = value.casefold()
+        if folded in seen:
+            raise ValueError(f"{value_name} 不能包含重复项。")
+        seen.add(folded)
+        normalized.append(value)
+
+    return tuple(normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspacePolicy:
+    """只能收窄全局安全边界的 Workspace 级策略契约。"""
+
+    policy_revision: int = 0
+    # 默认值保持既有 Workspace 的读、提案和执行行为；新增策略只能显式收窄。
+    read_enabled: bool = True
+    proposal_enabled: bool = True
+    safe_execution_enabled: bool = True
+    user_denylist: tuple[str, ...] = ()
+    ignore_patterns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.policy_revision, int)
+            or isinstance(self.policy_revision, bool)
+            or self.policy_revision < 0
+        ):
+            raise ValueError("policy_revision must be a non-negative integer")
+        for field_name in (
+            "read_enabled",
+            "proposal_enabled",
+            "safe_execution_enabled",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise ValueError(f"{field_name} must be boolean")
+
+        normalized_denylist = _normalize_workspace_relative_values(
+            self.user_denylist,
+            "user_denylist",
+            allow_glob=False,
+        )
+        normalized_patterns = _normalize_workspace_relative_values(
+            self.ignore_patterns,
+            "ignore_patterns",
+            allow_glob=True,
+        )
+        object.__setattr__(self, "user_denylist", normalized_denylist)
+        object.__setattr__(self, "ignore_patterns", normalized_patterns)
+
+    @property
+    def denylisted_paths(self) -> tuple[Path, ...]:
+        """把已验证的 workspace 相对 denylist 转换为 Adapter 输入。"""
+
+        return tuple(Path(value) for value in self.user_denylist)
+
+    @property
+    def ignore_policy(self) -> GlobalIgnorePolicy:
+        """返回叠加在全局忽略策略之上的 workspace 忽略策略。"""
+
+        return GlobalIgnorePolicy(frozenset(self.ignore_patterns))
+
+    def ignores(self, relative_path: Path) -> bool:
+        """判断相对路径或其父目录是否命中 Workspace 忽略规则。"""
+
+        path = PurePosixPath(relative_path.as_posix())
+        parts = tuple(part for part in path.parts if part not in {"", "."})
+        if not parts:
+            return False
+
+        return any(
+            self.ignore_policy.matches(Path(PurePosixPath(*parts[:index])))
+            for index in range(1, len(parts) + 1)
+        )
+
+
+DEFAULT_WORKSPACE_POLICY = WorkspacePolicy()
+
+
+class WorkspacePolicyPersistenceError(ValueError):
+    """持久化策略缺失或无法通过严格契约解析。"""
+
+
+def serialize_workspace_policy_rules(
+    policy: WorkspacePolicy,
+) -> tuple[str, str]:
+    """以稳定 JSON 序列化已校验的 denylist 和 ignore patterns。"""
+
+    return (
+        json.dumps(
+            list(policy.user_denylist),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            list(policy.ignore_patterns),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def workspace_policy_rule_summary(
+    policy: WorkspacePolicy,
+) -> dict[str, list[str]]:
+    """生成只包含规则增删所需字段的审计摘要。"""
+
+    return {
+        "user_denylist": list(policy.user_denylist),
+        "ignore_patterns": list(policy.ignore_patterns),
+    }
+
+
+def parse_workspace_policy(
+    *,
+    policy_revision: int,
+    read_enabled: bool,
+    proposal_enabled: bool,
+    safe_execution_enabled: bool,
+    user_denylist_json: str,
+    ignore_patterns_json: str,
+) -> WorkspacePolicy:
+    """严格解析数据库策略；任何损坏都不能回退到全局默认策略。"""
+
+    try:
+        user_denylist = _parse_policy_rule_list(
+            user_denylist_json,
+            "user_denylist_json",
+        )
+        ignore_patterns = _parse_policy_rule_list(
+            ignore_patterns_json,
+            "ignore_patterns_json",
+        )
+        return WorkspacePolicy(
+            policy_revision=policy_revision,
+            read_enabled=read_enabled,
+            proposal_enabled=proposal_enabled,
+            safe_execution_enabled=safe_execution_enabled,
+            user_denylist=user_denylist,
+            ignore_patterns=ignore_patterns,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        if isinstance(error, WorkspacePolicyPersistenceError):
+            raise
+        raise WorkspacePolicyPersistenceError(
+            "持久化 Workspace Policy 无法通过严格校验"
+        ) from error
+
+
+def _parse_policy_rule_list(raw_json: str, field_name: str) -> tuple[str, ...]:
+    """只接受 JSON 字符串数组，不把损坏值静默转成空策略。"""
+
+    try:
+        parsed = json.loads(raw_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise WorkspacePolicyPersistenceError(
+            f"{field_name} 不是有效 JSON"
+        ) from error
+    if not isinstance(parsed, list) or any(
+        not isinstance(value, str) for value in parsed
+    ):
+        raise WorkspacePolicyPersistenceError(
+            f"{field_name} 必须是字符串数组"
+        )
+    return tuple(parsed)
+
+
 class PathPolicyErrorCode(StrEnum):
     """Path Policy 对外稳定的错误码。"""
 
@@ -166,6 +374,7 @@ class PathPolicyErrorCode(StrEnum):
     PATH_LINK_OUTSIDE_WORKSPACE = "path_link_outside_workspace"
     SENSITIVE_PATH = "sensitive_path"
     PATH_DENYLISTED = "path_denylisted"
+    WORKSPACE_IGNORED = "workspace_ignore"
 
 
 @dataclass(frozen=True, slots=True)

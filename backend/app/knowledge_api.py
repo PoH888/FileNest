@@ -1,6 +1,7 @@
 """Knowledge 文档查询 API。"""
 
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
@@ -11,12 +12,25 @@ from sqlalchemy.orm import Session
 
 from .database import get_session
 from .document_contracts import DocumentPosition
-from .models import ChunkEmbeddingRecord, ChunkRecord, DocumentRecord, FileEntry
+from .filesystem_adapter import FileSystemAdapter
+from .models import (
+    ChunkEmbeddingRecord,
+    ChunkRecord,
+    DocumentRecord,
+    FileEntry,
+    Workspace,
+)
+from .path_policy import PathPolicyError
 from .retrieval_context import (
     RetrievalContextError,
     build_retrieval_context_from_records,
 )
-from .services import get_workspace as get_workspace_service
+from .services import (
+    WorkspaceNotFoundError,
+    WorkspacePolicyError,
+    get_workspace as get_workspace_service,
+    require_workspace_read_policy,
+)
 
 
 router = APIRouter(prefix="/api/v1/knowledge")
@@ -157,8 +171,43 @@ def list_knowledge_documents(
         DocumentRecord.document_id.asc(),
     )
     if workspace_id is not None:
+        workspace = get_workspace_service(session, workspace_id)
+        if workspace is None:
+            return []
+        try:
+            policy = require_workspace_read_policy(session, workspace_id)
+        except WorkspacePolicyError as error:
+            raise _workspace_policy_http_error(error) from error
+        adapter = FileSystemAdapter(
+            Path(workspace.root_path),
+            workspace_policy=policy,
+        )
         statement = statement.where(DocumentRecord.workspace_id == workspace_id)
-    return list(session.scalars(statement).all())
+        return [
+            document
+            for document in session.scalars(statement).all()
+            if _document_is_readable(document, adapter)
+        ]
+
+    readable_documents: list[DocumentRecord] = []
+    for document in session.scalars(statement).all():
+        workspace = session.get(Workspace, document.workspace_id)
+        if workspace is None:
+            continue
+        try:
+            policy = require_workspace_read_policy(
+                session,
+                document.workspace_id,
+            )
+        except (WorkspaceNotFoundError, WorkspacePolicyError):
+            continue
+        adapter = FileSystemAdapter(
+            Path(workspace.root_path),
+            workspace_policy=policy,
+        )
+        if _document_is_readable(document, adapter):
+            readable_documents.append(document)
+    return readable_documents
 
 
 @router.get(
@@ -173,6 +222,32 @@ def get_knowledge_document(
 
     document = session.get(DocumentRecord, str(document_id))
     if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "document_not_found",
+                "message": "Knowledge 文档不存在。",
+            },
+        )
+
+    workspace = session.get(Workspace, document.workspace_id)
+    if workspace is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "document_not_found",
+                "message": "Knowledge 文档不存在。",
+            },
+        )
+    try:
+        policy = require_workspace_read_policy(session, document.workspace_id)
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
+    if not _document_is_readable(document, adapter):
         raise HTTPException(
             status_code=404,
             detail={
@@ -209,7 +284,8 @@ def search_knowledge(
 ) -> KnowledgeSearchResponse:
     """在指定工作区的已索引片段中执行只读关键词搜索。"""
 
-    if get_workspace_service(session, request.workspace_id) is None:
+    workspace = get_workspace_service(session, request.workspace_id)
+    if workspace is None:
         raise HTTPException(
             status_code=404,
             detail={
@@ -217,6 +293,15 @@ def search_knowledge(
                 "message": "工作区不存在。",
             },
         )
+
+    try:
+        policy = require_workspace_read_policy(session, request.workspace_id)
+    except WorkspacePolicyError as error:
+        raise _workspace_policy_http_error(error) from error
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
 
     statement = (
         select(ChunkRecord, DocumentRecord)
@@ -237,7 +322,13 @@ def search_knowledge(
             ChunkRecord.text.icontains(request.query, autoescape=True),
         )
     )
-    rows = list(session.execute(statement).all())
+    rows = []
+    for chunk, document in session.execute(statement).all():
+        try:
+            adapter.authorized_path(Path(chunk.source_relative_path))
+        except PathPolicyError:
+            continue
+        rows.append((chunk, document))
 
     normalized_query = request.query.casefold()
     ranked: list[tuple[int, str, int, str, ChunkRecord, DocumentRecord]] = []
@@ -346,6 +437,32 @@ def search_knowledge(
         provenance=provenance,
         retrieved_at=retrieval_context.retrieved_at,
         snapshot_hash=retrieval_context.snapshot_hash,
+    )
+
+
+def _document_is_readable(
+    document: DocumentRecord,
+    adapter: FileSystemAdapter,
+) -> bool:
+    """只把来源路径仍通过当前 Workspace Policy 的文档投影出去。"""
+
+    try:
+        adapter.authorized_path(Path(document.source_relative_path))
+    except PathPolicyError:
+        return False
+    return True
+
+
+def _workspace_policy_http_error(error: WorkspacePolicyError) -> HTTPException:
+    """把策略拒绝转换为不暴露内部路径的 HTTP 错误。"""
+
+    status_code = 403 if error.code.value.endswith("_disabled") else 409
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": error.code.value,
+            "message": str(error),
+        },
     )
 
 

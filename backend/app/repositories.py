@@ -24,9 +24,17 @@ from .models import (
     OperationPlanRecord,
     OperationStatusRecord,
     Workspace,
+    WorkspacePolicyAuditEvent,
+    WorkspacePolicyRecord,
 )
 from .operation_projection import OperationProjection
 from .operation_status import OperationStatus, transition_operation_status
+from .path_policy import (
+    WorkspacePolicy,
+    WorkspacePolicyPersistenceError,
+    parse_workspace_policy,
+    serialize_workspace_policy_rules,
+)
 
 FileEntrySortField = Literal[
     "relative_path",
@@ -106,6 +114,107 @@ def get_workspace_by_id(
     """按 ID 查询一个工作区，找不到时返回 None。"""
 
     return session.get(Workspace, workspace_id) # 按主键查询
+
+
+def get_workspace_policy_record(
+    session: Session,
+    workspace_id: int,
+) -> WorkspacePolicyRecord | None:
+    """读取 Workspace 的唯一持久化策略记录。"""
+
+    return session.get(WorkspacePolicyRecord, workspace_id)
+
+
+def get_workspace_policy(
+    session: Session,
+    workspace_id: int,
+) -> WorkspacePolicy:
+    """严格读取 Workspace Policy，缺失或损坏时不回退默认值。"""
+
+    record = get_workspace_policy_record(session, workspace_id)
+    if record is None:
+        raise WorkspacePolicyPersistenceError(
+            "workspace policy record is missing"
+        )
+    try:
+        return parse_workspace_policy(
+            policy_revision=record.policy_revision,
+            read_enabled=record.read_enabled,
+            proposal_enabled=record.proposal_enabled,
+            safe_execution_enabled=record.safe_execution_enabled,
+            user_denylist_json=record.user_denylist_json,
+            ignore_patterns_json=record.ignore_patterns_json,
+        )
+    except WorkspacePolicyPersistenceError:
+        raise
+
+
+def add_workspace_policy(
+    session: Session,
+    policy_record: WorkspacePolicyRecord,
+) -> None:
+    """加入 Workspace Policy 初始记录，提交时机由业务服务决定。"""
+
+    session.add(policy_record)
+
+
+def add_workspace_policy_audit_event(
+    session: Session,
+    audit_event: WorkspacePolicyAuditEvent,
+) -> None:
+    """追加策略变更审计，必须与策略更新在同一事务提交。"""
+
+    session.add(audit_event)
+
+
+def find_workspace_policy_audit_events(
+    session: Session,
+    workspace_id: int,
+) -> list[WorkspacePolicyAuditEvent]:
+    """按写入顺序读取一个 Workspace 的策略审计事实。"""
+
+    statement = (
+        select(WorkspacePolicyAuditEvent)
+        .where(WorkspacePolicyAuditEvent.workspace_id == workspace_id)
+        .order_by(WorkspacePolicyAuditEvent.id.asc())
+    )
+    return list(session.scalars(statement).all())
+
+
+def compare_and_set_workspace_policy(
+    session: Session,
+    workspace_id: int,
+    expected_revision: int,
+    policy: WorkspacePolicy,
+) -> bool:
+    """仅在 revision 未变化时原子更新策略内容。"""
+
+    if expected_revision < 0:
+        raise ValueError("expected_revision must not be negative")
+    denylist_json, ignore_patterns_json = serialize_workspace_policy_rules(
+        policy
+    )
+    statement = (
+        update(WorkspacePolicyRecord)
+        .where(
+            WorkspacePolicyRecord.workspace_id == workspace_id,
+            WorkspacePolicyRecord.policy_revision == expected_revision,
+        )
+        .values(
+            policy_revision=policy.policy_revision,
+            read_enabled=policy.read_enabled,
+            proposal_enabled=policy.proposal_enabled,
+            safe_execution_enabled=policy.safe_execution_enabled,
+            user_denylist_json=denylist_json,
+            ignore_patterns_json=ignore_patterns_json,
+            updated_at=func.current_timestamp(),
+        )
+    )
+    result = session.execute(
+        statement,
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount == 1
 
 
 def find_workspaces(
@@ -408,6 +517,73 @@ def get_operation_plan_by_id(
     """按 plan_id 读取独立持久化的完整计划记录。"""
 
     return session.get(OperationPlanRecord, plan_id)
+
+
+def find_operation_plans(
+    session: Session,
+    workspace_id: int,
+    *,
+    plan_status: OperationPlanStatus | None = None,
+    offset: int = 0,
+    limit: int = 20,
+) -> list[OperationPlanRecord]:
+    """按工作区、状态和稳定创建顺序分页读取计划记录。"""
+
+    if workspace_id < 1:
+        raise ValueError("workspace_id must be positive")
+    if plan_status is not None and plan_status not in {
+        "WAITING_APPROVAL",
+        "APPROVED",
+        "REJECTED",
+        "CANCELLED",
+        "SUPERSEDED",
+    }:
+        raise ValueError(f"unsupported operation plan status: {plan_status}")
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    filters = [OperationPlanRecord.workspace_id == workspace_id]
+    if plan_status is not None:
+        filters.append(OperationPlanRecord.status == plan_status)
+    statement = (
+        select(OperationPlanRecord)
+        .where(*filters)
+        .order_by(
+            OperationPlanRecord.created_at.asc(),
+            OperationPlanRecord.plan_id.asc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(session.scalars(statement).all())
+
+
+def count_operation_plans(
+    session: Session,
+    workspace_id: int,
+    *,
+    plan_status: OperationPlanStatus | None = None,
+) -> int:
+    """返回工作区中符合状态过滤的计划总数。"""
+
+    if workspace_id < 1:
+        raise ValueError("workspace_id must be positive")
+    if plan_status is not None and plan_status not in {
+        "WAITING_APPROVAL",
+        "APPROVED",
+        "REJECTED",
+        "CANCELLED",
+        "SUPERSEDED",
+    }:
+        raise ValueError(f"unsupported operation plan status: {plan_status}")
+
+    filters = [OperationPlanRecord.workspace_id == workspace_id]
+    if plan_status is not None:
+        filters.append(OperationPlanRecord.status == plan_status)
+    statement = select(func.count(OperationPlanRecord.plan_id)).where(*filters)
+    return session.scalar(statement) or 0
 
 
 def find_operation_plan_items(

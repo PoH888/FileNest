@@ -9,10 +9,12 @@ from stat import S_ISREG
 
 from .path_policy import (
     AuthorizedPath,
+    DEFAULT_WORKSPACE_POLICY,
     PathPolicyError,
     PathPolicyErrorCode,
     PathPolicyRequest,
     SensitivePathWriteAuditRecord,
+    WorkspacePolicy,
     authorize_path,
     write_sensitive_path_audit,
 )
@@ -37,10 +39,20 @@ class FileSystemAdapter:
         sensitive_path_audit_writer: Callable[
             [SensitivePathWriteAuditRecord], None
         ] = write_sensitive_path_audit,
+        workspace_policy: WorkspacePolicy = DEFAULT_WORKSPACE_POLICY,
     ) -> None:
         self._workspace_root = workspace_root
-        self._user_denylist = user_denylist
+        self._workspace_policy = workspace_policy
+        self._user_denylist = (
+            workspace_policy.denylisted_paths + user_denylist
+        )
         self._sensitive_path_audit_writer = sensitive_path_audit_writer
+
+    @property
+    def workspace_policy(self) -> WorkspacePolicy:
+        """返回当前 Adapter 使用的不可变 Workspace Policy。"""
+
+        return self._workspace_policy
 
     @property
     def workspace_root(self) -> Path:
@@ -134,13 +146,7 @@ class FileSystemAdapter:
 
         for child_path in authorized_directory.path.iterdir():
             try:
-                authorize_path(
-                    PathPolicyRequest(
-                        workspace_root=authorized_directory.workspace_root,
-                        requested_path=child_path,
-                        user_denylist=self._user_denylist,
-                    )
-                )
+                self._authorize(child_path)
             except PathPolicyError as error:
                 if on_ignored is not None:
                     on_ignored(child_path, error)
@@ -153,13 +159,42 @@ class FileSystemAdapter:
     def _authorize(self, requested_path: Path) -> AuthorizedPath:
         """确保 Adapter 的每个文件系统操作使用同一策略入口。"""
 
-        return authorize_path(
+        authorized_path = authorize_path(
             PathPolicyRequest(
                 workspace_root=self._workspace_root,
                 requested_path=requested_path,
                 user_denylist=self._user_denylist,
             )
         )
+        relative_candidates: list[Path] = []
+        try:
+            relative_candidates.append(
+                authorized_path.path.relative_to(authorized_path.workspace_root)
+            )
+        except ValueError:
+            pass
+        if not requested_path.is_absolute():
+            relative_candidates.append(requested_path)
+        else:
+            try:
+                relative_candidates.append(
+                    requested_path.relative_to(
+                        authorized_path.workspace_root,
+                    )
+                )
+            except ValueError:
+                pass
+
+        if any(
+            self._workspace_policy.ignores(candidate)
+            for candidate in relative_candidates
+        ):
+            raise PathPolicyError(
+                PathPolicyErrorCode.WORKSPACE_IGNORED,
+                "请求路径命中 Workspace Policy 忽略规则。",
+            )
+
+        return authorized_path
 
     def _record_sensitive_path_write(
         self,

@@ -33,6 +33,7 @@ from .services import (
     OperationPlanTargetConflictError,
     OperationPlanTargetUnavailableError,
     OperationPreviewPathUnavailableError,
+    WorkspacePolicyError,
     WorkspaceNotFoundError,
     validate_operation_plan,
 )
@@ -230,6 +231,11 @@ class FileNestMCPServer:
             return ToolResult.failure(
                 code="workspace_not_found",
                 message="工作区不存在",
+            )
+        except WorkspacePolicyError as error:
+            return ToolResult.failure(
+                code=error.code.value,
+                message=str(error),
             )
         except FileEntryNotFoundError:
             return ToolResult.failure(

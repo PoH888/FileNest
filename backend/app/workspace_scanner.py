@@ -11,6 +11,7 @@ from .path_policy import (
     DEFAULT_GLOBAL_IGNORE_POLICY,
     GlobalIgnorePolicy,
     PathPolicyError,
+    WorkspacePolicy,
 )
 
 
@@ -40,10 +41,14 @@ def scan_workspace_files(
     *,
     global_ignore_policy: GlobalIgnorePolicy = DEFAULT_GLOBAL_IGNORE_POLICY,
     ignored_entries: list[IgnoredEntry] | None = None,
+    workspace_policy: WorkspacePolicy = WorkspacePolicy(),
 ) -> list[ScannedFile]:
     """通过 FileSystem Adapter 扫描工作区中的普通文件。"""
 
-    adapter = FileSystemAdapter(workspace_root)
+    adapter = FileSystemAdapter(
+        workspace_root,
+        workspace_policy=workspace_policy,
+    )
     logger = logging.getLogger("FileNest")
 
     try:
@@ -68,10 +73,17 @@ def scan_workspace_files(
             error.code.value,
         )
 
+    effective_ignore_patterns = set(global_ignore_policy.patterns)
+    effective_ignore_patterns.update(ignore_patterns or ())
+    effective_ignore_patterns.update(workspace_policy.ignore_patterns)
+    effective_ignore_policy = GlobalIgnorePolicy(
+        frozenset(effective_ignore_patterns)
+    )
+
     folders = scan_directory(
         authorized_root,
         max_depth=max_depth,
-        ignore_patterns=ignore_patterns,
+        ignore_patterns=sorted(effective_ignore_patterns),
     )
     relative_directories = {Path(".")}
 
@@ -87,13 +99,16 @@ def scan_workspace_files(
         relative_directories,
         key=lambda path: path.as_posix().casefold(),
     ):
-        if global_ignore_policy.matches(directory):
+        if effective_ignore_policy.matches(directory):
             _append_ignored_entry(
                 ignored_entries,
                 recorded_ignored,
                 authorized_root,
                 directory,
-                "global_ignore",
+                _ignore_reason(
+                    directory,
+                    workspace_policy=workspace_policy,
+                ),
             )
             continue
 
@@ -115,13 +130,16 @@ def scan_workspace_files(
 
         for name in child_names:
             relative_path = directory / name
-            if global_ignore_policy.matches(relative_path):
+            if effective_ignore_policy.matches(relative_path):
                 _append_ignored_entry(
                     ignored_entries,
                     recorded_ignored,
                     authorized_root,
                     relative_path,
-                    "global_ignore",
+                    _ignore_reason(
+                        relative_path,
+                        workspace_policy=workspace_policy,
+                    ),
                 )
                 continue
 
@@ -196,3 +214,15 @@ def _exclusion_reason(error: OSError | PathPolicyError, fallback: str) -> str:
     if isinstance(error, PathPolicyError):
         return error.code.value
     return fallback
+
+
+def _ignore_reason(
+    relative_path: Path,
+    *,
+    workspace_policy: WorkspacePolicy,
+) -> str:
+    """区分 Workspace Policy 排除与全局/调用方排除原因。"""
+
+    if workspace_policy.ignores(relative_path):
+        return "workspace_ignore"
+    return "global_ignore"

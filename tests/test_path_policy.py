@@ -5,12 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from backend.app.filesystem_adapter import FileSystemAdapter
 from backend.app.path_policy import (
     AuthorizedPath,
     SensitivePathRules,
     PathPolicyError,
     PathPolicyErrorCode,
     PathPolicyRequest,
+    WorkspacePolicy,
     authorize_path,
 )
 
@@ -413,3 +415,64 @@ def test_authorize_path_uses_configured_sensitive_path_rules(
 def test_sensitive_path_rules_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="file_names"):
         SensitivePathRules(file_names="service-token")  # type: ignore[arg-type]
+
+
+def test_workspace_policy_defaults_are_compatible_and_immutable() -> None:
+    policy = WorkspacePolicy()
+
+    assert policy.policy_revision == 0
+    assert policy.read_enabled is True
+    assert policy.proposal_enabled is True
+    assert policy.safe_execution_enabled is True
+    assert policy.user_denylist == ()
+    assert policy.ignore_patterns == ()
+
+    with pytest.raises(FrozenInstanceError):
+        policy.read_enabled = False
+
+
+def test_workspace_policy_only_adds_relative_denylist_and_ignore_rules(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    policy = WorkspacePolicy(
+        policy_revision=3,
+        user_denylist=("private/data",),
+        ignore_patterns=("*.tmp", "cache/**"),
+    )
+    adapter = FileSystemAdapter(
+        workspace_root,
+        workspace_policy=policy,
+    )
+
+    assert policy.denylisted_paths == (Path("private/data"),)
+    assert policy.ignore_policy.matches(Path("draft.tmp"))
+    assert policy.ignore_policy.matches(Path("cache/item.txt"))
+    assert adapter.workspace_policy == policy
+    with pytest.raises(PathPolicyError) as denylisted:
+        adapter.authorized_path(Path("private/data/secret.txt"))
+    assert denylisted.value.code is PathPolicyErrorCode.PATH_DENYLISTED
+    with pytest.raises(PathPolicyError) as sensitive:
+        adapter.authorized_path(Path(".env"))
+    assert sensitive.value.code is PathPolicyErrorCode.SENSITIVE_PATH
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"user_denylist": (".",)},
+        {"user_denylist": ("../private",)},
+        {"user_denylist": ("C:/private",)},
+        {"user_denylist": ("private\\data",)},
+        {"user_denylist": ("private", "PRIVATE")},
+        {"ignore_patterns": ("",)},
+        {"ignore_patterns": ("../*.tmp",)},
+        {"ignore_patterns": ("cache//*.tmp",)},
+        {"ignore_patterns": ("*.tmp", "*.TMP")},
+    ],
+)
+def test_workspace_policy_rejects_unstable_or_duplicate_rules(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        WorkspacePolicy(**kwargs)  # type: ignore[arg-type]

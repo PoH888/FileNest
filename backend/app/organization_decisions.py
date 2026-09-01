@@ -26,6 +26,7 @@ from .services import (
     approve_operation_plan,
     cancel_operation_plan,
     edit_operation_plan,
+    require_workspace_proposal_policy,
     reject_operation_plan,
 )
 from .workflow import WorkflowEvent, WorkflowState
@@ -207,6 +208,10 @@ def apply_organization_plan_edit(
                     replacement_plan,
                     workflow_id=workflow_id,
                     parent_plan_id=workflow.operation_plan.plan_id,
+                    policy=require_workspace_proposal_policy(
+                        session,
+                        replacement_plan.workspace_id,
+                    ),
                 ),
             )
             session.flush()
@@ -238,6 +243,10 @@ def apply_organization_plan_edit(
                         workflow.operation_plan,
                         workflow_id=workflow_id,
                         parent_plan_id=expected_plan_id,
+                        policy=require_workspace_proposal_policy(
+                            session,
+                            workflow.operation_plan.workspace_id,
+                        ),
                     ),
                 )
                 session.flush()

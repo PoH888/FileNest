@@ -26,6 +26,11 @@ from .operation_plan import (
 )
 from .operation_preview import OperationPreviewRequest
 from .operation_status import OperationStatus
+from .path_policy import (
+    DEFAULT_WORKSPACE_POLICY,
+    WorkspacePolicy,
+    serialize_workspace_policy_rules,
+)
 from .repositories import (
     add_approval_request,
     add_operation_plan,
@@ -37,6 +42,7 @@ from .services import (
     generate_operation_preview,
     get_authorized_file_metadata,
     get_workspace,
+    require_workspace_proposal_policy,
     validate_operation_plan,
 )
 from .workflow import WorkflowEvent, WorkflowState
@@ -121,9 +127,14 @@ def build_operation_plan_record(
     workflow_id: UUID,
     agent_run_id: int | None = None,
     parent_plan_id: UUID | None = None,
+    policy: WorkspacePolicy | None = None,
 ) -> OperationPlanRecord:
     """将已验证的计划契约转换为可在业务库中保存的完整记录。"""
 
+    effective_policy = policy or DEFAULT_WORKSPACE_POLICY
+    user_denylist, ignore_patterns = serialize_workspace_policy_rules(
+        effective_policy
+    )
     return OperationPlanRecord(
         plan_id=str(plan.plan_id),
         schema_version=plan.schema_version,
@@ -132,7 +143,19 @@ def build_operation_plan_record(
         workflow_id=str(workflow_id),
         operation_type=plan.operations[0].operation_type,
         metadata_json=json.dumps(
-            {"contract_schema_version": plan.schema_version},
+            {
+                "contract_schema_version": plan.schema_version,
+                "workspace_policy": {
+                    "policy_revision": effective_policy.policy_revision,
+                    "read_enabled": effective_policy.read_enabled,
+                    "proposal_enabled": effective_policy.proposal_enabled,
+                    "safe_execution_enabled": (
+                        effective_policy.safe_execution_enabled
+                    ),
+                    "user_denylist_json": user_denylist,
+                    "ignore_patterns_json": ignore_patterns,
+                },
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         ),
@@ -226,6 +249,7 @@ def build_organization_plan(
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         raise ValueError("now must include timezone information")
 
+    policy = require_workspace_proposal_policy(session, request.workspace_id)
     preview_request = OperationPreviewRequest(
         workspace_id=request.workspace_id,
         source_file_ids=tuple(
@@ -239,7 +263,10 @@ def build_organization_plan(
         # generate_operation_preview 已保证该分支不可达，保留失败关闭边界。
         raise RuntimeError("validated workspace disappeared")
 
-    adapter = FileSystemAdapter(Path(workspace.root_path))
+    adapter = FileSystemAdapter(
+        Path(workspace.root_path),
+        workspace_policy=policy,
+    )
     preview_items = {item.source_file_id: item for item in preview.items}
     operations: list[OperationPlanItem] = []
     for selection in request.selections:
@@ -341,6 +368,7 @@ def create_waiting_approval_workflow_for_plan(
 ) -> CreatedApprovalWorkflow:
     """把已完成业务校验的计划安全提交为待审批工作流。"""
 
+    policy = require_workspace_proposal_policy(session, plan.workspace_id)
     workflow_id = workflow_id_factory()
     initial_workflow = WorkflowState(
         workflow_id=workflow_id,
@@ -360,6 +388,7 @@ def create_waiting_approval_workflow_for_plan(
         plan,
         workflow_id=workflow_id,
         agent_run_id=agent_run_id,
+        policy=policy,
     )
 
     try:

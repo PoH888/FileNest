@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    event,
     Float,
     ForeignKey,
     Numeric,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.engine import Connection
 from sqlalchemy.engine.default import DefaultExecutionContext
 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -71,6 +73,160 @@ class Workspace(Base): # 继承 FileNest 的 ORM 基类
         String,
         nullable=False,
         unique=True, # 给 root_path 添加唯一约束，SQLite 会拒绝第二条记录
+    )
+
+
+class WorkspacePolicyRecord(Base):
+    """一个 Workspace 的持久化收窄策略及其当前 revision。"""
+
+    __tablename__ = "workspace_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "policy_revision >= 0",
+            name="ck_workspace_policies_revision_non_negative",
+        ),
+        CheckConstraint(
+            "length(user_denylist_json) > 0",
+            name="ck_workspace_policies_denylist_json_present",
+        ),
+        CheckConstraint(
+            "length(ignore_patterns_json) > 0",
+            name="ck_workspace_policies_ignore_json_present",
+        ),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    policy_revision: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    read_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    proposal_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    safe_execution_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    user_denylist_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
+    ignore_patterns_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+
+class WorkspacePolicyAuditEvent(Base):
+    """Workspace Policy 变更的结构化、只追加审计事实。"""
+
+    __tablename__ = "workspace_policy_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "previous_revision >= 0 AND next_revision >= 0",
+            name="ck_workspace_policy_audits_revision_non_negative",
+        ),
+        CheckConstraint(
+            "next_revision >= previous_revision",
+            name="ck_workspace_policy_audits_revision_order",
+        ),
+        CheckConstraint(
+            "length(actor) BETWEEN 1 AND 128 AND actor = trim(actor)",
+            name="ck_workspace_policy_audits_actor",
+        ),
+        CheckConstraint(
+            "length(source) BETWEEN 1 AND 128 AND source = trim(source)",
+            name="ck_workspace_policy_audits_source",
+        ),
+        CheckConstraint(
+            "length(added_rules_json) > 0",
+            name="ck_workspace_policy_audits_added_json_present",
+        ),
+        CheckConstraint(
+            "length(removed_rules_json) > 0",
+            name="ck_workspace_policy_audits_removed_json_present",
+        ),
+        CheckConstraint(
+            "result IN ('succeeded', 'failed')",
+            name="ck_workspace_policy_audits_result",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    previous_revision: Mapped[int] = mapped_column(nullable=False)
+    next_revision: Mapped[int] = mapped_column(nullable=False)
+    added_rules_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    removed_rules_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    result: Mapped[str] = mapped_column(String(16), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+
+@event.listens_for(Workspace, "after_insert")
+def _create_default_workspace_policy(
+    mapper: object,
+    connection: Connection,
+    target: Workspace,
+) -> None:
+    """让新建 Workspace 获得兼容默认策略，原始 SQL 缺失时仍由读取端 fail closed。"""
+
+    del mapper
+    connection.execute(
+        WorkspacePolicyRecord.__table__.insert().values(
+            workspace_id=target.id,
+            policy_revision=0,
+            read_enabled=True,
+            proposal_enabled=True,
+            safe_execution_enabled=True,
+            user_denylist_json="[]",
+            ignore_patterns_json="[]",
+        )
     )
 
 
