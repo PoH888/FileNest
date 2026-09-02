@@ -90,8 +90,12 @@ def test_agent_contract_metrics_calculate_required_rates_and_latency() -> None:
             case_id="rag-no-evidence-refusal",
             actual_tool_calls=(
                 _call(
-                    "search_files",
-                    {"workspace_id": 1, "keyword": "roadmap-2030"},
+                    "knowledge_search",
+                    {
+                        "workspace_id": 1,
+                        "query": "roadmap-2030",
+                        "top_k": 5,
+                    },
                 ),
             ),
             actual_result="no_evidence_refusal",

@@ -238,7 +238,7 @@ class AgentContractCase(BaseModel):
 
 
 class AgentContractDataset(BaseModel):
-    """T4-01 目标：五类各四条、总计二十条的固定合同数据集。"""
+    """固定 Agent 合同数据集，保留五类至少四条的基础覆盖。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -248,7 +248,7 @@ class AgentContractDataset(BaseModel):
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
     )
     fixture: AgentContractFixture
-    cases: tuple[AgentContractCase, ...] = Field(min_length=20, max_length=20)
+    cases: tuple[AgentContractCase, ...] = Field(min_length=20, max_length=100)
 
     @model_validator(mode="after")
     def validate_dataset_contract(self) -> "AgentContractDataset":
@@ -266,8 +266,8 @@ class AgentContractDataset(BaseModel):
                 "rag_citation",
             )
         }
-        if any(count != 4 for count in category_counts.values()):
-            raise ValueError("each contract category must contain exactly four cases")
+        if any(count < 4 for count in category_counts.values()):
+            raise ValueError("each contract category must contain at least four cases")
 
         for case in self.cases:
             if case.fixture != self.fixture.fixture_id:

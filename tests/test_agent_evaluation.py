@@ -221,6 +221,21 @@ def test_tool_trajectory_evaluation_accepts_search_read_propose_order() -> None:
     assert result.violations == ()
 
 
+def test_tool_trajectory_evaluation_accepts_directory_inspection_order() -> None:
+    result = evaluate_tool_trajectory(
+        (
+            "list_workspaces",
+            "list_directory",
+            "find_similar_folders",
+            "propose_move",
+        )
+    )
+
+    assert result.passed is True
+    assert result.actual_stages == ("search", "read", "propose")
+    assert result.violations == ()
+
+
 def test_tool_trajectory_evaluation_rejects_wrong_and_dangerous_chain() -> None:
     result = evaluate_tool_trajectory(
         ("propose_move", "approve", "search_files")

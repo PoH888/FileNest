@@ -23,6 +23,8 @@ def test_workspace_agent_registry_exposes_read_search_rag_and_proposal_tools(
     registry = _registry(tmp_path)
 
     assert registry.names == (
+        "list_directory",
+        "find_similar_folders",
         "search_files",
         "get_file_metadata",
         "knowledge_search",

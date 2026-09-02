@@ -47,8 +47,8 @@ def test_contract_runner_executes_all_twenty_cases_and_writes_isolated_evidence(
         version_info=_version_info(),
     )
 
-    assert len(summary.cases) == 20
-    assert summary.metrics.end_to_end_successes == 20
+    assert len(summary.cases) == 24
+    assert summary.metrics.end_to_end_successes == 24
     assert summary.metrics.end_to_end_success_rate == 1
     assert summary.metrics.tool_selection_accuracy == 1
     assert summary.metrics.argument_accuracy == 1
@@ -84,13 +84,13 @@ def test_contract_runner_executes_all_twenty_cases_and_writes_isolated_evidence(
     metadata = json.loads(
         (run_root / "run-metadata.json").read_text(encoding="utf-8")
     )
-    assert metadata["case_count"] == 20
+    assert metadata["case_count"] == 24
     assert metadata["failure_case_ids"] == []
     assert metadata["model_type"] == "deterministic_scripted_fake"
     assert "查找文件名包含" not in json.dumps(metadata, ensure_ascii=False)
 
     junit = ElementTree.parse(run_root / "junit.xml").getroot()
-    assert junit.attrib["tests"] == "20"
+    assert junit.attrib["tests"] == "24"
     assert junit.attrib["failures"] == "0"
 
 

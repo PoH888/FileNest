@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
@@ -55,12 +56,13 @@ from .document_contracts import (
     validate_source_relative_path,
 )
 from .events import build_agent_run_event_stream
-from .model_client import ModelClient, ModelMessage
+from .model_client import ModelClient, ModelMessage, ModelToolCall
 from .model_settings import ModelSettings
 from .models import (
     AgentRun,
     AgentToolCall,
     DocumentRecord,
+    FileEntry,
     OperationPlanRecord,
 )
 from .openai_compatible_model_client import (
@@ -68,6 +70,16 @@ from .openai_compatible_model_client import (
     UnsupportedModelProviderError,
 )
 from .read_tools import (
+    FileMetadataToolData,
+    FindSimilarFoldersArguments,
+    FindSimilarFoldersData,
+    GetFileMetadataArguments,
+    KnowledgeSearchArguments,
+    KnowledgeSearchData,
+    ListDirectoryArguments,
+    ListDirectoryData,
+    SearchFilesArguments,
+    SearchFilesData,
     build_find_similar_folders_tool,
     build_get_file_metadata_tool,
     build_knowledge_search_tool,
@@ -100,6 +112,33 @@ router = APIRouter(prefix="/api/v1")
 NO_EVIDENCE_REFUSAL = "没有足够的文档证据，无法回答该问题。"
 _QUARANTINE_ROOT_ENV = "FILENEST_QUARANTINE_ROOT"
 _AGENT_PROMPT_VERSION = "agent-system-v1"
+_FILESYSTEM_METADATA_TOOL_NAMES = frozenset(
+    {
+        "list_directory",
+        "find_similar_folders",
+        "search_files",
+        "get_file_metadata",
+    }
+)
+_READ_ONLY_OBSERVATION_CONTRACTS = {
+    "list_directory": (ListDirectoryArguments, ListDirectoryData),
+    "find_similar_folders": (
+        FindSimilarFoldersArguments,
+        FindSimilarFoldersData,
+    ),
+    "search_files": (SearchFilesArguments, SearchFilesData),
+    "get_file_metadata": (GetFileMetadataArguments, FileMetadataToolData),
+    "knowledge_search": (KnowledgeSearchArguments, KnowledgeSearchData),
+}
+
+
+@dataclass(frozen=True)
+class _SuccessfulReadObservation:
+    """经过工具、参数、结果和工作区校验的只读观察。"""
+
+    tool_call: ModelToolCall
+    result: ToolResult
+    data: BaseModel
 
 
 class AgentRunRequest(BaseModel):
@@ -586,7 +625,15 @@ class ReadOnlyAgentRunExecutor:
             if result.error is not None
             else None
         )
-        sources = _source_references(result.messages, workspace_id)
+        observations = _successful_read_observations(
+            result.messages,
+            workspace_id,
+        )
+        sources = _source_references(
+            result.messages,
+            workspace_id,
+            session=session,
+        )
         retrieval_contexts = _knowledge_retrieval_contexts(
             result.messages,
             workspace_id,
@@ -603,7 +650,11 @@ class ReadOnlyAgentRunExecutor:
         final_answer = (
             NO_EVIDENCE_REFUSAL
             if result.status == "completed"
-            and (not sources or citation_binding.status == "invalid")
+            and not _has_sufficient_answer_evidence(
+                observations,
+                retrieval_contexts,
+                citation_binding.status,
+            )
             else result.final_answer
         )
         response = AgentRunResponse(
@@ -629,32 +680,94 @@ def _build_model_client() -> ModelClient:
         raise _ModelConfigurationUnavailableError from error
 
 
+def _successful_read_observations(
+    messages: tuple[ModelMessage, ...],
+    workspace_id: int,
+) -> tuple[_SuccessfulReadObservation, ...]:
+    """提取经过严格契约和工作区校验的成功只读观察。"""
+
+    tool_calls = {
+        tool_call.id: tool_call
+        for message in messages
+        if message.role == "assistant"
+        for tool_call in message.tool_calls
+    }
+    observations: list[_SuccessfulReadObservation] = []
+    for message in messages:
+        if message.role != "tool" or message.content is None:
+            continue
+        tool_call = tool_calls.get(message.tool_call_id or "")
+        if tool_call is None:
+            continue
+        contract = _READ_ONLY_OBSERVATION_CONTRACTS.get(tool_call.name)
+        if contract is None:
+            continue
+        arguments_model, data_model = contract
+        try:
+            tool_result = ToolResult.model_validate_json(message.content)
+            arguments = arguments_model.model_validate(tool_call.arguments)
+            data = data_model.model_validate(tool_result.data)
+        except ValidationError:
+            continue
+        if not tool_result.ok:
+            continue
+        if getattr(arguments, "workspace_id", None) != workspace_id:
+            continue
+        returned_workspace_id = getattr(data, "workspace_id", None)
+        if (
+            returned_workspace_id is not None
+            and returned_workspace_id != workspace_id
+        ):
+            continue
+        if isinstance(data, KnowledgeSearchData) and any(
+            item.workspace_id != workspace_id for item in data.items
+        ):
+            continue
+        if isinstance(data, FindSimilarFoldersData) and (
+            not isinstance(arguments, FindSimilarFoldersArguments)
+            or data.source_file_id != arguments.source_file_id
+        ):
+            continue
+        observations.append(
+            _SuccessfulReadObservation(
+                tool_call=tool_call,
+                result=tool_result,
+                data=data,
+            )
+        )
+    return tuple(observations)
+
+
+def _has_sufficient_answer_evidence(
+    observations: tuple[_SuccessfulReadObservation, ...],
+    retrieval_contexts: tuple[RetrievalContext, ...],
+    citation_status: str,
+) -> bool:
+    """按文件系统元数据和文档内容两类证据分别判断回答资格。"""
+
+    if any(
+        observation.tool_call.name == "knowledge_search"
+        for observation in observations
+    ):
+        return bool(retrieval_contexts) and citation_status == "bound"
+    return any(
+        observation.tool_call.name in _FILESYSTEM_METADATA_TOOL_NAMES
+        for observation in observations
+    )
+
+
 def _knowledge_retrieval_contexts(
     messages: tuple[ModelMessage, ...],
     workspace_id: int,
 ) -> tuple[RetrievalContext, ...]:
     """从成功 knowledge_search 消息恢复同一份来源快照。"""
 
-    tool_names = {
-        tool_call.id: tool_call.name
-        for message in messages
-        if message.role == "assistant"
-        for tool_call in message.tool_calls
-    }
     contexts: list[RetrievalContext] = []
-    for message in messages:
-        if message.role != "tool" or message.content is None:
-            continue
-        if tool_names.get(message.tool_call_id or "") != "knowledge_search":
-            continue
-        try:
-            tool_result = ToolResult.model_validate_json(message.content)
-        except ValidationError:
-            continue
-        if not tool_result.ok or not isinstance(tool_result.data, dict):
+    for observation in _successful_read_observations(messages, workspace_id):
+        if not isinstance(observation.data, KnowledgeSearchData):
             continue
         context = _knowledge_retrieval_context_from_data(
-            tool_result.data,
+            observation.data.model_dump(mode="json"),
             workspace_id=workspace_id,
         )
         if context is not None:
@@ -758,41 +871,62 @@ def _source_reference_from_retrieved_chunk(
     )
 
 
+def _source_references_from_similar_folders(
+    session: Session,
+    workspace_id: int,
+    data: FindSimilarFoldersData,
+) -> tuple[AgentSourceReference, ...]:
+    """只把当前工作区中真实存在的相似目录文件 ID 投影为出处。"""
+
+    file_ids = [data.source_file_id]
+    for candidate in data.items:
+        file_ids.extend(candidate.file_ids)
+    unique_file_ids = tuple(dict.fromkeys(file_ids))
+    entries_by_id = {
+        entry.id: entry
+        for entry in session.scalars(
+            select(FileEntry).where(
+                FileEntry.workspace_id == workspace_id,
+                FileEntry.id.in_(unique_file_ids),
+            )
+        ).all()
+    }
+    references: list[AgentSourceReference] = []
+    for file_id in unique_file_ids:
+        entry = entries_by_id.get(file_id)
+        if entry is None:
+            continue
+        try:
+            references.append(
+                AgentSourceReference(
+                    workspace_id=entry.workspace_id,
+                    file_id=entry.id,
+                    name=entry.name,
+                    relative_path=entry.relative_path,
+                )
+            )
+        except ValidationError:
+            continue
+    return tuple(references)
+
+
 def _source_references(
     messages: tuple[ModelMessage, ...],
     workspace_id: int,
+    *,
+    session: Session | None = None,
 ) -> tuple[AgentSourceReference, ...]:
-    """只接受 Agent Loop 生成的成功只读工具消息作为出处证据。"""
+    """只接受经过契约和工作区校验的 Agent 只读观察作为出处证据。"""
 
-    tool_names = {
-        tool_call.id: tool_call.name
-        for message in messages
-        if message.role == "assistant"
-        for tool_call in message.tool_calls
-    }
     references: list[AgentSourceReference] = []
     seen_references: set[AgentSourceReference] = set()
 
-    for message in messages:
-        if message.role != "tool" or message.content is None:
-            continue
-        tool_name = tool_names.get(message.tool_call_id or "")
-        if tool_name not in {
-            "search_files",
-            "get_file_metadata",
-            "knowledge_search",
-        }:
-            continue
-        try:
-            tool_result = ToolResult.model_validate_json(message.content)
-        except ValidationError:
-            continue
-        if not tool_result.ok or not isinstance(tool_result.data, dict):
-            continue
+    for observation in _successful_read_observations(messages, workspace_id):
+        tool_name = observation.tool_call.name
 
         if tool_name == "knowledge_search":
             retrieval_context = _knowledge_retrieval_context_from_data(
-                tool_result.data,
+                observation.data.model_dump(mode="json"),
                 workspace_id=workspace_id,
             )
             if retrieval_context is None:
@@ -808,15 +942,38 @@ def _source_references(
                 seen_references.add(reference)
             continue
 
+        if tool_name == "list_directory":
+            continue
+
+        if tool_name == "find_similar_folders":
+            if session is None or not isinstance(
+                observation.data,
+                FindSimilarFoldersData,
+            ):
+                continue
+            for reference in _source_references_from_similar_folders(
+                session,
+                workspace_id,
+                observation.data,
+            ):
+                if reference in seen_references:
+                    continue
+                references.append(reference)
+                seen_references.add(reference)
+            continue
+
+        raw_data = observation.data.model_dump(mode="json")
         if tool_name == "search_files":
-            raw_items = tool_result.data.get("items", [])
+            raw_items = raw_data.get("items", [])
         elif tool_name == "get_file_metadata":
-            result_workspace_id = tool_result.data.get("workspace_id")
+            result_workspace_id = raw_data.get("workspace_id")
             raw_items = (
-                [tool_result.data]
+                [raw_data]
                 if result_workspace_id == workspace_id
                 else []
             )
+        else:
+            continue
         if not isinstance(raw_items, list):
             continue
 
@@ -830,20 +987,6 @@ def _source_references(
                     "name": raw_item.get("name"),
                     "relative_path": raw_item.get("relative_path"),
                 }
-                if tool_name == "knowledge_search":
-                    reference_data.update(
-                        {
-                            "relative_path": raw_item.get(
-                                "source_relative_path"
-                            ),
-                            "start_line": raw_item.get("start_line"),
-                            "end_line": raw_item.get("end_line"),
-                            "start_offset": raw_item.get("start_offset"),
-                            "end_offset": raw_item.get("end_offset"),
-                            "page_start": raw_item.get("page_start"),
-                            "page_end": raw_item.get("page_end"),
-                        }
-                    )
                 reference = AgentSourceReference.model_validate(reference_data)
             except ValidationError:
                 continue

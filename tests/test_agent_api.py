@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.agent_api import (
+    NO_EVIDENCE_REFUSAL,
     _stream_agent_run_events,
     _source_references,
     AgentRunResponse,
@@ -254,6 +255,210 @@ def test_agent_run_api_returns_read_only_answer_and_run_id(
         persisted_run = session.get(AgentRun, run_id)
         assert persisted_run is not None
         assert persisted_run.status == "completed"
+
+
+def test_agent_run_api_accepts_list_directory_metadata_without_sources(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, _, _ = _seed_disk_workspace(
+        session_factory,
+        tmp_path / "list-directory-workspace",
+        name="目录观察工作区",
+        relative_path="reports/quarterly.txt",
+        contents=b"quarterly",
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_list_directory",
+                name="list_directory",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "relative_directory": ".",
+                },
+            ),
+            _final_response("目录中包含季度报告。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "列出工作区根目录。",
+        },
+    )
+
+    assert response.status_code == 202
+    state = _wait_for_agent_run_completion(client, response.json()["run_id"])
+    assert state.json()["final_answer"] == "目录中包含季度报告。"
+    assert state.json()["sources"] == []
+
+
+def test_agent_run_api_accepts_empty_directory_observation(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_root = tmp_path / "empty-directory-workspace"
+    (workspace_root / "empty").mkdir(parents=True)
+    workspace_id, _, _ = _seed_disk_workspace(
+        session_factory,
+        workspace_root,
+        name="空目录观察工作区",
+        relative_path="reports/quarterly.txt",
+        contents=b"quarterly",
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_empty_directory",
+                name="list_directory",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "relative_directory": "empty",
+                },
+            ),
+            _final_response("该目录为空。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "检查 empty 目录是否为空。",
+        },
+    )
+
+    assert response.status_code == 202
+    state = _wait_for_agent_run_completion(client, response.json()["run_id"])
+    assert state.json()["final_answer"] == "该目录为空。"
+    assert state.json()["sources"] == []
+
+
+def test_agent_run_api_projects_real_similar_folder_file_references(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+    tmp_path: Path,
+) -> None:
+    client, session_factory = agent_client
+    workspace_root = tmp_path / "similar-folder-workspace"
+    workspace_id, source_file_id, _ = _seed_disk_workspace(
+        session_factory,
+        workspace_root,
+        name="相似目录观察工作区",
+        relative_path="inbox/2026-q1-summary.txt",
+        contents=b"q1",
+    )
+    candidate_path = workspace_root / "archive" / "2026-q2-summary.txt"
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_bytes(b"q2")
+    candidate_metadata = candidate_path.stat()
+    with session_factory() as session:
+        session.add(
+            FileEntry(
+                workspace_id=workspace_id,
+                relative_path="archive/2026-q2-summary.txt",
+                name=candidate_path.name,
+                extension=candidate_path.suffix,
+                size_bytes=candidate_metadata.st_size,
+                mtime_ns=candidate_metadata.st_mtime_ns,
+            )
+        )
+        session.commit()
+        candidate_file_id = session.scalar(
+            select(FileEntry.id).where(
+                FileEntry.workspace_id == workspace_id,
+                FileEntry.relative_path == "archive/2026-q2-summary.txt",
+            )
+        )
+    assert candidate_file_id is not None
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_find_similar",
+                name="find_similar_folders",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "source_file_id": source_file_id,
+                },
+            ),
+            _final_response("发现了相似目录。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "查找与季度总结相似的目录。",
+        },
+    )
+
+    assert response.status_code == 202
+    state = _wait_for_agent_run_completion(client, response.json()["run_id"])
+    payload = state.json()
+    assert payload["final_answer"] == "发现了相似目录。"
+    assert {
+        source["relative_path"] for source in payload["sources"]
+    } == {
+        "inbox/2026-q1-summary.txt",
+        "archive/2026-q2-summary.txt",
+    }
+
+
+def test_agent_run_api_requires_citation_for_knowledge_answer(
+    agent_client: tuple[TestClient, sessionmaker[Session]],
+) -> None:
+    client, session_factory = agent_client
+    workspace_id, file_id = _seed_workspace(
+        session_factory,
+        name="缺少引用的知识回答",
+    )
+    _seed_knowledge_document(
+        session_factory,
+        workspace_id=workspace_id,
+        file_id=file_id,
+    )
+    model_client = FakeModelClient(
+        [
+            _tool_call_response(
+                call_id="call_knowledge_without_citation",
+                name="knowledge_search",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "query": "审批",
+                },
+            ),
+            _final_response("文档显示需要先完成审批。"),
+        ]
+    )
+    app.dependency_overrides[get_agent_run_executor] = lambda: (
+        ReadOnlyAgentRunExecutor(lambda: model_client)
+    )
+
+    response = client.post(
+        "/api/v1/agent-runs",
+        json={
+            "workspace_id": workspace_id,
+            "request_text": "审批流程是什么？",
+        },
+    )
+
+    assert response.status_code == 202
+    state = _wait_for_agent_run_completion(client, response.json()["run_id"])
+    assert state.json()["final_answer"] == NO_EVIDENCE_REFUSAL
 
 
 def test_agent_run_history_lists_only_workspace_runs_with_stable_pagination(
@@ -963,7 +1168,9 @@ def test_source_references_preserve_pdf_page_range() -> None:
             "items": [
                 {
                     "file_id": 7,
+                    "workspace_id": 3,
                     "name": "approval.pdf",
+                    "citation_id": "cite_approval",
                     "chunk_id": "chunk-1",
                     "document_id": "document-1",
                     "source_relative_path": "reports/approval.pdf",
@@ -978,6 +1185,12 @@ def test_source_references_preserve_pdf_page_range() -> None:
                     "score": 1,
                 }
             ],
+            "query": "审批",
+            "total": 1,
+            "top_k": 5,
+            "has_more": False,
+            "retrieved_at": "2026-09-03T00:00:00+00:00",
+            "snapshot_hash": "f32c7657e53dc8471740cd6bbfe8f5ef4a4135bc2d65ba20ef2497efff6d3419",
         }
     )
     messages = (
@@ -987,7 +1200,7 @@ def test_source_references_preserve_pdf_page_range() -> None:
                 ModelToolCall(
                     id="call_pdf_source",
                     name="knowledge_search",
-                    arguments={},
+                    arguments={"workspace_id": 3, "query": "审批"},
                 ),
             ),
         ),
@@ -1011,7 +1224,9 @@ def test_source_references_drop_incomplete_pdf_page_range() -> None:
             "items": [
                 {
                     "file_id": 7,
+                    "workspace_id": 3,
                     "name": "approval.pdf",
+                    "citation_id": "cite_invalid_pdf",
                     "chunk_id": "chunk-1",
                     "document_id": "document-1",
                     "source_relative_path": "reports/approval.pdf",
@@ -1026,6 +1241,12 @@ def test_source_references_drop_incomplete_pdf_page_range() -> None:
                     "score": 1,
                 }
             ],
+            "query": "审批",
+            "total": 1,
+            "top_k": 5,
+            "has_more": False,
+            "retrieved_at": "2026-09-03T00:00:00+00:00",
+            "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }
     )
     messages = (
@@ -1035,7 +1256,7 @@ def test_source_references_drop_incomplete_pdf_page_range() -> None:
                 ModelToolCall(
                     id="call_invalid_pdf_source",
                     name="knowledge_search",
-                    arguments={},
+                    arguments={"workspace_id": 3, "query": "审批"},
                 ),
             ),
         ),

@@ -44,6 +44,8 @@ class EvaluationWorkspaceMaterializationError(ValueError):
 AGENT_ALLOWED_TOOL_NAMES = frozenset(
     {
         "list_workspaces",
+        "list_directory",
+        "find_similar_folders",
         "search_files",
         "get_file_metadata",
         "knowledge_search",
@@ -59,6 +61,8 @@ EXPECTED_TOOL_TRAJECTORY: tuple[str, ...] = (
     "propose",
 )
 _TRAJECTORY_TOOL_STAGES = {
+    "list_directory": "search",
+    "find_similar_folders": "read",
     "search_files": "search",
     "knowledge_search": "search",
     "get_file_metadata": "read",

@@ -20,18 +20,18 @@ DATASET_PATH = (
 )
 
 
-def test_agent_contract_dataset_has_twenty_balanced_cases() -> None:
+def test_agent_contract_dataset_has_base_coverage_and_directory_cases() -> None:
     dataset = load_agent_contract_dataset(DATASET_PATH)
 
     assert dataset.dataset_version == "agent-contract-v1"
     assert dataset.fixture.seed == 42
     assert dataset.fixture.root_policy == "fresh_temporary_workspace"
-    assert len(dataset.cases) == 20
+    assert len(dataset.cases) == 24
     assert Counter(case.category for case in dataset.cases) == {
-        "tool_selection": 4,
-        "argument_validity": 4,
+        "tool_selection": 6,
+        "argument_validity": 5,
         "proposal_validity": 4,
-        "security_boundary": 4,
+        "security_boundary": 5,
         "rag_citation": 4,
     }
 

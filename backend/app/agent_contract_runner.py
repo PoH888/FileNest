@@ -439,7 +439,11 @@ def _run_case(
     tool_results = _tool_results(run_result.messages)
     actual_source_paths = tuple(
         source.relative_path
-        for source in _source_references(run_result.messages, workspace_id)
+        for source in _source_references(
+            run_result.messages,
+            workspace_id,
+            session=session,
+        )
     )
     valid_parameter_calls = sum(
         registry.validate(call.name, call.arguments).ok
