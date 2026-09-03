@@ -953,8 +953,8 @@ def test_minimal_ui_wires_execution_and_undo_path() -> None:
     html = response.text
     assert 'id="execute-plan"' in html
     assert 'id="undo-plan"' in html
-    assert "/execute`" in html
-    assert "/undo`" in html
+    assert "/execute?${query}" in html
+    assert "/undo?${query}" in html
     assert 'executePlanButton.addEventListener("click"' in html
     assert 'undoPlanButton.addEventListener("click"' in html
     assert "showExecutionAction();" in html

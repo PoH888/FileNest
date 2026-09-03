@@ -23,6 +23,12 @@
       padding: 0.65rem;
       font: inherit;
     }
+    input[type="text"] {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 0.65rem;
+      font: inherit;
+    }
     textarea {
       min-height: 7rem;
       resize: vertical;
@@ -51,6 +57,12 @@
     .recent-run-button {
       width: 100%;
       text-align: left;
+    }
+    .recent-run-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.35rem;
     }
     #result-answer {
       white-space: pre-wrap;
@@ -117,12 +129,139 @@
       display: flex;
       gap: 0.75rem;
     }
+    #workspace-management,
+    #workspace-actions {
+      margin-top: 1.5rem;
+      border-top: 1px solid #d1d5db;
+      padding-top: 1rem;
+    }
+    #workspace-actions[hidden] {
+      display: none;
+    }
+    #workspace-job-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    #pending-approvals-panel[hidden],
+    #pending-approval-detail[hidden],
+    #pending-edit-form[hidden] {
+      display: none;
+    }
+    #pending-approvals-panel,
+    #pending-approval-detail {
+      margin-top: 1.5rem;
+      border-top: 1px solid #d1d5db;
+      padding-top: 1rem;
+    }
+    #pending-approvals-list,
+    #pending-approval-operations {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+    #pending-approvals-list li + li {
+      margin-top: 0.5rem;
+    }
+    .pending-approval-button {
+      width: 100%;
+      text-align: left;
+    }
+    .pending-approval-actions,
+    .pending-edit-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+    .pending-approval-meta,
+    .pending-approval-status {
+      margin: 0.25rem 0 0;
+    }
+    #pending-edit-targets {
+      display: grid;
+      gap: 0.75rem;
+      margin-top: 0.75rem;
+    }
   </style>
 </head>
 <body>
   <main>
     <h1>FileNest</h1>
     <p>在已授权工作区中提交一次只读文件查询。</p>
+
+    <section id="workspace-management" aria-labelledby="workspace-management-heading">
+      <h2 id="workspace-management-heading">工作区初始化</h2>
+      <form id="workspace-form">
+        <label for="workspace-name">工作区名称</label>
+        <input
+          id="workspace-name"
+          name="name"
+          type="text"
+          maxlength="200"
+          required
+          placeholder="例如：我的资料"
+        >
+        <label for="workspace-root-path">本机根路径</label>
+        <input
+          id="workspace-root-path"
+          name="root_path"
+          type="text"
+          maxlength="4000"
+          required
+          autocomplete="off"
+          placeholder="例如：D:\Documents"
+        >
+        <button id="add-workspace" type="submit">新增工作区</button>
+      </form>
+      <p id="workspace-status" role="status" aria-live="polite">
+        输入服务端可访问的本机目录后新增工作区。
+      </p>
+      <section id="workspace-actions" aria-labelledby="workspace-actions-heading" hidden>
+        <h3 id="workspace-actions-heading">扫描与索引</h3>
+        <div id="workspace-job-actions">
+          <button id="scan-workspace" type="button">扫描工作区</button>
+          <button id="index-documents" type="button">建立文档索引</button>
+        </div>
+        <p id="job-status" role="status" aria-live="polite">
+          当前没有未完成的初始化任务。
+        </p>
+      </section>
+    </section>
+
+    <section
+      id="pending-approvals-panel"
+      aria-labelledby="pending-approvals-heading"
+      hidden
+    >
+      <h2 id="pending-approvals-heading">待审批计划</h2>
+      <p id="pending-approvals-status" role="status" aria-live="polite">
+        选择工作区后加载。
+      </p>
+      <ul id="pending-approvals-list"></ul>
+      <section id="pending-approval-detail" aria-labelledby="pending-approval-detail-heading" hidden>
+        <h3 id="pending-approval-detail-heading">计划详情</h3>
+        <p id="pending-approval-summary" class="pending-approval-meta"></p>
+        <p id="pending-approval-detail-status" class="pending-approval-status" role="status" aria-live="polite"></p>
+        <ul id="pending-approval-operations"></ul>
+        <div id="pending-approval-actions" class="pending-approval-actions" hidden>
+          <button id="pending-approve" type="button">批准</button>
+          <button id="pending-reject" type="button">拒绝</button>
+          <button id="pending-cancel" type="button">取消</button>
+          <button id="pending-edit" type="button">编辑目标</button>
+          <button id="pending-execute" type="button" hidden>执行</button>
+          <button id="pending-undo" type="button" hidden>撤销</button>
+        </div>
+        <form id="pending-edit-form" hidden>
+          <div id="pending-edit-targets"></div>
+          <div class="pending-edit-actions">
+            <button id="pending-edit-submit" type="submit">提交编辑</button>
+            <button id="pending-edit-cancel" type="button">放弃编辑</button>
+          </div>
+        </form>
+        <p id="pending-execution-status" role="status" aria-live="polite"></p>
+        <ul id="pending-execution-list"></ul>
+      </section>
+    </section>
 
     <form id="request-form">
       <label for="workspace-select">工作区</label>
@@ -190,9 +329,62 @@
 
   <script>
     const form = document.querySelector("#request-form");
+    const workspaceForm = document.querySelector("#workspace-form");
+    const workspaceNameInput = document.querySelector("#workspace-name");
+    const workspaceRootPathInput = document.querySelector("#workspace-root-path");
+    const addWorkspaceButton = document.querySelector("#add-workspace");
+    const workspaceStatus = document.querySelector("#workspace-status");
     const workspaceSelect = document.querySelector("#workspace-select");
     const requestText = document.querySelector("#request-text");
     const submitButton = document.querySelector("#submit-request");
+    const workspaceActions = document.querySelector("#workspace-actions");
+    const scanWorkspaceButton = document.querySelector("#scan-workspace");
+    const indexDocumentsButton = document.querySelector("#index-documents");
+    const jobStatus = document.querySelector("#job-status");
+    const pendingApprovalsPanel = document.querySelector(
+      "#pending-approvals-panel",
+    );
+    const pendingApprovalsStatus = document.querySelector(
+      "#pending-approvals-status",
+    );
+    const pendingApprovalsList = document.querySelector(
+      "#pending-approvals-list",
+    );
+    const pendingApprovalDetail = document.querySelector(
+      "#pending-approval-detail",
+    );
+    const pendingApprovalSummary = document.querySelector(
+      "#pending-approval-summary",
+    );
+    const pendingApprovalDetailStatus = document.querySelector(
+      "#pending-approval-detail-status",
+    );
+    const pendingApprovalOperations = document.querySelector(
+      "#pending-approval-operations",
+    );
+    const pendingApprovalActions = document.querySelector(
+      "#pending-approval-actions",
+    );
+    const pendingApproveButton = document.querySelector("#pending-approve");
+    const pendingRejectButton = document.querySelector("#pending-reject");
+    const pendingCancelButton = document.querySelector("#pending-cancel");
+    const pendingEditButton = document.querySelector("#pending-edit");
+    const pendingExecuteButton = document.querySelector("#pending-execute");
+    const pendingUndoButton = document.querySelector("#pending-undo");
+    const pendingEditForm = document.querySelector("#pending-edit-form");
+    const pendingEditTargets = document.querySelector("#pending-edit-targets");
+    const pendingEditSubmitButton = document.querySelector(
+      "#pending-edit-submit",
+    );
+    const pendingEditCancelButton = document.querySelector(
+      "#pending-edit-cancel",
+    );
+    const pendingExecutionStatus = document.querySelector(
+      "#pending-execution-status",
+    );
+    const pendingExecutionList = document.querySelector(
+      "#pending-execution-list",
+    );
     const recentRunsStatus = document.querySelector("#recent-runs-status");
     const recentRunsList = document.querySelector("#recent-runs-list");
     const resultStatus = document.querySelector("#result-status");
@@ -225,7 +417,19 @@
     let currentWorkspaceName = "";
     let proposalRenderToken = 0;
     let recentRunsRequestToken = 0;
+    let pendingApprovalsRequestToken = 0;
+    let pendingApprovalDetailToken = 0;
+    let currentPendingApproval = null;
+    let pendingApprovalBusy = false;
+    let pendingEditMode = false;
+    let activeJobPollTimer = null;
+    let jobPollToken = 0;
+    let currentJob = null;
+    const activeJobs = new Map();
     const ACTIVE_RUN_STORAGE_KEY = "filenest.active_agent_run_id";
+    const ACTIVE_WORKFLOW_STORAGE_KEY = "filenest.active_workflow_id";
+    const ACTIVE_PLAN_STORAGE_KEY = "filenest.active_plan_id";
+    const ACTIVE_JOB_STORAGE_KEY_PREFIX = "filenest.active_job";
 
     const TERMINAL_RUN_STATUSES = new Set([
       "completed",
@@ -235,11 +439,47 @@
       "failed",
     ]);
     const RUN_STATUS_LABELS = Object.freeze({
+      pending: "等待中",
+      running: "运行中",
+      waiting_approval: "等待审批",
       completed: "已完成",
       max_steps_reached: "达到最大步数",
       timed_out: "超时",
       cancelled: "已取消",
       failed: "失败",
+    });
+    const ACTIVE_RUN_STATUSES = new Set([
+      "pending",
+      "running",
+      "waiting_approval",
+    ]);
+    const RESUMABLE_RUN_STATUSES = new Set([
+      "cancelled",
+      "failed",
+      "timed_out",
+      "max_steps_reached",
+    ]);
+    const JOB_STATUS_LABELS = Object.freeze({
+      pending: "等待中",
+      running: "运行中",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+      cancel_requested: "取消中",
+    });
+    const TERMINAL_JOB_STATUSES = new Set([
+      "completed",
+      "failed",
+      "cancelled",
+    ]);
+    const ACTIVE_JOB_STATUSES = new Set([
+      "pending",
+      "running",
+      "cancel_requested",
+    ]);
+    const JOB_KIND_LABELS = Object.freeze({
+      workspace_scan: "扫描",
+      document_index: "文档索引",
     });
     const TOOL_STATUS_LABELS = Object.freeze({
       requested: "已请求",
@@ -310,8 +550,389 @@
       }
     }
 
+    function clearActiveRun(runId = null) {
+      try {
+        if (
+          runId === null ||
+          window.localStorage.getItem(ACTIVE_RUN_STORAGE_KEY) === String(runId)
+        ) {
+          window.localStorage.removeItem(ACTIVE_RUN_STORAGE_KEY);
+        }
+      } catch {
+        // 本地存储不可用时不影响当前页面的恢复尝试。
+      }
+    }
+
+    function isStoredUuid(value) {
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        value ?? "",
+      );
+    }
+
+    function readStoredWorkflowId() {
+      try {
+        const workflowId = window.localStorage.getItem(
+          ACTIVE_WORKFLOW_STORAGE_KEY,
+        );
+        return isStoredUuid(workflowId) ? workflowId : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function rememberActiveWorkflow(workflowId, planId) {
+      try {
+        window.localStorage.setItem(
+          ACTIVE_WORKFLOW_STORAGE_KEY,
+          String(workflowId),
+        );
+        window.localStorage.setItem(ACTIVE_PLAN_STORAGE_KEY, String(planId));
+      } catch {
+        // 服务端状态仍然有效，存储不可用时只影响刷新后的自动选中。
+      }
+    }
+
+    function clearActiveWorkflow(workflowId = null) {
+      try {
+        if (
+          workflowId === null ||
+          window.localStorage.getItem(ACTIVE_WORKFLOW_STORAGE_KEY) ===
+            String(workflowId)
+        ) {
+          window.localStorage.removeItem(ACTIVE_WORKFLOW_STORAGE_KEY);
+          window.localStorage.removeItem(ACTIVE_PLAN_STORAGE_KEY);
+        }
+      } catch {
+        // 下一次加载仍以服务端待审批列表为准。
+      }
+    }
+
+    function jobStorageKey(workspaceId, kind) {
+      return `${ACTIVE_JOB_STORAGE_KEY_PREFIX}.${String(kind)}.${String(workspaceId)}`;
+    }
+
+    function readStoredJobId(workspaceId, kind) {
+      try {
+        const jobId = window.localStorage.getItem(
+          jobStorageKey(workspaceId, kind),
+        );
+        return /^[0-9a-f-]{20,100}$/i.test(jobId ?? "") ? jobId : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function rememberJobId(workspaceId, kind, jobId) {
+      try {
+        window.localStorage.setItem(jobStorageKey(workspaceId, kind), String(jobId));
+      } catch {
+        // 状态仍由服务端保存，存储不可用时只影响刷新后的自动恢复。
+      }
+    }
+
+    function forgetJobId(workspaceId, kind, jobId = null) {
+      try {
+        const key = jobStorageKey(workspaceId, kind);
+        if (jobId === null || window.localStorage.getItem(key) === String(jobId)) {
+          window.localStorage.removeItem(key);
+        }
+      } catch {
+        // 无法清理本地句柄时，下一次恢复仍会以服务端 Job 列表为准。
+      }
+    }
+
+    function jobKey(workspaceId, kind) {
+      return `${String(workspaceId)}:${String(kind)}`;
+    }
+
+    function workspaceHasActiveJob(workspaceId) {
+      const prefix = `${String(workspaceId)}:`;
+      return [...activeJobs.keys()].some((key) => key.startsWith(prefix));
+    }
+
+    function updateWorkspaceActionState() {
+      const workspaceId = workspaceSelect.value;
+      workspaceActions.hidden = !workspaceId;
+      const disabled = !workspaceId || workspaceHasActiveJob(workspaceId);
+      scanWorkspaceButton.disabled = disabled;
+      indexDocumentsButton.disabled = disabled;
+    }
+
+    function renderJobStatus(payload, kind = "") {
+      const status = String(payload?.status ?? "");
+      const statusLabel = JOB_STATUS_LABELS[status] ?? "状态未知";
+      const kindLabel =
+        JOB_KIND_LABELS[kind] ?? JOB_KIND_LABELS[payload?.kind] ?? "初始化";
+      const attempts = Array.isArray(payload?.attempts) ? payload.attempts : [];
+      const attempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
+      const completedUnits = attempt?.completed_units;
+      const totalUnits = attempt?.total_units;
+      let progress = "";
+      if (Number.isInteger(completedUnits) && Number.isInteger(totalUnits)) {
+        progress = `；进度 ${String(completedUnits)}/${String(totalUnits)}`;
+      } else if (Number.isInteger(completedUnits)) {
+        progress = `；已处理 ${String(completedUnits)} 项`;
+      }
+      const phase =
+        typeof attempt?.phase_code === "string" && attempt.phase_code
+          ? `；阶段 ${attempt.phase_code}`
+          : "";
+      const error =
+        typeof payload?.error_code === "string" && payload.error_code
+          ? `；错误码 ${payload.error_code}`
+          : "";
+      jobStatus.textContent = `${kindLabel}任务：${statusLabel}（${status}）${progress}${phase}${error}`;
+    }
+
+    function stopJobPolling() {
+      jobPollToken += 1;
+      if (activeJobPollTimer !== null) {
+        window.clearTimeout(activeJobPollTimer);
+        activeJobPollTimer = null;
+      }
+      currentJob = null;
+    }
+
+    async function pollJobStatus(job, pollToken) {
+      if (
+        pollToken !== jobPollToken ||
+        workspaceSelect.value !== String(job.workspaceId)
+      ) {
+        return;
+      }
+
+      try {
+        const query = new URLSearchParams({
+          workspace_id: String(job.workspaceId),
+        });
+        const response = await fetch(
+          `/api/v1/jobs/${encodeURIComponent(job.jobId)}?${query}`,
+        );
+        const payload = await response.json();
+        if (response.status === 404) {
+          activeJobs.delete(jobKey(job.workspaceId, job.kind));
+          forgetJobId(job.workspaceId, job.kind, job.jobId);
+          jobStatus.textContent = "初始化任务不存在，请重新提交。";
+          updateWorkspaceActionState();
+          return;
+        }
+        if (
+          !response.ok ||
+          !payload ||
+          typeof payload !== "object" ||
+          String(payload.job_id) !== String(job.jobId) ||
+          Number(payload.workspace_id) !== Number(job.workspaceId) ||
+          typeof payload.status !== "string"
+        ) {
+          throw new Error("job status unavailable");
+        }
+        if (
+          pollToken !== jobPollToken ||
+          workspaceSelect.value !== String(job.workspaceId)
+        ) {
+          return;
+        }
+
+        currentJob = {...job, status: String(payload.status)};
+        renderJobStatus(payload, job.kind);
+        if (TERMINAL_JOB_STATUSES.has(String(payload.status))) {
+          activeJobs.delete(jobKey(job.workspaceId, job.kind));
+          forgetJobId(job.workspaceId, job.kind, job.jobId);
+          updateWorkspaceActionState();
+          return;
+        }
+        activeJobPollTimer = window.setTimeout(
+          () => void pollJobStatus(job, pollToken),
+          500,
+        );
+      } catch {
+        if (
+          pollToken !== jobPollToken ||
+          workspaceSelect.value !== String(job.workspaceId)
+        ) {
+          return;
+        }
+        jobStatus.textContent = "任务状态暂时读取失败，正在重试…";
+        activeJobPollTimer = window.setTimeout(
+          () => void pollJobStatus(job, pollToken),
+          1000,
+        );
+      }
+    }
+
+    function startJobPolling(jobId, kind, workspaceId) {
+      stopJobPolling();
+      const job = {
+        jobId: String(jobId),
+        kind: String(kind),
+        workspaceId: Number(workspaceId),
+      };
+      activeJobs.set(jobKey(job.workspaceId, job.kind), job.jobId);
+      rememberJobId(job.workspaceId, job.kind, job.jobId);
+      jobStatus.textContent = `${JOB_KIND_LABELS[job.kind] ?? "初始化"}任务状态读取中…`;
+      updateWorkspaceActionState();
+      void pollJobStatus(job, jobPollToken);
+    }
+
+    async function restoreWorkspaceJobs() {
+      const workspaceId = workspaceSelect.value;
+      stopJobPolling();
+      updateWorkspaceActionState();
+      if (!workspaceId) {
+        jobStatus.textContent = "选择工作区后加载任务。";
+        return;
+      }
+
+      const storedJobs = new Map();
+      for (const kind of Object.keys(JOB_KIND_LABELS)) {
+        const jobId = readStoredJobId(workspaceId, kind);
+        if (jobId !== null) {
+          const key = jobKey(workspaceId, kind);
+          activeJobs.set(key, jobId);
+          storedJobs.set(key, {kind, jobId});
+        }
+      }
+      updateWorkspaceActionState();
+      const requestToken = jobPollToken;
+      jobStatus.textContent = "正在恢复初始化任务…";
+      try {
+        const query = new URLSearchParams({workspace_id: workspaceId});
+        const response = await fetch(`/api/v1/jobs?${query}`);
+        const payload = await response.json();
+        if (
+          !response.ok ||
+          !Array.isArray(payload) ||
+          requestToken !== jobPollToken ||
+          workspaceSelect.value !== workspaceId
+        ) {
+          throw new Error("job list unavailable");
+        }
+
+        const jobs = payload.filter(
+          (job) =>
+            job &&
+            typeof job === "object" &&
+            Number(job.workspace_id) === Number(workspaceId) &&
+            typeof job.job_id === "string" &&
+            typeof job.kind === "string",
+        );
+        const listedJobKeys = new Set(
+          jobs.map((job) => jobKey(workspaceId, String(job.kind))),
+        );
+        for (const [key, stored] of storedJobs) {
+          if (!listedJobKeys.has(key)) {
+            activeJobs.delete(key);
+            forgetJobId(workspaceId, stored.kind, stored.jobId);
+          }
+        }
+        for (const job of jobs) {
+          if (TERMINAL_JOB_STATUSES.has(String(job.status))) {
+            activeJobs.delete(jobKey(workspaceId, job.kind));
+            forgetJobId(workspaceId, job.kind, job.job_id);
+          }
+        }
+        const unfinished = jobs.find((job) =>
+          ACTIVE_JOB_STATUSES.has(String(job.status)),
+        );
+        if (unfinished) {
+          startJobPolling(unfinished.job_id, unfinished.kind, workspaceId);
+          return;
+        }
+        jobStatus.textContent = "当前没有未完成的初始化任务。";
+        updateWorkspaceActionState();
+      } catch {
+        if (requestToken === jobPollToken && workspaceSelect.value === workspaceId) {
+          jobStatus.textContent = "初始化任务恢复失败，请稍后刷新。";
+        }
+      }
+    }
+
+    async function submitWorkspaceJob(kind, endpoint, button) {
+      const workspaceId = workspaceSelect.value;
+      if (!workspaceId || workspaceHasActiveJob(workspaceId)) {
+        return;
+      }
+
+      button.disabled = true;
+      jobStatus.textContent = `${JOB_KIND_LABELS[kind] ?? "初始化"}任务提交中…`;
+      try {
+        const response = await fetch(endpoint, {method: "POST"});
+        const payload = await response.json();
+        if (!response.ok || typeof payload?.job_id !== "string") {
+          jobStatus.textContent = safeErrorMessage(
+            payload,
+            "初始化任务提交失败，请稍后重试。",
+          );
+          return;
+        }
+        startJobPolling(payload.job_id, kind, workspaceId);
+      } catch {
+        jobStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        updateWorkspaceActionState();
+      }
+    }
+
     function recentRunStatusLabel(status) {
       return RUN_STATUS_LABELS[status] ?? "处理中";
+    }
+
+    async function submitAgentRunAction(run, action, button) {
+      const workspaceId = workspaceSelect.value;
+      if (
+        !workspaceId ||
+        Number(run.workspace_id) !== Number(workspaceId) ||
+        !Number.isInteger(run.run_id)
+      ) {
+        return;
+      }
+
+      button.disabled = true;
+      resultStatus.textContent =
+        action === "cancel"
+          ? `运行 #${String(run.run_id)} 取消请求提交中…`
+          : `运行 #${String(run.run_id)} 恢复请求提交中…`;
+      try {
+        const latest = await requestRunResult(run.run_id);
+        const canCancel = ACTIVE_RUN_STATUSES.has(String(latest.status));
+        const canResume = RESUMABLE_RUN_STATUSES.has(String(latest.status));
+        if ((action === "cancel" && !canCancel) || (action === "resume" && !canResume)) {
+          resultStatus.textContent =
+            `运行 #${String(run.run_id)} 当前状态为${recentRunStatusLabel(latest.status)}，未执行操作。`;
+          renderRunResult(latest, currentWorkspaceName);
+          return;
+        }
+
+        const response = await fetch(
+          `/api/v1/agent-runs/${encodeURIComponent(String(run.run_id))}/${action}`,
+          {method: "POST"},
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          resultStatus.textContent = safeErrorMessage(
+            payload,
+            action === "cancel"
+              ? "取消失败，请刷新运行状态。"
+              : "恢复失败，请刷新运行状态。",
+          );
+          const refreshed = await loadRunResult(run.run_id, currentWorkspaceName);
+          if (refreshed !== null && ACTIVE_RUN_STATUSES.has(refreshed.status)) {
+            startRunEventStream(run.run_id, currentWorkspaceName);
+          }
+          return;
+        }
+
+        saveActiveRun(run.run_id);
+        const refreshed = await loadRunResult(run.run_id, currentWorkspaceName);
+        if (refreshed !== null && !TERMINAL_RUN_STATUSES.has(refreshed.status)) {
+          startRunEventStream(run.run_id, currentWorkspaceName);
+        }
+        void loadRecentRuns();
+      } catch {
+        resultStatus.textContent = "运行状态读取失败，请刷新后重试。";
+      } finally {
+        button.disabled = false;
+      }
     }
 
     function renderRecentRuns(payload, requestToken) {
@@ -368,7 +989,29 @@
             },
           );
         });
-        item.append(button);
+        const actions = document.createElement("div");
+        actions.className = "recent-run-actions";
+        if (ACTIVE_RUN_STATUSES.has(String(run.status))) {
+          const cancelButton = document.createElement("button");
+          cancelButton.type = "button";
+          cancelButton.textContent = "取消";
+          cancelButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            void submitAgentRunAction(run, "cancel", cancelButton);
+          });
+          actions.append(cancelButton);
+        }
+        if (RESUMABLE_RUN_STATUSES.has(String(run.status))) {
+          const resumeButton = document.createElement("button");
+          resumeButton.type = "button";
+          resumeButton.textContent = "恢复";
+          resumeButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            void submitAgentRunAction(run, "resume", resumeButton);
+          });
+          actions.append(resumeButton);
+        }
+        item.append(button, actions);
         recentRunsList.append(item);
       }
     }
@@ -461,6 +1104,9 @@
           `/api/v1/agent-runs/${encodeURIComponent(normalizedRunId)}?${query}`,
         );
         const payload = await response.json();
+        if (response.status === 404) {
+          clearActiveRun(normalizedRunId);
+        }
         if (
           !response.ok ||
           !payload ||
@@ -774,8 +1420,7 @@
       if (eventType === "approval.waiting") {
         planStatus.textContent = "计划等待审批。";
       } else if (eventType === "approval.approved") {
-        planStatus.textContent = "计划已批准，尚未执行文件操作。";
-        showExecutionAction();
+        void refreshCurrentPlanState("计划已批准，尚未执行文件操作。");
       } else if (eventType === "approval.rejected") {
         planStatus.textContent =
           payload.action === "cancel" ? "计划已取消。" : "计划已拒绝。";
@@ -789,8 +1434,7 @@
         planStatus.textContent = "部分文件执行失败。";
       } else if (eventType === "execution.completed") {
         if (payload.status === "COMPLETED") {
-          planStatus.textContent = "计划已执行，文件已移动，可以撤销。";
-          showUndoAction();
+          void refreshCurrentPlanState("计划已执行，文件已移动，可以撤销。");
         } else {
           planStatus.textContent = `执行结果：${String(payload.status)}。`;
           eventSource.close();
@@ -833,6 +1477,508 @@
       };
     }
 
+    function pendingApprovalItemIsValid(item, workspaceId) {
+      return (
+        item &&
+        typeof item === "object" &&
+        Number(item.workspace_id) === Number(workspaceId) &&
+        typeof item.workflow_id === "string" &&
+        typeof item.plan_id === "string" &&
+        typeof item.approval_status === "string" &&
+        typeof item.recovery_status === "string" &&
+        Array.isArray(item.source_summary) &&
+        Array.isArray(item.targets)
+      );
+    }
+
+    function resetPendingApprovalDetail() {
+      pendingApprovalDetailToken += 1;
+      currentPendingApproval = null;
+      pendingEditMode = false;
+      pendingApprovalDetail.hidden = true;
+      pendingApprovalActions.hidden = true;
+      pendingEditForm.hidden = true;
+      pendingApprovalSummary.textContent = "";
+      pendingApprovalDetailStatus.textContent = "";
+      pendingApprovalOperations.replaceChildren();
+      pendingEditTargets.replaceChildren();
+      pendingExecutionStatus.textContent = "";
+      pendingExecutionList.replaceChildren();
+    }
+
+    function renderPendingApprovalPreview(item) {
+      pendingApprovalDetail.hidden = false;
+      pendingApprovalActions.hidden = true;
+      pendingEditForm.hidden = true;
+      pendingApprovalSummary.textContent =
+        `Workflow ${String(item.workflow_id)}；Plan ${String(item.plan_id)}；revision ${String(item.current_revision)}`;
+      pendingApprovalDetailStatus.textContent = "正在读取最新计划与恢复状态…";
+      pendingApprovalOperations.replaceChildren();
+      for (const source of item.source_summary) {
+        const operation = document.createElement("li");
+        operation.textContent =
+          `${String(source.source_relative_path)} → ${String(source.target_relative_path)}`;
+        pendingApprovalOperations.append(operation);
+      }
+    }
+
+    function renderPendingApprovalDetails(plan, workflow) {
+      const snapshot = workflowSnapshot(workflow);
+      if (snapshot === null) {
+        throw new Error("pending workflow snapshot unavailable");
+      }
+
+      const validation = String(plan.validation_status ?? "unknown");
+      const recovery = String(plan.recovery_status ?? "unknown");
+      const validationError =
+        typeof plan.validation_error_code === "string" && plan.validation_error_code
+          ? `；校验错误码 ${plan.validation_error_code}`
+          : "";
+      const recoveryError =
+        typeof plan.recovery_error_code === "string" && plan.recovery_error_code
+          ? `；恢复错误码 ${plan.recovery_error_code}`
+          : "";
+      const waitReason =
+        typeof workflow.wait_reason_code === "string" && workflow.wait_reason_code
+          ? `；等待原因 ${workflow.wait_reason_code}`
+          : "";
+      pendingApprovalSummary.textContent =
+        `Workflow ${snapshot.workflowId}；Plan ${snapshot.planId}；revision ${String(snapshot.revision)}；工作流 ${String(workflow.status)}；审批 ${String(workflow.approval_status)}；校验 ${validation}；恢复 ${recovery}${validationError}${recoveryError}${waitReason}`;
+      pendingApprovalDetailStatus.textContent = "最新计划与恢复状态已读取。";
+      pendingApprovalOperations.replaceChildren();
+      pendingEditMode = false;
+      for (const operation of plan.operations) {
+        const item = document.createElement("li");
+        const risks = Array.isArray(operation.risks) ? operation.risks : [];
+        const riskText = risks.length
+          ? risks
+              .map(
+                (risk) =>
+                  `${String(risk.level)} / ${String(risk.code)}：${String(risk.description)}`,
+              )
+              .join("；")
+          : "无结构化风险";
+        item.textContent =
+          `${String(operation.source_relative_path)} → ${String(operation.target_relative_path)}；风险：${riskText}`;
+        pendingApprovalOperations.append(item);
+      }
+
+      pendingEditTargets.replaceChildren();
+      for (const operation of plan.operations) {
+        const field = document.createElement("div");
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "text";
+        input.required = true;
+        input.maxLength = 400;
+        input.dataset.fileId = String(operation.source_file_id);
+        const targetPath = String(operation.target_relative_path);
+        const slash = targetPath.lastIndexOf("/");
+        input.value = slash > 0 ? targetPath.slice(0, slash) : "";
+        label.htmlFor = `pending-target-${String(operation.source_file_id)}`;
+        input.id = label.htmlFor;
+        label.textContent = `目标目录：${String(operation.source_relative_path)}`;
+        field.append(label, input);
+        pendingEditTargets.append(field);
+      }
+      pendingEditForm.hidden = true;
+      pendingApprovalDetail.hidden = false;
+      configurePendingApprovalActions();
+    }
+
+    function pendingApprovalActionState() {
+      const current = currentPendingApproval;
+      if (current === null || current.workflow === null || current.plan === null) {
+        return null;
+      }
+      const snapshot = workflowSnapshot(current.workflow);
+      if (snapshot === null) {
+        return null;
+      }
+
+      const waiting =
+        current.workflow.status === "waiting" &&
+        current.workflow.approval_status === "WAITING_APPROVAL" &&
+        current.workflow.operation?.overall_status === "WAITING_APPROVAL";
+      const safeForApproval =
+        current.item.recovery_status === "available" &&
+        current.plan.validation_status === "valid" &&
+        current.plan.recovery_status === "available";
+      const safeForExecution = current.plan.validation_status === "valid";
+      const safeForUndo =
+        String(current.plan.workflow_id) === snapshot.workflowId &&
+        String(current.plan.plan_id) === snapshot.planId;
+      return {
+        snapshot,
+        approve: waiting && safeForApproval,
+        reject: waiting,
+        cancel: waiting,
+        edit: waiting && safeForApproval,
+        execute:
+          safeForExecution &&
+          current.workflow.status === "ready" &&
+          current.workflow.approval_status === "APPROVED" &&
+          current.workflow.operation?.overall_status === "APPROVED",
+        undo:
+          safeForUndo &&
+          current.workflow.status === "ready" &&
+          current.workflow.approval_status === "APPROVED" &&
+          current.workflow.operation?.overall_status === "COMPLETED",
+      };
+    }
+
+    function configurePendingApprovalActions() {
+      const state = pendingApprovalActionState();
+      const buttons = [
+        [pendingApproveButton, state?.approve === true],
+        [pendingRejectButton, state?.reject === true],
+        [pendingCancelButton, state?.cancel === true],
+        [pendingEditButton, state?.edit === true],
+        [pendingExecuteButton, state?.execute === true],
+        [pendingUndoButton, state?.undo === true],
+      ];
+      const anyVisible = buttons.some(([, visible]) => visible);
+      pendingApprovalActions.hidden = !anyVisible;
+      for (const [button, visible] of buttons) {
+        button.hidden = !visible;
+        button.disabled = pendingApprovalBusy || !visible;
+      }
+      if (state?.edit !== true) {
+        pendingEditMode = false;
+        pendingEditForm.hidden = true;
+      } else {
+        pendingEditForm.hidden = !pendingEditMode;
+      }
+      pendingEditSubmitButton.disabled = pendingApprovalBusy;
+      pendingEditCancelButton.disabled = pendingApprovalBusy;
+    }
+
+    async function loadPendingApprovalDetails(item, statusMessage = "") {
+      const workspaceId = workspaceSelect.value;
+      if (!pendingApprovalItemIsValid(item, workspaceId)) {
+        return false;
+      }
+      const requestToken = ++pendingApprovalDetailToken;
+      currentPendingApproval = {item, plan: null, workflow: null};
+      rememberActiveWorkflow(item.workflow_id, item.plan_id);
+      renderPendingApprovalPreview(item);
+      try {
+        const workflow = await fetchWorkflowState(item.workflow_id);
+        const snapshot = workflowSnapshot(workflow);
+        if (snapshot === null) {
+          throw new Error("pending workflow snapshot unavailable");
+        }
+        const plan = await fetchOperationPlanDetail(snapshot.planId);
+        if (
+          requestToken !== pendingApprovalDetailToken ||
+          workspaceSelect.value !== workspaceId ||
+          String(plan.workflow_id) !== snapshot.workflowId
+        ) {
+          return false;
+        }
+        currentPendingApproval = {
+          item: {
+            ...item,
+            plan_id: snapshot.planId,
+            current_revision: snapshot.revision,
+            approval_status: workflow.approval_status,
+          },
+          plan,
+          workflow,
+        };
+        rememberActiveWorkflow(snapshot.workflowId, snapshot.planId);
+        renderPendingApprovalDetails(plan, workflow);
+        if (statusMessage) {
+          pendingApprovalDetailStatus.textContent = statusMessage;
+        }
+        return true;
+      } catch {
+        if (requestToken === pendingApprovalDetailToken) {
+          currentPendingApproval = null;
+          pendingApprovalActions.hidden = true;
+          pendingEditForm.hidden = true;
+          pendingApprovalDetailStatus.textContent =
+            "计划详情读取失败，未启用审批或文件操作按钮。";
+        }
+        return false;
+      }
+    }
+
+    function renderPendingApprovalList(
+      payload,
+      requestToken,
+      preserveSelectedApproval = false,
+    ) {
+      if (requestToken !== pendingApprovalsRequestToken) {
+        return;
+      }
+      pendingApprovalsList.replaceChildren();
+      const workspaceId = workspaceSelect.value;
+      const items = Array.isArray(payload?.items)
+        ? payload.items.filter((item) =>
+            pendingApprovalItemIsValid(item, workspaceId),
+          )
+        : [];
+      if (items.length === 0) {
+        pendingApprovalsStatus.textContent = "当前工作区没有待审批计划。";
+      } else {
+        pendingApprovalsStatus.textContent =
+          `共 ${String(payload.total ?? items.length)} 个待审批计划。`;
+      }
+      for (const approval of items) {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "pending-approval-button";
+        button.textContent =
+          `${String(approval.operation_type)}；Workflow ${String(approval.workflow_id)}；Plan ${String(approval.plan_id)}；revision ${String(approval.current_revision)}`;
+        button.addEventListener("click", () => {
+          void loadPendingApprovalDetails(approval);
+        });
+        item.append(button);
+        pendingApprovalsList.append(item);
+      }
+
+      if (!preserveSelectedApproval) {
+        const storedWorkflowId = readStoredWorkflowId();
+        const restored = items.find(
+          (item) => item.workflow_id === storedWorkflowId,
+        );
+        if (restored) {
+          void loadPendingApprovalDetails(restored);
+        } else if (storedWorkflowId !== null) {
+          clearActiveWorkflow(storedWorkflowId);
+        }
+      }
+    }
+
+    async function loadPendingApprovals(preserveSelectedApproval = false) {
+      const workspaceId = workspaceSelect.value;
+      const requestToken = ++pendingApprovalsRequestToken;
+      if (!preserveSelectedApproval) {
+        resetPendingApprovalDetail();
+      }
+      pendingApprovalsPanel.hidden = !workspaceId;
+      if (!workspaceId) {
+        pendingApprovalsStatus.textContent = "选择工作区后加载。";
+        return;
+      }
+
+      pendingApprovalsStatus.textContent = "待审批计划加载中…";
+      try {
+        const query = new URLSearchParams({
+          workspace_id: workspaceId,
+          page: "1",
+          page_size: "20",
+        });
+        const response = await fetch(`/api/v1/approvals/pending?${query}`);
+        const payload = await response.json();
+        if (
+          !response.ok ||
+          !payload ||
+          typeof payload !== "object" ||
+          !Array.isArray(payload.items) ||
+          requestToken !== pendingApprovalsRequestToken ||
+          workspaceSelect.value !== workspaceId
+        ) {
+          throw new Error("pending approval request failed");
+        }
+        renderPendingApprovalList(payload, requestToken, preserveSelectedApproval);
+      } catch {
+        if (requestToken === pendingApprovalsRequestToken) {
+          pendingApprovalsStatus.textContent =
+            "待审批计划加载失败，请稍后刷新。";
+        }
+      }
+    }
+
+    async function submitPendingDecision(action, changes = null) {
+      if (currentPendingApproval === null || pendingApprovalBusy) {
+        return;
+      }
+      pendingApprovalBusy = true;
+      configurePendingApprovalActions();
+      const item = currentPendingApproval.item;
+      try {
+        if (!(await loadPendingApprovalDetails(item))) {
+          return;
+        }
+        const state = pendingApprovalActionState();
+        const allowed =
+          action === "approve"
+            ? state?.approve
+            : action === "reject"
+              ? state?.reject
+              : action === "cancel"
+                ? state?.cancel
+                : state?.edit;
+        if (!allowed || state === null) {
+          pendingApprovalDetailStatus.textContent =
+            "计划状态已变化，未执行写操作。";
+          return;
+        }
+        const body = {
+          action,
+          expected_plan_id: state.snapshot.planId,
+          expected_revision: state.snapshot.revision,
+        };
+        if (action === "edit") {
+          if (!Array.isArray(changes) || changes.length === 0) {
+            pendingApprovalDetailStatus.textContent = "请填写至少一个新的目标目录。";
+            return;
+          }
+          body.changes = changes;
+        }
+        pendingApprovalDetailStatus.textContent =
+          action === "approve"
+            ? "批准提交中…"
+            : action === "reject"
+              ? "拒绝提交中…"
+              : action === "cancel"
+                ? "取消提交中…"
+                : "编辑提交中…";
+        const response = await fetch(
+          `/api/v1/workflows/${encodeURIComponent(state.snapshot.workflowId)}/decisions`,
+          {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(body),
+          },
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          if (response.status === 409) {
+            await loadPendingApprovalDetails(
+              item,
+              "计划状态已变化，已重新读取；未自动重试写操作。",
+            );
+            return;
+          }
+          pendingApprovalDetailStatus.textContent = safeErrorMessage(
+            payload,
+            "审批操作失败，请刷新计划后重试。",
+          );
+          return;
+        }
+        const updatedSnapshot = workflowSnapshot(payload);
+        if (updatedSnapshot === null) {
+          throw new Error("decision result unavailable");
+        }
+        if (action === "reject" || action === "cancel") {
+          clearActiveWorkflow(updatedSnapshot.workflowId);
+          resetPendingApprovalDetail();
+          void loadPendingApprovals();
+          return;
+        }
+        await loadPendingApprovalDetails(
+          {
+            ...item,
+            plan_id: updatedSnapshot.planId,
+            current_revision: updatedSnapshot.revision,
+            approval_status: payload.approval_status,
+          },
+          action === "edit"
+            ? "编辑完成，旧计划已失效并替换为新计划。"
+            : "计划已批准，尚未执行文件操作。",
+        );
+        if (action === "approve") {
+          void loadPendingApprovals(true);
+        }
+      } catch {
+        pendingApprovalDetailStatus.textContent =
+          "无法连接 FileNest API，请刷新计划后重试。";
+      } finally {
+        pendingApprovalBusy = false;
+        configurePendingApprovalActions();
+      }
+    }
+
+    async function submitPendingFileAction(action) {
+      if (currentPendingApproval === null || pendingApprovalBusy) {
+        return;
+      }
+      pendingApprovalBusy = true;
+      configurePendingApprovalActions();
+      const item = currentPendingApproval.item;
+      try {
+        if (!(await loadPendingApprovalDetails(item))) {
+          return;
+        }
+        const state = pendingApprovalActionState();
+        const allowed = action === "execute" ? state?.execute : state?.undo;
+        if (!allowed || state === null) {
+          pendingApprovalDetailStatus.textContent =
+            "计划状态已变化，未执行文件操作。";
+          return;
+        }
+        const query = new URLSearchParams({
+          expected_plan_id: state.snapshot.planId,
+          expected_revision: String(state.snapshot.revision),
+        });
+        pendingApprovalDetailStatus.textContent =
+          action === "execute" ? "文件执行中…" : "撤销执行中…";
+        const response = await fetch(
+          `/api/v1/workflows/${encodeURIComponent(state.snapshot.workflowId)}/${action}?${query}`,
+          {method: "POST"},
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          if (response.status === 409) {
+            await loadPendingApprovalDetails(
+              item,
+              "计划状态已变化，已重新读取；未自动重试写操作。",
+            );
+            return;
+          }
+          pendingApprovalDetailStatus.textContent = safeErrorMessage(
+            payload,
+            action === "execute"
+              ? "执行失败，请刷新计划后重试。"
+              : "撤销失败，请刷新计划后重试。",
+          );
+          return;
+        }
+        const resultSnapshot = workflowSnapshot({
+          workflow_id: payload.workflow_id,
+          operation_plan: {plan_id: payload.plan_id},
+          operation: {revision: state.snapshot.revision},
+        });
+        if (
+          resultSnapshot === null ||
+          resultSnapshot.workflowId !== state.snapshot.workflowId ||
+          resultSnapshot.planId !== state.snapshot.planId ||
+          !Array.isArray(payload.items)
+        ) {
+          throw new Error("file action result unavailable");
+        }
+        const refreshed = await loadPendingApprovalDetails(item);
+        if (!refreshed || currentPendingApproval === null) {
+          return;
+        }
+        renderAgentExecutionItems(
+          payload,
+          {
+            executionList: pendingExecutionList,
+            executionStatus: pendingExecutionStatus,
+          },
+          action === "execute" ? "执行" : "撤销",
+        );
+        pendingApprovalDetailStatus.textContent =
+          action === "execute"
+            ? "执行响应已返回，按钮状态已按最新服务端状态更新。"
+            : "撤销响应已返回，按钮状态已按最新服务端状态更新。";
+        if (action === "undo" && payload.status === "UNDONE") {
+          clearActiveWorkflow(state.snapshot.workflowId);
+        }
+      } catch {
+        pendingApprovalDetailStatus.textContent =
+          "文件操作状态读取失败，未自动重试；请刷新后确认。";
+      } finally {
+        pendingApprovalBusy = false;
+        configurePendingApprovalActions();
+      }
+    }
+
     function showSources(sources, workspaceName = "") {
       currentSources = Array.isArray(sources) ? sources : [];
       sourceList.replaceChildren();
@@ -856,6 +2002,155 @@
       agentProposalsPanel.hidden = true;
     }
 
+    function workflowSnapshot(payload) {
+      const workflowId = payload?.workflow_id;
+      const planId = payload?.operation_plan?.plan_id;
+      const revision = payload?.operation?.revision;
+      if (
+        typeof workflowId !== "string" ||
+        typeof planId !== "string" ||
+        !Number.isInteger(revision) ||
+        revision < 0
+      ) {
+        return null;
+      }
+      return {
+        workflowId,
+        planId,
+        revision,
+      };
+    }
+
+    async function fetchWorkflowState(workflowId) {
+      const workspaceId = workspaceSelect.value;
+      if (!workspaceId || typeof workflowId !== "string") {
+        throw new Error("workflow workspace unavailable");
+      }
+
+      const query = new URLSearchParams({workspace_id: workspaceId});
+      const response = await fetch(
+        `/api/v1/workflows/${encodeURIComponent(workflowId)}?${query}`,
+      );
+      const payload = await response.json();
+      const snapshot = workflowSnapshot(payload);
+      if (
+        !response.ok ||
+        snapshot === null ||
+        snapshot.workflowId !== workflowId ||
+        Number(payload.operation_plan.workspace_id) !== Number(workspaceId) ||
+        String(payload.operation.workflow_id) !== workflowId ||
+        String(payload.operation.plan_id) !== snapshot.planId
+      ) {
+        throw new Error("workflow state unavailable");
+      }
+      return payload;
+    }
+
+    async function fetchOperationPlanDetail(planId) {
+      const workspaceId = workspaceSelect.value;
+      if (!workspaceId || typeof planId !== "string") {
+        throw new Error("operation plan workspace unavailable");
+      }
+
+      const query = new URLSearchParams({workspace_id: workspaceId});
+      const response = await fetch(
+        `/api/v1/operation-plans/${encodeURIComponent(planId)}?${query}`,
+      );
+      const payload = await response.json();
+      if (
+        !response.ok ||
+        !payload ||
+        typeof payload !== "object" ||
+        String(payload.plan_id) !== planId ||
+        Number(payload.workspace_id) !== Number(workspaceId) ||
+        !Array.isArray(payload.operations) ||
+        !Number.isInteger(payload.current_revision)
+      ) {
+        throw new Error("operation plan detail unavailable");
+      }
+      return payload;
+    }
+
+    function applyCurrentWorkflowState(payload) {
+      const snapshot = workflowSnapshot(payload);
+      if (snapshot === null) {
+        throw new Error("current workflow snapshot unavailable");
+      }
+      currentWorkflow = snapshot;
+      rememberActiveWorkflow(snapshot.workflowId, snapshot.planId);
+      return snapshot;
+    }
+
+    function configureCurrentPlanActions(payload) {
+      const snapshot = workflowSnapshot(payload);
+      if (snapshot === null) {
+        currentWorkflow = null;
+        resetPlanActions();
+        return;
+      }
+      currentWorkflow = snapshot;
+      const operationStatus = String(payload.operation?.overall_status ?? "");
+      if (
+        payload.approval_status === "WAITING_APPROVAL" &&
+        payload.status === "waiting" &&
+        operationStatus === "WAITING_APPROVAL"
+      ) {
+        showApprovalActions();
+      } else if (
+        payload.approval_status === "APPROVED" &&
+        payload.status === "ready" &&
+        operationStatus === "APPROVED"
+      ) {
+        showExecutionAction();
+      } else if (
+        payload.approval_status === "APPROVED" &&
+        payload.status === "ready" &&
+        operationStatus === "COMPLETED"
+      ) {
+        showUndoAction();
+      } else {
+        resetPlanActions();
+      }
+    }
+
+    async function refreshCurrentPlanState(message = "") {
+      if (currentWorkflow === null) {
+        return false;
+      }
+      const workflowId = currentWorkflow.workflowId;
+      try {
+        const payload = await fetchWorkflowState(workflowId);
+        if (
+          currentWorkflow === null ||
+          currentWorkflow.workflowId !== workflowId ||
+          workspaceSelect.value !== String(payload.operation_plan.workspace_id)
+        ) {
+          return false;
+        }
+        configureCurrentPlanActions(payload);
+        if (message) {
+          planStatus.textContent = message;
+        }
+        return true;
+      } catch {
+        if (currentWorkflow?.workflowId === workflowId) {
+          currentWorkflow = null;
+          resetPlanActions();
+          planStatus.textContent =
+            "最新计划状态读取失败，已停用文件操作按钮。";
+        }
+        return false;
+      }
+    }
+
+    async function refreshCurrentPlanAfterConflict(message) {
+      const refreshed = await refreshCurrentPlanState(message);
+      if (!refreshed) {
+        planStatus.textContent =
+          "计划状态已变化且当前不可读取，未执行写操作；请刷新后确认。";
+      }
+    }
+
     async function fetchAgentProposalWorkflow(proposal) {
       if (
         typeof proposal.workflow_id !== "string" ||
@@ -864,22 +2159,11 @@
         throw new Error("proposal identifiers unavailable");
       }
 
-      const response = await fetch(
-        `/api/v1/workflows/${encodeURIComponent(proposal.workflow_id)}`,
-      );
-      const payload = await response.json();
-      if (
-        !response.ok ||
-        !payload ||
-        typeof payload !== "object" ||
-        typeof payload.operation_plan?.plan_id !== "string"
-      ) {
-        throw new Error("proposal details unavailable");
-      }
-      return payload;
+      return fetchWorkflowState(proposal.workflow_id);
     }
 
     function hideAgentProposalActions(controls) {
+      controls.stateLoaded = false;
       controls.actions.hidden = true;
       for (const button of controls.buttons) {
         button.hidden = true;
@@ -889,15 +2173,22 @@
 
     function configureAgentProposalActions(payload, controls) {
       controls.lastWorkflow = payload;
+      const stateLoaded = controls.stateLoaded === true;
+      const snapshot = workflowSnapshot(payload);
       const approvalStatus = String(payload?.approval_status ?? "");
       const workflowStatus = String(payload?.status ?? "");
       const operationStatus = String(payload?.operation?.overall_status ?? "");
-      const waitingForApproval = approvalStatus === "WAITING_APPROVAL";
+      const waitingForApproval =
+        stateLoaded && snapshot !== null && approvalStatus === "WAITING_APPROVAL";
       const canExecute =
+        stateLoaded &&
+        snapshot !== null &&
         approvalStatus === "APPROVED" &&
         workflowStatus === "ready" &&
         operationStatus === "APPROVED";
       const canUndo =
+        stateLoaded &&
+        snapshot !== null &&
         approvalStatus === "APPROVED" &&
         workflowStatus === "ready" &&
         operationStatus === "COMPLETED";
@@ -913,13 +2204,19 @@
     }
 
     function syncAgentProposalWorkflow(proposal, payload, controls) {
-      proposal.plan_id = String(payload.operation_plan.plan_id);
+      const snapshot = workflowSnapshot(payload);
+      if (snapshot === null) {
+        throw new Error("proposal snapshot unavailable");
+      }
+      proposal.plan_id = snapshot.planId;
+      proposal.revision = snapshot.revision;
       proposal.approval_status = String(payload.approval_status);
       controls.meta.textContent =
         `workflow_id：${String(proposal.workflow_id)}；plan_id：${proposal.plan_id}`;
       const operationStatus = String(payload.operation?.overall_status ?? "");
       controls.statusElement.textContent =
         `审批状态：${proposal.approval_status}；工作流状态：${String(payload.status)}；操作状态：${operationStatus}`;
+      controls.stateLoaded = true;
       configureAgentProposalActions(payload, controls);
     }
 
@@ -986,6 +2283,23 @@
       }
     }
 
+    async function refreshAgentProposalAfterConflict(
+      proposal,
+      controls,
+      message,
+    ) {
+      try {
+        const workflow = await fetchAgentProposalWorkflow(proposal);
+        syncAgentProposalWorkflow(proposal, workflow, controls);
+        controls.statusElement.textContent = message;
+      } catch {
+        hideAgentProposalActions(controls);
+        controls.lastWorkflow = null;
+        controls.statusElement.textContent =
+          "计划状态已变化且当前不可读取，未执行写操作；请刷新后确认。";
+      }
+    }
+
     async function decideAgentProposal(
       proposal,
       action,
@@ -1001,7 +2315,12 @@
       try {
         const workflow = await fetchAgentProposalWorkflow(proposal);
         syncAgentProposalWorkflow(proposal, workflow, controls);
-        const latestPlanId = proposal.plan_id;
+        const snapshot = workflowSnapshot(workflow);
+        if (snapshot === null) {
+          throw new Error("approval snapshot unavailable");
+        }
+        const latestPlanId = snapshot.planId;
+        const latestRevision = snapshot.revision;
         if (workflow.approval_status !== "WAITING_APPROVAL") {
           controls.statusElement.textContent =
             `审批状态：${String(workflow.approval_status)}；请刷新提案。`;
@@ -1016,11 +2335,20 @@
             body: JSON.stringify({
               action,
               expected_plan_id: latestPlanId,
+              expected_revision: latestRevision,
             }),
           },
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshAgentProposalAfterConflict(
+              proposal,
+              controls,
+              "计划状态已变化，已重新读取；未自动重试。",
+            );
+            return;
+          }
           controls.statusElement.textContent = safeErrorMessage(
             payload,
             "审批提交失败，请刷新提案后重试。",
@@ -1059,6 +2387,10 @@
       try {
         const workflow = await fetchAgentProposalWorkflow(proposal);
         syncAgentProposalWorkflow(proposal, workflow, controls);
+        const snapshot = workflowSnapshot(workflow);
+        if (snapshot === null) {
+          throw new Error("execution snapshot unavailable");
+        }
         if (
           workflow.approval_status !== "APPROVED" ||
           workflow.status !== "ready" ||
@@ -1070,12 +2402,24 @@
         }
 
         controls.statusElement.textContent = "正在执行文件操作…";
+        const query = new URLSearchParams({
+          expected_plan_id: snapshot.planId,
+          expected_revision: String(snapshot.revision),
+        });
         const response = await fetch(
-          `/api/v1/workflows/${encodeURIComponent(proposal.workflow_id)}/execute`,
+          `/api/v1/workflows/${encodeURIComponent(proposal.workflow_id)}/execute?${query}`,
           {method: "POST"},
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshAgentProposalAfterConflict(
+              proposal,
+              controls,
+              "计划状态已变化，已重新读取；未自动重试。",
+            );
+            return;
+          }
           controls.statusElement.textContent = safeErrorMessage(
             payload,
             "执行失败，请刷新提案后重试。",
@@ -1115,6 +2459,10 @@
       try {
         const workflow = await fetchAgentProposalWorkflow(proposal);
         syncAgentProposalWorkflow(proposal, workflow, controls);
+        const snapshot = workflowSnapshot(workflow);
+        if (snapshot === null) {
+          throw new Error("undo snapshot unavailable");
+        }
         if (
           workflow.approval_status !== "APPROVED" ||
           workflow.status !== "ready" ||
@@ -1126,12 +2474,24 @@
         }
 
         controls.statusElement.textContent = "正在撤销文件操作…";
+        const query = new URLSearchParams({
+          expected_plan_id: snapshot.planId,
+          expected_revision: String(snapshot.revision),
+        });
         const response = await fetch(
-          `/api/v1/workflows/${encodeURIComponent(proposal.workflow_id)}/undo`,
+          `/api/v1/workflows/${encodeURIComponent(proposal.workflow_id)}/undo?${query}`,
           {method: "POST"},
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshAgentProposalAfterConflict(
+              proposal,
+              controls,
+              "计划状态已变化，已重新读取；未自动重试。",
+            );
+            return;
+          }
           controls.statusElement.textContent = safeErrorMessage(
             payload,
             "撤销失败，请刷新提案后重试。",
@@ -1220,12 +2580,11 @@
           executionStatus,
           executionList,
           busy: false,
-          lastWorkflow: null,
+           lastWorkflow: null,
+           stateLoaded: false,
         };
-        configureAgentProposalActions(
-          {approval_status: proposal.approval_status},
-          controls,
-        );
+        configureAgentProposalActions(null, controls);
+        status.textContent = "正在读取最新计划状态…";
         item.append(
           title,
           meta,
@@ -1349,9 +2708,11 @@
       const operations = plan?.operations;
       const workflowId = payload?.workflow_id;
       const planId = plan?.plan_id;
+      const snapshot = workflowSnapshot(payload);
       if (
         !plan ||
         !Array.isArray(operations) ||
+        snapshot === null ||
         typeof workflowId !== "string" ||
         typeof planId !== "string"
       ) {
@@ -1361,7 +2722,8 @@
         return;
       }
 
-      currentWorkflow = {workflowId, planId};
+      currentWorkflow = snapshot;
+      rememberActiveWorkflow(snapshot.workflowId, snapshot.planId);
       planStatus.textContent =
         `计划 ${planId} 已生成，当前等待审批。`;
       showApprovalActions();
@@ -1373,7 +2735,7 @@
       }
     }
 
-    async function loadWorkspaces() {
+    async function loadWorkspaces(preferredWorkspaceId = null) {
       try {
         const response = await fetch("/api/v1/workspaces");
         const payload = await response.json();
@@ -1381,14 +2743,21 @@
           throw new Error("workspace request failed");
         }
 
+        const currentWorkspaceId = workspaceSelect.value;
         workspaceSelect.replaceChildren();
         if (payload.length === 0) {
           const option = document.createElement("option");
           option.value = "";
           option.textContent = "没有可用工作区";
           workspaceSelect.append(option);
+          workspaceSelect.disabled = true;
+          submitButton.disabled = true;
+          workspaceActions.hidden = true;
+          stopJobPolling();
+          resetPendingApprovalDetail();
+          pendingApprovalsPanel.hidden = true;
           showStatus("请先通过现有 API 添加并扫描工作区。");
-          return;
+          return false;
         }
 
         for (const workspace of payload) {
@@ -1397,18 +2766,101 @@
           option.textContent = String(workspace.name);
           workspaceSelect.append(option);
         }
+        const previousWorkspaceId =
+          preferredWorkspaceId === null
+            ? currentWorkspaceId
+            : String(preferredWorkspaceId);
+        const preferredWorkspaceExists = payload.some(
+          (workspace) => String(workspace.id) === previousWorkspaceId,
+        );
+        workspaceSelect.value = preferredWorkspaceExists
+          ? previousWorkspaceId
+          : String(payload[0].id);
         workspaceSelect.disabled = false;
         submitButton.disabled = false;
+        currentWorkspaceName =
+          workspaceSelect.selectedOptions[0]?.textContent ?? "";
+        updateWorkspaceActionState();
         void loadRecentRuns();
+        void restoreWorkspaceJobs();
+        void loadPendingApprovals();
+        return true;
       } catch {
         workspaceSelect.replaceChildren();
         const option = document.createElement("option");
         option.value = "";
         option.textContent = "工作区加载失败";
         workspaceSelect.append(option);
+        workspaceSelect.disabled = true;
+        submitButton.disabled = true;
+        workspaceActions.hidden = true;
+        stopJobPolling();
+        resetPendingApprovalDetail();
+        pendingApprovalsPanel.hidden = true;
         showStatus("工作区当前不可用，请稍后重试。");
+        return false;
       }
     }
+
+    workspaceForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const name = workspaceNameInput.value.trim();
+      const rootPath = workspaceRootPathInput.value.trim();
+      if (!name || !rootPath) {
+        workspaceStatus.textContent = "请填写工作区名称和根路径。";
+        return;
+      }
+
+      addWorkspaceButton.disabled = true;
+      workspaceStatus.textContent = "正在新增工作区…";
+      try {
+        const response = await fetch("/api/v1/workspaces", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({name, root_path: rootPath}),
+        });
+        const payload = await response.json();
+        if (!response.ok || !Number.isInteger(payload?.id)) {
+          workspaceStatus.textContent = safeErrorMessage(
+            payload,
+            "工作区创建失败，请检查根路径后重试。",
+          );
+          return;
+        }
+
+        const refreshed = await loadWorkspaces(payload.id);
+        if (!refreshed || workspaceSelect.value !== String(payload.id)) {
+          workspaceStatus.textContent =
+            "工作区已创建，但列表刷新失败，请稍后刷新页面确认。";
+          return;
+        }
+        workspaceNameInput.value = "";
+        workspaceRootPathInput.value = "";
+        workspaceStatus.textContent = `工作区“${name}”已新增并选中。`;
+      } catch {
+        workspaceStatus.textContent = "无法连接 FileNest API，请稍后重试。";
+      } finally {
+        addWorkspaceButton.disabled = false;
+      }
+    });
+
+    scanWorkspaceButton.addEventListener("click", () => {
+      const workspaceId = encodeURIComponent(workspaceSelect.value);
+      void submitWorkspaceJob(
+        "workspace_scan",
+        `/api/v1/workspaces/${workspaceId}/scan`,
+        scanWorkspaceButton,
+      );
+    });
+
+    indexDocumentsButton.addEventListener("click", () => {
+      const workspaceId = encodeURIComponent(workspaceSelect.value);
+      void submitWorkspaceJob(
+        "document_index",
+        `/api/v1/workspaces/${workspaceId}/documents/index`,
+        indexDocumentsButton,
+      );
+    });
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1450,7 +2902,70 @@
     });
 
     workspaceSelect.addEventListener("change", () => {
+      currentWorkspaceName =
+        workspaceSelect.selectedOptions[0]?.textContent ?? "";
+      stopJobPolling();
+      updateWorkspaceActionState();
       void loadRecentRuns();
+      void restoreWorkspaceJobs();
+      void loadPendingApprovals();
+    });
+
+    pendingApproveButton.addEventListener("click", () => {
+      void submitPendingDecision("approve");
+    });
+
+    pendingRejectButton.addEventListener("click", () => {
+      void submitPendingDecision("reject");
+    });
+
+    pendingCancelButton.addEventListener("click", () => {
+      void submitPendingDecision("cancel");
+    });
+
+    pendingEditButton.addEventListener("click", () => {
+      if (pendingApprovalActionState()?.edit !== true) {
+        return;
+      }
+      pendingEditMode = true;
+      pendingEditForm.hidden = false;
+      configurePendingApprovalActions();
+    });
+
+    pendingEditCancelButton.addEventListener("click", () => {
+      pendingEditMode = false;
+      configurePendingApprovalActions();
+    });
+
+    pendingEditForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const changes = [
+        ...pendingEditTargets.querySelectorAll("input[data-file-id]"),
+      ].map((input) => ({
+        source_file_id: Number(input.dataset.fileId),
+        target_directory: input.value.trim(),
+      }));
+      if (
+        changes.length === 0 ||
+        changes.some(
+          (change) =>
+            !Number.isInteger(change.source_file_id) ||
+            change.source_file_id < 1 ||
+            !change.target_directory,
+        )
+      ) {
+        pendingApprovalDetailStatus.textContent = "请为每个文件填写目标目录。";
+        return;
+      }
+      void submitPendingDecision("edit", changes);
+    });
+
+    pendingExecuteButton.addEventListener("click", () => {
+      void submitPendingFileAction("execute");
+    });
+
+    pendingUndoButton.addEventListener("click", () => {
+      void submitPendingFileAction("undo");
     });
 
     planForm.addEventListener("submit", async (event) => {
@@ -1508,23 +3023,42 @@
         return;
       }
 
+      const workflowId = currentWorkflow.workflowId;
       approvePlanButton.disabled = true;
       rejectPlanButton.disabled = true;
       planStatus.textContent = action === "approve" ? "批准提交中…" : "拒绝提交中…";
       try {
+        const workflow = await fetchWorkflowState(workflowId);
+        const snapshot = applyCurrentWorkflowState(workflow);
+        if (
+          workflow.approval_status !== "WAITING_APPROVAL" ||
+          workflow.status !== "waiting" ||
+          workflow.operation?.overall_status !== "WAITING_APPROVAL"
+        ) {
+          configureCurrentPlanActions(workflow);
+          planStatus.textContent = "计划状态已变化，未执行写操作。";
+          return;
+        }
         const response = await fetch(
-          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/decisions`,
+          `/api/v1/workflows/${encodeURIComponent(workflowId)}/decisions`,
           {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({
               action,
-              expected_plan_id: currentWorkflow.planId,
+              expected_plan_id: snapshot.planId,
+              expected_revision: snapshot.revision,
             }),
           },
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshCurrentPlanAfterConflict(
+              "计划状态已变化，已重新读取；未自动重试写操作。",
+            );
+            return;
+          }
           planStatus.textContent = safeErrorMessage(
             payload,
             "审批提交失败，请刷新计划后重试。",
@@ -1532,15 +3066,19 @@
           return;
         }
 
+        const updatedSnapshot = workflowSnapshot(payload);
+        if (updatedSnapshot === null) {
+          throw new Error("approval result unavailable");
+        }
+        configureCurrentPlanActions(payload);
         if (payload.approval_status === "APPROVED") {
           planStatus.textContent = "计划已批准，尚未执行文件操作。";
-          currentWorkflow = {
-            workflowId: String(payload.workflow_id),
-            planId: String(payload.operation_plan.plan_id),
-          };
-          showExecutionAction();
-        } else if (payload.approval_status === "REJECTED") {
+        } else if (
+          payload.approval_status === "REJECTED" ||
+          payload.approval_status === "CANCELLED"
+        ) {
           planStatus.textContent = "计划已拒绝。";
+          clearActiveWorkflow(updatedSnapshot.workflowId);
           currentWorkflow = null;
           resetPlanActions();
         } else {
@@ -1561,15 +3099,39 @@
         return;
       }
 
+      const workflowId = currentWorkflow.workflowId;
       executePlanButton.disabled = true;
-      planStatus.textContent = "文件执行中…";
+      planStatus.textContent = "正在读取最新执行状态…";
       try {
+        const workflow = await fetchWorkflowState(workflowId);
+        const snapshot = applyCurrentWorkflowState(workflow);
+        if (
+          workflow.approval_status !== "APPROVED" ||
+          workflow.status !== "ready" ||
+          workflow.operation?.overall_status !== "APPROVED"
+        ) {
+          configureCurrentPlanActions(workflow);
+          planStatus.textContent = "当前计划不可执行，未执行文件操作。";
+          return;
+        }
+
+        const query = new URLSearchParams({
+          expected_plan_id: snapshot.planId,
+          expected_revision: String(snapshot.revision),
+        });
+        planStatus.textContent = "文件执行中…";
         const response = await fetch(
-          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/execute`,
+          `/api/v1/workflows/${encodeURIComponent(workflowId)}/execute?${query}`,
           {method: "POST"},
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshCurrentPlanAfterConflict(
+              "计划状态已变化，已重新读取；未自动重试写操作。",
+            );
+            return;
+          }
           planStatus.textContent = safeErrorMessage(
             payload,
             "文件执行失败，请检查当前文件状态。",
@@ -1578,10 +3140,19 @@
         }
 
         if (payload.status === "COMPLETED") {
-          planStatus.textContent = "计划已执行，文件已移动，可以撤销。";
-          showUndoAction();
+          const refreshed = await refreshCurrentPlanState(
+            "计划已执行，文件已移动，可以撤销。",
+          );
+          if (!refreshed) {
+            return;
+          }
         } else {
-          planStatus.textContent = `执行结果：${String(payload.status)}。`;
+          const refreshed = await refreshCurrentPlanState(
+            `执行结果：${String(payload.status)}。`,
+          );
+          if (!refreshed) {
+            return;
+          }
         }
       } catch {
         planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
@@ -1597,15 +3168,39 @@
         return;
       }
 
+      const workflowId = currentWorkflow.workflowId;
       undoPlanButton.disabled = true;
-      planStatus.textContent = "撤销执行中…";
+      planStatus.textContent = "正在读取最新撤销状态…";
       try {
+        const workflow = await fetchWorkflowState(workflowId);
+        const snapshot = applyCurrentWorkflowState(workflow);
+        if (
+          workflow.approval_status !== "APPROVED" ||
+          workflow.status !== "ready" ||
+          workflow.operation?.overall_status !== "COMPLETED"
+        ) {
+          configureCurrentPlanActions(workflow);
+          planStatus.textContent = "当前计划不可撤销，未执行文件操作。";
+          return;
+        }
+
+        const query = new URLSearchParams({
+          expected_plan_id: snapshot.planId,
+          expected_revision: String(snapshot.revision),
+        });
+        planStatus.textContent = "撤销执行中…";
         const response = await fetch(
-          `/api/v1/workflows/${encodeURIComponent(currentWorkflow.workflowId)}/undo`,
+          `/api/v1/workflows/${encodeURIComponent(workflowId)}/undo?${query}`,
           {method: "POST"},
         );
         const payload = await response.json();
         if (!response.ok) {
+          if (response.status === 409) {
+            await refreshCurrentPlanAfterConflict(
+              "计划状态已变化，已重新读取；未自动重试写操作。",
+            );
+            return;
+          }
           planStatus.textContent = safeErrorMessage(
             payload,
             "撤销失败，请检查当前文件状态。",
@@ -1615,10 +3210,13 @@
 
         if (payload.status === "UNDONE") {
           planStatus.textContent = "执行已撤销，文件已恢复原位置。";
+          clearActiveWorkflow(workflowId);
           currentWorkflow = null;
           resetPlanActions();
         } else {
-          planStatus.textContent = `撤销结果：${String(payload.status)}。`;
+          await refreshCurrentPlanState(
+            `撤销结果：${String(payload.status)}。`,
+          );
         }
       } catch {
         planStatus.textContent = "无法连接 FileNest API，请稍后重试。";
