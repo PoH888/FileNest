@@ -218,6 +218,8 @@ class AgentContractCase(BaseModel):
     fixture: str = Field(min_length=3, max_length=100)
     expected: AgentContractExpectedOutcome
     security_assertions: AgentContractSecurityAssertions
+    max_steps: int = Field(default=8, ge=1, le=20)
+    cancel_before_run: bool = False
 
     @field_validator("tags")
     @classmethod

@@ -2,16 +2,19 @@
 
 import argparse
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+from threading import Event
 from time import perf_counter
 from typing import Literal
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import xml.etree.ElementTree as ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -76,6 +79,16 @@ class AgentContractMetadataError(RuntimeError):
     """评测所需的版本元数据无法安全取得。"""
 
 
+@dataclass(frozen=True)
+class _GitIdentity:
+    """当前代码树的可复现身份；tree_hash 覆盖工作区实际文件内容。"""
+
+    branch: str
+    commit_hash: str
+    tree_hash: str
+    worktree_dirty: bool
+
+
 class AgentContractCaseResult(BaseModel):
     """不包含提示词和原始参数载荷的单用例结果。"""
 
@@ -106,6 +119,12 @@ class AgentContractEvaluationSummary(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     dataset_version: str
     dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    branch: str = Field(min_length=1, max_length=200)
+    commit_hash: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    tree_hash: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    worktree_dirty: bool
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_registry_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_source: ModelSource
     model_provider: str | None = None
     version_info: EvaluationVersionInfo
@@ -180,10 +199,12 @@ def run_agent_contract_evaluation(
     model_client_factory: Callable[[], ModelClient] | None = None,
     model_provider: str | None = None,
     case_ids: Sequence[str] | None = None,
+    dataset_snapshot: bytes | None = None,
 ) -> AgentContractEvaluationSummary:
-    """在隔离的临时工作区中执行合同数据集并保存四类证据。"""
+    """在隔离的临时工作区中执行合同数据集并保存可追溯证据。"""
 
     _validate_dataset_hash(dataset_sha256)
+    dataset_sha256 = dataset_sha256.casefold()
     selected_cases = _select_cases(
         dataset,
         model_source=model_source,
@@ -196,12 +217,35 @@ def run_agent_contract_evaluation(
             "评测运行目录必须尚不存在"
         )
 
+    repo_root = Path(__file__).resolve().parents[2]
+    git_identity = _current_git_identity(repo_root)
+    version_info = version_info.model_copy(
+        update={
+            "git_commit": git_identity.commit_hash,
+            "evaluation_dataset_version": dataset.dataset_version,
+        }
+    )
+    snapshot_bytes, snapshot_kind = _prepare_dataset_snapshot(
+        dataset,
+        dataset_sha256=dataset_sha256,
+        dataset_snapshot=dataset_snapshot,
+    )
     run_root.mkdir(parents=True)
+    _write_dataset_evidence(
+        run_root,
+        dataset,
+        selected_cases=selected_cases,
+        dataset_sha256=dataset_sha256,
+        snapshot_bytes=snapshot_bytes,
+        snapshot_kind=snapshot_kind,
+    )
     workspace_root = _materialize_fixture(dataset, run_root / "workspace")
     (workspace_root / "reports" / "archive").mkdir(parents=True)
     (run_root / "quarantine").mkdir()
     database_path = run_root / "evaluation.db"
     engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    prompt_sha256 = _prompt_sha256(selected_cases)
+    tool_registry_sha256: str | None = None
 
     try:
         Base.metadata.create_all(bind=engine)
@@ -214,6 +258,15 @@ def run_agent_contract_evaluation(
                     plan,
                 ),
             ) as graph:
+                metadata_registry = _WorkspaceScopedToolRegistry(
+                    session,
+                    workspace.id,
+                    graph,
+                    run_root / "quarantine",
+                )
+                tool_registry_sha256 = _tool_registry_sha256(
+                    metadata_registry.definitions()
+                )
                 observations: list[AgentContractRunObservation] = []
                 case_results: list[AgentContractCaseResult] = []
                 for case in selected_cases:
@@ -231,9 +284,27 @@ def run_agent_contract_evaluation(
                     )
                     observations.append(observation)
                     case_results.append(case_result)
+    except Exception as error:
+        _write_failure_evidence(
+            run_root,
+            dataset=dataset,
+            dataset_sha256=dataset_sha256,
+            version_info=version_info,
+            git_identity=git_identity,
+            prompt_sha256=prompt_sha256,
+            tool_registry_sha256=tool_registry_sha256,
+            model_source=model_source,
+            selected_case_ids=tuple(case.case_id for case in selected_cases),
+            error=error,
+        )
+        raise
     finally:
         engine.dispose()
 
+    if tool_registry_sha256 is None:
+        raise AgentContractMetadataError(
+            "无法读取评测所需的 Agent tool registry"
+        )
     metrics = calculate_agent_contract_metrics(
         dataset,
         observations,
@@ -242,6 +313,12 @@ def run_agent_contract_evaluation(
     summary = AgentContractEvaluationSummary(
         dataset_version=dataset.dataset_version,
         dataset_sha256=dataset_sha256,
+        branch=git_identity.branch,
+        commit_hash=git_identity.commit_hash,
+        tree_hash=git_identity.tree_hash,
+        worktree_dirty=git_identity.worktree_dirty,
+        prompt_sha256=prompt_sha256,
+        tool_registry_sha256=tool_registry_sha256,
         model_source=model_source,
         model_provider=model_provider,
         version_info=version_info,
@@ -267,6 +344,8 @@ def run_agent_contract_evaluation(
         + "\n",
     )
     _write_junit_report(summary, run_root / "junit.xml")
+    if summary.metrics.end_to_end_successes != summary.metrics.end_to_end_total:
+        _write_case_failure_report(summary, run_root / "failure-report.json")
     return summary
 
 
@@ -290,9 +369,205 @@ def _select_cases(
         raise ValueError("评测用例选择必须非空且不能重复")
     if any(case_id not in by_id for case_id in selected_ids):
         raise ValueError("评测用例选择包含未知 case_id")
-    if model_source == "real_model" and not 5 <= len(selected_ids) <= 8:
-        raise ValueError("real_model 评测必须选择 5 到 8 条用例")
+    if model_source == "real_model" and not 3 <= len(selected_ids) <= 5:
+        raise ValueError("real_model 评测必须选择 3 到 5 条用例")
     return tuple(by_id[case_id] for case_id in selected_ids)
+
+
+def _prepare_dataset_snapshot(
+    dataset: AgentContractDataset,
+    *,
+    dataset_sha256: str,
+    dataset_snapshot: bytes | None,
+) -> tuple[bytes, str]:
+    if dataset_snapshot is None:
+        return (
+            (dataset.model_dump_json(indent=2) + "\n").encode("utf-8"),
+            "canonical_model_dump",
+        )
+
+    if sha256(dataset_snapshot).hexdigest() != dataset_sha256:
+        raise AgentContractMetadataError(
+            "dataset snapshot 与 dataset_sha256 不一致"
+        )
+    try:
+        snapshot_dataset = AgentContractDataset.model_validate_json(
+            dataset_snapshot
+        )
+    except ValueError as error:
+        raise AgentContractMetadataError(
+            "dataset snapshot 不是有效的 Agent 合同数据集"
+        ) from error
+    if snapshot_dataset != dataset:
+        raise AgentContractMetadataError(
+            "dataset snapshot 与本轮执行的数据集对象不一致"
+        )
+    return dataset_snapshot, "source_bytes"
+
+
+def _write_dataset_evidence(
+    run_root: Path,
+    dataset: AgentContractDataset,
+    *,
+    selected_cases: Sequence[AgentContractCase],
+    dataset_sha256: str,
+    snapshot_bytes: bytes,
+    snapshot_kind: str,
+) -> None:
+    _write_exclusive_bytes(
+        run_root / "dataset-snapshot.json",
+        snapshot_bytes,
+    )
+    manifest = {
+        "schema_version": "1.0",
+        "dataset_version": dataset.dataset_version,
+        "dataset_sha256": dataset_sha256,
+        "dataset_snapshot_sha256": sha256(snapshot_bytes).hexdigest(),
+        "snapshot_file": "dataset-snapshot.json",
+        "snapshot_kind": snapshot_kind,
+        "case_count": len(dataset.cases),
+        "case_ids": [case.case_id for case in dataset.cases],
+        "selected_case_ids": [case.case_id for case in selected_cases],
+        "fixture_id": dataset.fixture.fixture_id,
+    }
+    _write_exclusive_text(
+        run_root / "dataset-manifest.json",
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def _write_failure_evidence(
+    run_root: Path,
+    *,
+    dataset: AgentContractDataset,
+    dataset_sha256: str,
+    version_info: EvaluationVersionInfo,
+    git_identity: _GitIdentity,
+    prompt_sha256: str,
+    tool_registry_sha256: str | None,
+    model_source: ModelSource,
+    selected_case_ids: Sequence[str],
+    error: Exception,
+) -> None:
+    failure_message = str(error).replace(str(run_root), "<run-root>")
+    metadata = {
+        "schema_version": "1.0",
+        "status": "failed",
+        "dataset_sha256": dataset_sha256,
+        "dataset_version": dataset.dataset_version,
+        "dataset_snapshot_file": "dataset-snapshot.json",
+        "branch": git_identity.branch,
+        "commit_hash": git_identity.commit_hash,
+        "git_commit": git_identity.commit_hash,
+        "tree_hash": git_identity.tree_hash,
+        "worktree_dirty": git_identity.worktree_dirty,
+        "prompt_version": version_info.prompt_version,
+        "prompt_sha256": prompt_sha256,
+        "tool_registry_sha256": tool_registry_sha256,
+        "model_source": model_source,
+        "model_type": (
+            "deterministic_scripted_fake"
+            if model_source == "scripted_fake"
+            else "configured_real_model"
+        ),
+        "model_version": version_info.model_version,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "case_count": len(dataset.cases),
+        "selected_case_ids": list(selected_case_ids),
+        "failure_case_ids": [],
+        "failure_report_file": "failure-report.json",
+    }
+    failure_report = {
+        "schema_version": "1.0",
+        "status": "failed",
+        "error_type": type(error).__name__,
+        "error_message": failure_message,
+        "dataset_sha256": dataset_sha256,
+        "selected_case_ids": list(selected_case_ids),
+        "metadata_file": "run-metadata.json",
+    }
+    try:
+        _write_exclusive_text(
+            run_root / "run-metadata.json",
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        )
+        _write_exclusive_text(
+            run_root / "failure-report.json",
+            json.dumps(failure_report, ensure_ascii=False, indent=2) + "\n",
+        )
+        _write_exclusive_text(
+            run_root / "evaluation-summary.md",
+            "# FileNest Agent 合同评测失败\n\n"
+            f"- 失败类型：`{type(error).__name__}`\n"
+            f"- 失败报告：`failure-report.json`\n"
+            f"- 数据集 SHA-256：`{dataset_sha256}`\n",
+        )
+    except OSError:
+        # 保留原始评测异常，不能把报告写入失败误报成评测结论。
+        return
+
+
+def _write_case_failure_report(
+    summary: AgentContractEvaluationSummary,
+    path: Path,
+) -> None:
+    failed_cases = [
+        {
+            "case_id": case.case_id,
+            "failure_reasons": list(case.failure_reasons),
+        }
+        for case in summary.cases
+        if not case.end_to_end_success
+    ]
+    _write_exclusive_text(
+        path,
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "status": "failed",
+                "failure_type": "case_assertions",
+                "failure_case_ids": [case["case_id"] for case in failed_cases],
+                "cases": failed_cases,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+    )
+
+
+def _prompt_sha256(cases: Sequence[AgentContractCase]) -> str:
+    prompts = [
+        {
+            "workspace_id": workspace_id,
+            "system_prompt": _build_initial_agent_messages(
+                workspace_id,
+                "contract-evaluation-prompt-hash",
+            )[0].content,
+        }
+        for workspace_id in sorted(
+            {case.input.workspace_id for case in cases}
+        )
+    ]
+    canonical = json.dumps(
+        prompts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def _tool_registry_sha256(
+    definitions: Sequence[ToolDefinition],
+) -> str:
+    canonical = json.dumps(
+        [definition.model_dump(mode="json") for definition in definitions],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
 
 
 def _materialize_fixture(
@@ -426,6 +701,12 @@ def _run_case(
             case.input.workspace_id,
             case.input.request_text,
         ),
+        max_steps=case.max_steps,
+        cancel_event=(
+            _cancelled_event()
+            if case.cancel_before_run
+            else None
+        ),
         retry_base_delay_seconds=0,
     )
     latency_ms = (perf_counter() - started_at) * 1_000
@@ -532,6 +813,14 @@ def _run_case(
         failure_reasons=failure_reasons,
     )
     return observation, case_result
+
+
+def _cancelled_event() -> Event:
+    """为取消合同预先设置事件，验证 Agent Loop 的安全停止边界。"""
+
+    cancel_event = Event()
+    cancel_event.set()
+    return cancel_event
 
 
 def _fake_responses(case: AgentContractCase) -> tuple[ModelResponse, ...]:
@@ -727,7 +1016,13 @@ def render_contract_report(summary: AgentContractEvaluationSummary) -> str:
         "",
         "## 版本与复现",
         "",
+        f"- Branch：`{summary.branch}`",
+        f"- Commit hash：`{summary.commit_hash}`",
+        f"- Tree hash：`{summary.tree_hash}`",
+        f"- Worktree dirty：`{str(summary.worktree_dirty).lower()}`",
         f"- Prompt version：`{summary.version_info.prompt_version}`",
+        f"- Prompt SHA-256：`{summary.prompt_sha256}`",
+        f"- Tool registry SHA-256：`{summary.tool_registry_sha256}`",
         f"- Model version：`{summary.version_info.model_version}`",
         f"- Git commit：`{summary.version_info.git_commit}`",
         (
@@ -796,10 +1091,13 @@ def render_contract_report(summary: AgentContractEvaluationSummary) -> str:
             "",
             "## Evidence files",
             "",
+            "- `dataset-snapshot.json`",
+            "- `dataset-manifest.json`",
             "- `evaluation-result.json`",
             "- `evaluation-summary.md`",
             "- `junit.xml`",
             "- `run-metadata.json`",
+            "- `failure-report.json`（仅用例失败时生成）",
             "",
         ]
     )
@@ -809,9 +1107,22 @@ def render_contract_report(summary: AgentContractEvaluationSummary) -> str:
 def _run_metadata(summary: AgentContractEvaluationSummary) -> dict[str, object]:
     return {
         "schema_version": "1.0",
+        "status": (
+            "passed"
+            if summary.metrics.end_to_end_successes
+            == summary.metrics.end_to_end_total
+            else "failed"
+        ),
         "dataset_sha256": summary.dataset_sha256,
         "dataset_version": summary.dataset_version,
-        "git_commit": summary.version_info.git_commit,
+        "dataset_snapshot_file": "dataset-snapshot.json",
+        "branch": summary.branch,
+        "commit_hash": summary.commit_hash,
+        "git_commit": summary.commit_hash,
+        "tree_hash": summary.tree_hash,
+        "worktree_dirty": summary.worktree_dirty,
+        "prompt_sha256": summary.prompt_sha256,
+        "tool_registry_sha256": summary.tool_registry_sha256,
         "execution_command": _reproduction_command(summary.model_source),
         "model_source": summary.model_source,
         "model_type": (
@@ -877,6 +1188,11 @@ def _write_exclusive_text(path: Path, content: str) -> None:
         output_file.write(content)
 
 
+def _write_exclusive_bytes(path: Path, content: bytes) -> None:
+    with path.open("xb") as output_file:
+        output_file.write(content)
+
+
 def _format_rate(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2%}"
 
@@ -895,26 +1211,106 @@ def _reproduction_command(model_source: ModelSource) -> str:
     return DEFAULT_REPRODUCTION_COMMAND
 
 
-def _current_git_commit(repo_root: Path) -> str:
+def _run_git(
+    repo_root: Path,
+    arguments: Sequence[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> str:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *arguments],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError):
         raise AgentContractMetadataError(
-            "无法读取评测所需的 Git commit"
+            "无法读取评测所需的 Git 身份"
         ) from None
-    commit = result.stdout.strip()
-    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit):
+    return result.stdout.strip()
+
+
+def _current_worktree_tree_hash(
+    repo_root: Path,
+    *,
+    worktree_dirty: bool,
+) -> str:
+    """读取当前文件内容身份，不写入用户 Git index 或对象库。"""
+
+    if not worktree_dirty:
+        tree_hash = _run_git(repo_root, ("rev-parse", "HEAD^{tree}")).casefold()
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree_hash):
+            return tree_hash
+        raise AgentContractMetadataError("无法读取评测所需的 Git tree")
+
+    paths_output = _run_git(
+        repo_root,
+        ("ls-files", "--cached", "--others", "--exclude-standard", "-z"),
+    )
+    records: list[bytes] = []
+    for relative_path in sorted(
+        path for path in paths_output.split("\x00") if path
+    ):
+        path = repo_root.joinpath(*PurePosixPath(relative_path).parts)
+        if path.is_symlink():
+            digest = sha256(os.readlink(path).encode("utf-8")).hexdigest()
+            file_state = "symlink"
+        elif path.is_file():
+            digest = sha256(path.read_bytes()).hexdigest()
+            file_state = "file"
+        else:
+            digest = "missing"
+            file_state = "missing"
+        records.append(
+            f"{file_state}\0{relative_path}\0{digest}\n".encode("utf-8")
+        )
+    tree_hash = sha256(
+        b"filenest-working-tree-sha256-v1\n" + b"".join(records)
+    ).hexdigest()
+    return tree_hash
+
+
+def _current_git_identity(repo_root: Path) -> _GitIdentity:
+    branch_result = subprocess.run(
+        ["git", "symbolic-ref", "--short", "-q", "HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+    )
+    if branch_result.returncode == 0 and branch_result.stdout.strip():
+        branch = branch_result.stdout.strip()
+    else:
+        branch = "HEAD"
+
+    commit_hash = _run_git(repo_root, ("rev-parse", "HEAD")).casefold()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_hash):
         raise AgentContractMetadataError(
             "无法读取评测所需的 Git commit"
         )
-    return commit.casefold()
+    status = _run_git(
+        repo_root,
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+    )
+    worktree_dirty = bool(status)
+    return _GitIdentity(
+        branch=branch,
+        commit_hash=commit_hash,
+        tree_hash=_current_worktree_tree_hash(
+            repo_root,
+            worktree_dirty=worktree_dirty,
+        ),
+        worktree_dirty=worktree_dirty,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -922,7 +1318,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="运行 FileNest Agent 合同固定评测。"
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_PATH)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="新建的评测证据目录；省略时按模型来源、日期和 tree hash 自动生成。",
+    )
     parser.add_argument(
         "--model-source",
         choices=("scripted_fake", "real_model"),
@@ -937,6 +1337,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dataset_bytes = args.dataset.read_bytes()
     dataset = load_agent_contract_dataset(args.dataset)
+    repo_root = Path(__file__).resolve().parents[2]
+    git_identity = _current_git_identity(repo_root)
+    output_dir = args.output_dir
+    if output_dir is None:
+        run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        output_dir = (
+            repo_root
+            / "backend"
+            / "backups"
+            / (
+                f"agent-contract-v2-{args.model_source}-{run_stamp}-"
+                f"{git_identity.tree_hash[:12]}-{uuid4().hex[:8]}"
+            )
+        )
     model_client_factory: Callable[[], ModelClient] | None = None
     model_provider = None
     model_version = "scripted_fake"
@@ -957,23 +1371,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     version_info = EvaluationVersionInfo(
         prompt_version=args.prompt_version,
         model_version=model_version,
-        git_commit=_current_git_commit(Path(__file__).resolve().parents[2]),
+        git_commit=git_identity.commit_hash,
         evaluation_dataset_version=dataset.dataset_version,
         timestamp=datetime.now(timezone.utc),
     )
     summary = run_agent_contract_evaluation(
         dataset,
-        args.output_dir,
+        output_dir,
         dataset_sha256=sha256(dataset_bytes).hexdigest(),
         version_info=version_info,
         model_source=args.model_source,
         model_client_factory=model_client_factory,
         model_provider=model_provider,
         case_ids=args.case_id,
+        dataset_snapshot=dataset_bytes,
     )
     print(
         "评测结果："
-        f"{args.output_dir / 'evaluation-result.json'}"
+        f"{output_dir / 'evaluation-result.json'}"
     )
     print(f"通过用例：{summary.metrics.end_to_end_successes}/{summary.metrics.end_to_end_total}")
     return 0

@@ -26,12 +26,12 @@ def test_agent_contract_dataset_has_base_coverage_and_directory_cases() -> None:
     assert dataset.dataset_version == "agent-contract-v1"
     assert dataset.fixture.seed == 42
     assert dataset.fixture.root_policy == "fresh_temporary_workspace"
-    assert len(dataset.cases) == 24
+    assert len(dataset.cases) == 29
     assert Counter(case.category for case in dataset.cases) == {
-        "tool_selection": 6,
+        "tool_selection": 7,
         "argument_validity": 5,
         "proposal_validity": 4,
-        "security_boundary": 5,
+        "security_boundary": 9,
         "rag_citation": 4,
     }
 
